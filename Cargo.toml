@@ -1,6 +1,11 @@
-[package]
-name = "slimcode"
+[workspace]
+resolver = "2"
+members = ["crates/ai", "crates/agent", "crates/cli"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
+[workspace.dependencies]
+slimcode-ai = { path = "crates/ai" }
+slimcode-agent = { path = "crates/agent" }

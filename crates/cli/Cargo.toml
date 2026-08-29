@@ -1,0 +1,16 @@
+[package]
+name = "slimcode"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[[bin]]
+name = "slimcode"
+path = "src/main.rs"
+
+[dependencies]
+slimcode-ai.workspace = true
+slimcode-agent.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
