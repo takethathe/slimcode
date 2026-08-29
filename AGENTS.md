@@ -20,7 +20,7 @@ cargo clippy --all-targets --all-features --message-format=json -- -D warnings
 
 ### 3. docs/ 文档同步
 
-文档统一维护在 `docs/`（索引见 `docs/README.md`）。任何影响架构、接口或使用方式的改动，必须同步更新对应文档后才能提交。
+文档统一维护在 `docs/`（索引见 `docs/index.md`）。任何影响架构、接口或使用方式的改动，必须同步更新对应文档后才能提交。
 
 ### 4. 开发流程
 

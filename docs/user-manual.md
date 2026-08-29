@@ -14,6 +14,8 @@ cargo build --release
 
 ## 配置
 
+> 详细说明见 [configuration.md](./configuration.md)：三层配置来源、逐项覆盖规则与示例。
+
 slimcode 的配置分三层，优先级从高到低：环境变量 > `config.toml` > 默认值。
 
 - **API key（必填）**：只从环境变量 `DASHSCOPE_API_KEY` 读取，绝不落盘：
