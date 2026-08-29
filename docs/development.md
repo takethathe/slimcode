@@ -90,7 +90,7 @@ cargo workspace，三个 crate（布局见 `.scratch/slimcode-v1` 的 map）：
 - **非交互**：`slimcode "<prompt>"`（可 `--cwd <dir>`）跑一轮七工具循环、流式渲染事件、
   打印 token 用量并保存会话；
 - **REPL**：`slimcode` 进入行式循环，`/` 命令控制（`/help /new /load <id> /sessions
-  /usage /save /exit`），每轮自动保存会话。
+  /usage /save /history /!! /!N /exit`），每轮自动保存会话。
 
 模块：
 
@@ -101,8 +101,16 @@ cargo workspace，三个 crate（布局见 `.scratch/slimcode-v1` 的 map）：
 - `session`：`SessionStore`（`~/.slimcode/sessions/<id>.json`），id
   `slimcode-<unix>-<pid>-<n>`、created_at RFC3339 UTC（无 chrono 依赖）、标题取首条
   用户消息截断 48 字符；
+- `history`：`HistoryStore`（`~/.slimcode/history.json`，JSON 数组，上限 500 条丢最旧）
+  记录 `input history`（仅普通 prompt，不含 `/` 命令），与会话 `message history`
+  严格区分（见 CONTEXT.md）；
 - `repl`：行式循环；`messages_for_prompt` 在**新会话**首轮前置系统提示（恢复的
   会话历史已含系统消息，不重复），`/load` 经 `SessionStore::load` 恢复历史；
+  输入历史 `/history`（最近 20 条、最新在前、带编号）/`/!!`/`/!N` 重跑（verbatim、
+  作为新一轮 prompt、不再写入历史）；多行 prompt 用行尾 `\` 续行、空行或非 `\` 行
+  提交（无 readline 依赖、无 raw mode，见 ADR-0001）；纯函数 `is_continuation` /
+  `strip_continuation` / `accumulate` / `parse_replay` / `resolve_replay_index` /
+  `render_history` 承接测试，共享依赖收在 `ReplCtx`；
 - `tools`：把七工具 factory 绑定到启动 `cwd`。
 
 agent crate 的 `agent` 模块 `pub use session::{Message, Role, ToolCall}`，CLI 统一从

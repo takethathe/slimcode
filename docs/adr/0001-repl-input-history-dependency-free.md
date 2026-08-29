@@ -1,0 +1,3 @@
+# REPL input history stays dependency-free; Shift+Enter is not a continuation key
+
+The v1 REPL deliberately avoided a readline dependency and raw terminal mode. Ticket 06 keeps that constraint for input history and multi-line prompts: recall is `/history` + `/!!` + `/!N` (line-buffered, no raw mode), and multi-line entry uses a trailing `\` continuation. Shift+Enter was considered but is indistinguishable from Enter on traditional terminals (same CR byte; only the kitty keyboard protocol can tell them apart, which needs escape-sequence negotiation — raw-mode territory), so we accept the trade-off rather than pull in a readline crate or raw-mode handling.

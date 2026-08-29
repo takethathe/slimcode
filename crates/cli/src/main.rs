@@ -12,6 +12,7 @@
 //! key comes only from `DASHSCOPE_API_KEY`.
 
 mod config;
+mod history;
 mod render;
 mod repl;
 mod session;
@@ -28,6 +29,7 @@ use slimcode_agent::agent::{Message, RunConfig, Tool};
 use slimcode_ai::{BailianConfig, BailianProvider};
 
 use crate::config::AppConfig;
+use crate::history::HistoryStore;
 use crate::session::SessionStore;
 
 /// System prompt grounding the agent in its tools and working directory.
@@ -140,15 +142,20 @@ fn run_repl(
     cwd: &Path,
     config: AppConfig,
     store: &SessionStore,
+    history: &HistoryStore,
     out: &mut dyn Write,
 ) -> Result<i32, String> {
     let (mut provider, tools) = setup(cwd, config)?;
     let session = repl::new_session(store);
-    repl::run(
-        &mut provider,
-        &tools,
-        cwd,
+    let mut ctx = repl::ReplCtx {
+        provider: &mut provider,
+        tools: &tools,
         store,
+        history,
+    };
+    repl::run(
+        &mut ctx,
+        cwd,
         session,
         out,
         &mut BufReader::new(std::io::stdin()),
@@ -202,10 +209,11 @@ fn run(args: &[String], out: &mut dyn Write) -> Result<i32, String> {
     let home =
         config::slimcode_home().ok_or_else(|| "cannot determine home directory".to_string())?;
     let store = SessionStore::new(home.join("sessions"));
+    let history = HistoryStore::new(home.join("history.json"));
 
     match prompt {
         Some(p) => run_once(&p, &cwd, config, &store, out),
-        None => run_repl(&cwd, config, &store, out),
+        None => run_repl(&cwd, config, &store, &history, out),
     }
 }
 

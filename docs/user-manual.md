@@ -64,14 +64,28 @@ slimcode
 
 | 命令 | 作用 |
 | --- | --- |
-| `<prompt>` | 作为用户消息运行一轮 agent 循环 |
+| `<prompt>` | 作为用户消息运行一轮 agent 循环；以 `\` 结尾的行续行，非 `\` 行（或空行）提交整个多行 prompt 为一条用户消息 |
 | `/help` | 列出命令 |
 | `/new` | 新建会话 |
 | `/load <id>` | 从磁盘恢复一个已保存会话（`/resume` 同义） |
 | `/sessions` | 列出已保存会话 id |
 | `/usage` | 显示累计 token 用量 |
 | `/save` | 显式保存当前会话 |
+| `/history` | 列出输入历史（最近 20 条、最新在前、带编号） |
+| `/!!` | 重跑最近一条 prompt（作为新一轮，不重复写入历史） |
+| `/!N` | 重跑编号 N 的 prompt（verbatim，多行原样） |
 | `/exit` / `/quit` | 退出 |
+
+### 输入历史与多行 prompt
+
+输入历史（`input history`，区别于会话的消息历史 `message history`）记录你提交过的
+普通 prompt，存于 `~/.slimcode/history.json`（JSON 数组，上限 500 条，超出丢最旧），
+跨运行保留；`/` 命令不记入。`/!N` 编号以 `1` = 最新，重跑沿用当前会话、保留消息历史。
+
+多行 prompt：以 `\` 结尾的行会继续下一行，直到遇到不以 `\` 结尾的行（或空行）才提交
+为**一条**用户消息。续行态中 `/` 开头的行也作为 prompt 内容。实现无 readline 依赖、
+无 raw mode（Shift+Enter 与 Enter 在传统终端不可区分，故不支持，见
+`docs/adr/0001-repl-input-history-dependency-free.md`）。
 
 ### 会话文件
 
