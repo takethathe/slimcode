@@ -1020,12 +1020,10 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 name = "slimcode"
 version = "0.1.0"
 dependencies = [
- "serde",
- "serde_json",
  "slimcode-agent",
  "slimcode-ai",
  "slimcode-commands",
- "toml",
+ "slimcode-common",
 ]
 
 [[package]]
@@ -1049,6 +1047,17 @@ dependencies = [
 [[package]]
 name = "slimcode-commands"
 version = "0.1.0"
+
+[[package]]
+name = "slimcode-common"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "slimcode-agent",
+ "slimcode-ai",
+ "toml",
+]
 
 [[package]]
 name = "smallvec"

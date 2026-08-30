@@ -1,12 +1,9 @@
 //! Provider configuration for the Bailian (阿里云百炼) OpenAI-compatible endpoint.
 //!
-//! Config comes from the environment (ticket 01 / grilling Q9):
-//! - `DASHSCOPE_API_KEY` — API key (required).
-//! - `SLIMCODE_AI_BASE_URL` — endpoint override; defaults to the China-station
-//!   legacy compatible-mode URL.
-//! - `SLIMCODE_AI_MODEL` — model override; defaults to `qwen-plus`.
-
-use std::env;
+//! `BailianConfig` is pure provider data: api key, base URL and model. The
+//! four-layer precedence resolution (frontend overrides > env > `config.toml` >
+//! defaults) lives in `slimcode-common::config`, which is the single owner of
+//! those env variables and defaults — this crate does not re-read them.
 
 /// Default China-station legacy compatible-mode base URL (no WorkspaceId needed).
 pub const DEFAULT_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
@@ -22,22 +19,6 @@ pub struct BailianConfig {
 }
 
 impl BailianConfig {
-    /// Load from environment, applying defaults.
-    pub fn from_env() -> Result<Self, String> {
-        let api_key = env::var("DASHSCOPE_API_KEY").map_err(|_| {
-            "DASHSCOPE_API_KEY is not set. Set it (e.g. export DASHSCOPE_API_KEY=sk-...)."
-                .to_string()
-        })?;
-        let base_url =
-            env::var("SLIMCODE_AI_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
-        let model = env::var("SLIMCODE_AI_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
-        Ok(Self {
-            api_key,
-            base_url,
-            model,
-        })
-    }
-
     /// Construct explicitly (used by callers with their own config / tests).
     pub fn new(
         api_key: impl Into<String>,
@@ -60,21 +41,6 @@ impl BailianConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn defaults_apply_without_env() {
-        // from_env fails without the key
-        unsafe {
-            env::set_var("DASHSCOPE_API_KEY", "sk-test");
-        }
-        let cfg = BailianConfig::from_env().unwrap();
-        assert_eq!(cfg.base_url, DEFAULT_BASE_URL);
-        assert_eq!(cfg.model, DEFAULT_MODEL);
-        assert_eq!(cfg.api_key, "sk-test");
-        unsafe {
-            env::remove_var("DASHSCOPE_API_KEY");
-        }
-    }
 
     #[test]
     fn chat_completions_url_appends_path() {

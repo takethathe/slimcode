@@ -25,14 +25,15 @@ cargo clippy --all-targets --all-features --message-format=json -- -D warnings
 
 ## 架构
 
-cargo workspace，四个 crate（布局见 `.scratch/slimcode-v1` 的 map）：
+cargo workspace，五个 crate（布局见 `.scratch/slimcode-v1` 的 map）：
 
 | crate | 包名 | 职责 | 状态 |
 | --- | --- | --- | --- |
 | `crates/ai` | `slimcode-ai` | 统一 LLM provider 层（Provider trait + OpenAI-compatible/Bailian） | 起步（Bailian provider + wire 模型） |
 | `crates/agent` | `slimcode-agent` | agent 运行时、工具、会话状态 | 起步（edit 引擎 + 运行时循环 + 消息模型） |
 | `crates/commands` | `slimcode-commands` | 前端无关的 `/` 命令注册表与预测提示 | v1 新增（registry + suggest/find） |
-| `crates/cli` | `slimcode` | 二进制入口（非交互 + REPL） | v1 完成（配置/渲染/会话/REPL + 七工具绑定） |
+| `crates/common` | `slimcode-common` | 前端无关的应用模块（配置解析 / 会话与输入历史持久化 / 七工具绑定） | v1 新增（自 cli 抽出） |
+| `crates/cli` | `slimcode` | 二进制入口 + 终端前端（非交互 + REPL） | v1 完成（render/repl/main） |
 
 ### crates/ai Bailian provider
 
@@ -49,8 +50,10 @@ cargo workspace，四个 crate（布局见 `.scratch/slimcode-v1` 的 map）：
   - `content`/`function.name`/`function.id`：可为 `''`/`null`（思考模型空内容、tool_call 续传 `name: null`）；
   - `*_tokens_details` 等未知字段：直接忽略；
 - **tool_call 拼接**：首片段带 `id`/`name`（`arguments: ""`）→ `ToolCallStart`，续传只有 `index`+`arguments` → `ToolCallArgs`，按 index 拼接；
-- **配置**：`DASHSCOPE_API_KEY`（必填）、`SLIMCODE_AI_BASE_URL`（默认 `https://dashscope.aliyuncs.com/compatible-mode/v1`）、
-  `SLIMCODE_AI_MODEL`（默认 `qwen-plus`）；`BailianConfig::from_env()` / `BailianProvider::from_env()`；
+- **配置**：`BailianConfig` 为纯 provider 数据（api key / base URL / model，保留默认值与
+  `chat_completions_url()`）。四层优先级解析的唯一 owner 是 `slimcode-common::config`
+  （frontend overrides > env > `config.toml` > 默认值），产出 `BailianConfig`；ai 不再提供
+  `from_env`，消除与 cli 重复解析同一组 env/默认值的问题；
 - 两个 `#[ignore]` 冒烟测试（文本 + 工具调用）需真实 key + 网络，默认跳过，一次性手动验证已通过。
 
 ### crates/agent 工具
@@ -99,6 +102,23 @@ cargo workspace，四个 crate（布局见 `.scratch/slimcode-v1` 的 map）：
 设计上不绑定任何前端：当前行式 REPL 消费它做 `/help` 与未知命令的 `did you
 mean` 提示，未来 TUI/Web 前端可直接复用同一注册表与补全逻辑。
 
+### crates/common 前端无关应用模块（`slimcode-common`）
+
+自 cli 抽出的前端无关 module，任何前端（当前 REPL、未来 TUI/Web）可直接复用，不依赖终端
+二进制：
+
+- `config`：四层优先级（frontend overrides > env > `config.toml` > 默认值）的单一 owner；
+  `resolve(file_toml, env, overrides)` 纯解析核心 + `load_from(path, overrides)` /
+  `load_with_overrides(overrides)` I/O 包装，产出 `slimcode_ai::BailianConfig`；API key 只
+  来自 `DASHSCOPE_API_KEY`；`slimcode_home()` 解析 `$SLIMCODE_HOME` / `~/.slimcode`；
+- `session`：`SessionStore`（`~/.slimcode/sessions/<id>.json`），id
+  `slimcode-<unix>-<pid>-<n>`、created_at RFC3339 UTC（无 chrono 依赖）、标题取首条
+  用户消息截断 48 字符；
+- `history`：`HistoryStore`（`~/.slimcode/history.json`，JSON 数组，上限 500 条丢最旧）
+  记录 `input history`（仅普通 prompt，不含 `/` 命令），与会话 `message history` 严格区分
+  （见 CONTEXT.md）；
+- `tools`：把七工具 factory 绑定到启动 `cwd`。
+
 ### crates/cli 二进制（`slimcode`）
 
 两种模式，I/O 与逻辑分离（`run(args, out)` 便于测试）：
@@ -111,17 +131,8 @@ mean` 提示，未来 TUI/Web 前端可直接复用同一注册表与补全逻�
 
 模块：
 
-- `config`：CLI 参数（`--base-url` / `--model`）> env 覆盖 > `config.toml`
-  （非敏感）> 默认值；API key 只来自 `DASHSCOPE_API_KEY`；
-  `load_with_overrides(overrides)` 委托 `load_from(path, overrides)` 复用文件加载逻辑；
 - `render`：`AgentEvent` → 终端输出（流式文本 / 结构行 / 用量汇总），原始
   tool_call delta 与 `Done` 事件被抑制；
-- `session`：`SessionStore`（`~/.slimcode/sessions/<id>.json`），id
-  `slimcode-<unix>-<pid>-<n>`、created_at RFC3339 UTC（无 chrono 依赖）、标题取首条
-  用户消息截断 48 字符；
-- `history`：`HistoryStore`（`~/.slimcode/history.json`，JSON 数组，上限 500 条丢最旧）
-  记录 `input history`（仅普通 prompt，不含 `/` 命令），与会话 `message history`
-  严格区分（见 CONTEXT.md）；
 - `repl`：行式循环；`messages_for_prompt` 在**新会话**首轮前置系统提示（恢复的
   会话历史已含系统消息，不重复），`/load` 经 `SessionStore::load` 恢复历史；
   输入历史 `/history`（最近 20 条、最新在前、带编号）/`/!!`/`/!N` 重跑（verbatim、
@@ -131,7 +142,8 @@ mean` 提示，未来 TUI/Web 前端可直接复用同一注册表与补全逻�
   `render_history` 承接测试，共享依赖收在 `ReplCtx`；`/help` 与启动 banner 由
   `slimcode-commands::COMMANDS` 生成，未知 `/` 命令用 `suggest` 给出 `did you
   mean` 预测提示；
-- `tools`：把七工具 factory 绑定到启动 `cwd`。
+- 前端无关的 `config` / `session` / `history` / `tools` 已移入 `slimcode-common`（见上节），
+  cli 只消费它们，不再各自实现。
 
 agent crate 的 `agent` 模块 `pub use session::{Message, Role, ToolCall}`，CLI 统一从
 `slimcode_agent::agent` 引用消息类型。

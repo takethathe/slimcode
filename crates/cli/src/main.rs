@@ -12,12 +12,8 @@
 //! (`~/.slimcode/config.toml`), which overrides defaults; the API key comes
 //! only from `DASHSCOPE_API_KEY`.
 
-mod config;
-mod history;
 mod render;
 mod repl;
-mod session;
-mod tools;
 
 #[cfg(test)]
 mod testutil;
@@ -28,10 +24,10 @@ use std::path::{Path, PathBuf};
 
 use slimcode_agent::agent::{Message, RunConfig, Tool};
 use slimcode_ai::{BailianConfig, BailianProvider};
-
-use crate::config::{AppConfig, CliOverrides};
-use crate::history::HistoryStore;
-use crate::session::SessionStore;
+use slimcode_common::config::{self, Overrides};
+use slimcode_common::history::HistoryStore;
+use slimcode_common::session::{SessionStore, infer_title};
+use slimcode_common::tools;
 
 /// System prompt grounding the agent in its tools and working directory.
 const SYSTEM_PROMPT: &str = concat!(
@@ -107,12 +103,8 @@ fn render_events(
 }
 
 /// Shared setup: resolve cwd + config, build provider + tools.
-fn setup(cwd: &Path, config: AppConfig) -> Result<(BailianProvider, Vec<Tool>), String> {
-    let provider = BailianProvider::new(BailianConfig::new(
-        config.api_key,
-        config.base_url,
-        config.model,
-    ))?;
+fn setup(cwd: &Path, config: BailianConfig) -> Result<(BailianProvider, Vec<Tool>), String> {
+    let provider = BailianProvider::new(config)?;
     let tools = tools::build_tools(cwd);
     Ok((provider, tools))
 }
@@ -121,14 +113,13 @@ fn setup(cwd: &Path, config: AppConfig) -> Result<(BailianProvider, Vec<Tool>), 
 fn run_once(
     prompt: &str,
     cwd: &Path,
-    config: AppConfig,
+    config: BailianConfig,
     store: &SessionStore,
     out: &mut dyn Write,
 ) -> Result<i32, String> {
     let (mut provider, tools) = setup(cwd, config)?;
     let mut session = repl::new_session(store);
-    session.title =
-        session::infer_title(&[Message::text(slimcode_agent::session::Role::User, prompt)]);
+    session.title = infer_title(&[Message::text(slimcode_agent::session::Role::User, prompt)]);
     let messages = vec![
         Message::text(slimcode_agent::session::Role::System, SYSTEM_PROMPT),
         Message::text(slimcode_agent::session::Role::User, prompt),
@@ -145,7 +136,7 @@ fn run_once(
 /// Interactive REPL.
 fn run_repl(
     cwd: &Path,
-    config: AppConfig,
+    config: BailianConfig,
     store: &SessionStore,
     history: &HistoryStore,
     out: &mut dyn Write,
@@ -192,7 +183,7 @@ fn run(args: &[String], out: &mut dyn Write) -> Result<i32, String> {
         None => env::current_dir().map_err(|e| format!("cwd: {e}"))?,
     };
 
-    let config = AppConfig::load_with_overrides(CliOverrides {
+    let app_config = config::load_with_overrides(Overrides {
         base_url: parsed.base_url,
         model: parsed.model,
     })?;
@@ -202,8 +193,8 @@ fn run(args: &[String], out: &mut dyn Write) -> Result<i32, String> {
     let history = HistoryStore::new(home.join("history.json"));
 
     match parsed.prompt {
-        Some(p) => run_once(&p, &cwd, config, &store, out),
-        None => run_repl(&cwd, config, &store, &history, out),
+        Some(p) => run_once(&p, &cwd, app_config, &store, out),
+        None => run_repl(&cwd, app_config, &store, &history, out),
     }
 }
 

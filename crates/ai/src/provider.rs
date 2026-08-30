@@ -50,11 +50,6 @@ impl BailianProvider {
             total_usage: TokenUsage::default(),
         })
     }
-
-    /// Build a provider from the environment (`DASHSCOPE_API_KEY` etc.).
-    pub fn from_env() -> Result<Self, String> {
-        Self::new(BailianConfig::from_env()?)
-    }
 }
 
 impl Provider for BailianProvider {
@@ -98,8 +93,23 @@ impl Provider for BailianProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{DEFAULT_BASE_URL, DEFAULT_MODEL};
     use slimcode_agent::agent::FinishReason;
     use slimcode_agent::session::Role;
+
+    /// Test-only: build a provider from the live environment. The real
+    /// resolution owner is `slimcode-common::config`; this helper keeps the
+    /// live smoke tests working without dragging that crate into the dependency
+    /// graph of slimcode-ai.
+    fn provider_from_env() -> Result<BailianProvider, String> {
+        let api_key = std::env::var("DASHSCOPE_API_KEY")
+            .map_err(|_| "DASHSCOPE_API_KEY is not set".to_string())?;
+        let base_url =
+            std::env::var("SLIMCODE_AI_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
+        let model =
+            std::env::var("SLIMCODE_AI_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+        BailianProvider::new(BailianConfig::new(api_key, base_url, model))
+    }
 
     #[test]
     fn accumulate_usage_sums_across_calls() {
@@ -127,10 +137,14 @@ mod tests {
 
     /// Live smoke test — requires `DASHSCOPE_API_KEY` (and optionally
     /// `SLIMCODE_AI_BASE_URL` / `SLIMCODE_AI_MODEL`). Skipped by default.
+    ///
+    /// Test-only env lookup: the production config seam is
+    /// `slimcode-common::config`, which this crate deliberately does not depend
+    /// on, so the live test reads the same variables inline.
     #[test]
     #[ignore = "requires live DASHSCOPE_API_KEY and network access"]
     fn live_chat_returns_text_and_done() {
-        let mut p = BailianProvider::from_env().expect("env config");
+        let mut p = provider_from_env().expect("env config");
         let msgs = vec![Message::text(Role::User, "Reply with exactly: pong")];
         let deltas = p.chat(&msgs, &[]).expect("chat succeeds");
         assert!(
@@ -150,7 +164,7 @@ mod tests {
     #[test]
     #[ignore = "requires live DASHSCOPE_API_KEY and network access"]
     fn live_chat_calls_tool() {
-        let mut p = BailianProvider::from_env().expect("env config");
+        let mut p = provider_from_env().expect("env config");
         let tool = Tool::new(
             "get_weather",
             "Get the current weather for a city",

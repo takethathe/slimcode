@@ -1,10 +1,10 @@
 //! Input history persistence: `<home>/history.json`.
 //!
-//! Mirrors the `session` module pattern: a `HistoryStore` backed by a single
-//! JSON file (an array of prompt strings). Records only ordinary prompts
-//! (never `/` commands), capped at `HISTORY_LIMIT` with the oldest dropped.
-//! See CONTEXT.md: `input history` is distinct from `message history`
-//! (`session.messages`).
+//! Frontend-agnostic: mirrors the `session` module pattern, a `HistoryStore`
+//! backed by a single JSON file (an array of prompt strings). Records only
+//! ordinary prompts (never `/` commands), capped at `HISTORY_LIMIT` with the
+//! oldest dropped. See CONTEXT.md: `input history` is distinct from `message
+//! history` (`session.messages`).
 
 use std::fs;
 use std::path::PathBuf;

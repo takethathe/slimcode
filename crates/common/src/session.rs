@@ -1,9 +1,10 @@
 //! Session persistence: `~/.slimcode/sessions/<id>.json`.
 //!
 //! Locked by grilling Q7 (JSON sessions) and ticket 04 (`Session` shape). The
-//! CLI-phase metadata decisions live here: id = `slimcode-<unix>-<pid>-<n>`,
-//! `created_at` = RFC3339 UTC (no chrono dep; civil-from-days below), and the
-//! title is inferred from the first user message (truncated to 48 chars).
+//! frontend-agnostic metadata decisions live here: id =
+//! `slimcode-<unix>-<pid>-<n>`, `created_at` = RFC3339 UTC (no chrono dep;
+//! civil-from-days below), and the title is inferred from the first user
+//! message (truncated to 48 chars).
 
 use std::fs;
 use std::path::PathBuf;

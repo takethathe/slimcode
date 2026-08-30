@@ -10,10 +10,10 @@ use slimcode_agent::agent::Tool;
 use slimcode_agent::session::{Message, Role};
 use slimcode_ai::BailianProvider;
 
-use crate::history::{HISTORY_DISPLAY, HistoryStore};
 use crate::render;
-use crate::session::{SessionStore, infer_title};
 use slimcode_commands::{COMMANDS, suggest};
+use slimcode_common::history::{HISTORY_DISPLAY, HistoryStore};
+use slimcode_common::session::{SessionStore, infer_title, now_rfc3339};
 
 /// What a line of REPL input means.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -338,7 +338,7 @@ fn replay_and_report(
 pub fn new_session(store: &SessionStore) -> slimcode_agent::session::Session {
     slimcode_agent::session::Session {
         id: store.new_id(),
-        created_at: crate::session::now_rfc3339(),
+        created_at: now_rfc3339(),
         messages: Vec::new(),
         title: None,
     }
@@ -667,7 +667,7 @@ mod tests {
         let history = HistoryStore::new(dir.join("history.json"));
         let saved = Session {
             id: "repl-restore-test".to_string(),
-            created_at: crate::session::now_rfc3339(),
+            created_at: now_rfc3339(),
             title: Some("restored".to_string()),
             messages: vec![
                 Message::text(Role::System, "sys"),
