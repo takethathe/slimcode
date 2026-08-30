@@ -2,13 +2,9 @@
 //!
 //! `BailianConfig` is pure provider data: api key, base URL and model. The
 //! four-layer precedence resolution (frontend overrides > env > `config.toml` >
-//! defaults) lives in `slimcode-common::config`, which is the single owner of
-//! those env variables and defaults — this crate does not re-read them.
-
-/// Default China-station legacy compatible-mode base URL (no WorkspaceId needed).
-pub const DEFAULT_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
-/// Recommended default model (ticket 01).
-pub const DEFAULT_MODEL: &str = "qwen-plus";
+//! defaults) — along with the env var names and default values behind it —
+//! lives in `slimcode-common::config`, which is the single owner of those
+//! constants. This crate does not re-read them.
 
 /// Resolved provider configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -15,5 +15,5 @@ pub mod history;
 pub mod session;
 pub mod tools;
 
-#[cfg(test)]
-mod testutil;
+#[doc(hidden)]
+pub mod testutil;

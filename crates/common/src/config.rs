@@ -4,16 +4,22 @@
 //! (`[ai] base_url` / `[ai] model`); the API key is **only ever** read from
 //! `DASHSCOPE_API_KEY` (never written to or read from a file). Precedence is
 //! frontend overrides (`--base-url` / `--model`) > env (`SLIMCODE_AI_BASE_URL` /
-//! `SLIMCODE_AI_MODEL`) > config.toml > defaults from `slimcode_ai`.
+//! `SLIMCODE_AI_MODEL`) > config.toml > defaults (owned here).
 //!
-//! This module is the single owner of that resolution: it produces a
-//! [`slimcode_ai::BailianConfig`], so the provider layer stays pure data and
-//! no other crate re-parses the same env variables and defaults.
+//! This module is the single owner of that resolution and of the env var names
+//! and defaults behind it: it produces a [`slimcode_ai::BailianConfig`], so the
+//! provider layer stays pure data and no other crate re-parses the same env
+//! variables and defaults.
 
 use std::path::Path;
 
 use serde::Deserialize;
-use slimcode_ai::{BailianConfig, DEFAULT_BASE_URL, DEFAULT_MODEL};
+use slimcode_ai::BailianConfig;
+
+/// Default China-station legacy compatible-mode base URL (no WorkspaceId needed).
+pub const DEFAULT_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+/// Recommended default model (ticket 01).
+pub const DEFAULT_MODEL: &str = "qwen-plus";
 
 /// Environment variable holding the API key (required).
 pub const ENV_API_KEY: &str = "DASHSCOPE_API_KEY";

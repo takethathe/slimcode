@@ -93,21 +93,21 @@ impl Provider for BailianProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DEFAULT_BASE_URL, DEFAULT_MODEL};
     use slimcode_agent::agent::FinishReason;
     use slimcode_agent::session::Role;
+    use slimcode_common::config::{
+        DEFAULT_BASE_URL, DEFAULT_MODEL, ENV_API_KEY, ENV_BASE_URL, ENV_MODEL,
+    };
 
     /// Test-only: build a provider from the live environment. The real
     /// resolution owner is `slimcode-common::config`; this helper keeps the
-    /// live smoke tests working without dragging that crate into the dependency
-    /// graph of slimcode-ai.
+    /// live smoke tests working by referencing the shared constants instead of
+    /// re-inlining them.
     fn provider_from_env() -> Result<BailianProvider, String> {
-        let api_key = std::env::var("DASHSCOPE_API_KEY")
-            .map_err(|_| "DASHSCOPE_API_KEY is not set".to_string())?;
-        let base_url =
-            std::env::var("SLIMCODE_AI_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
-        let model =
-            std::env::var("SLIMCODE_AI_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+        let api_key =
+            std::env::var(ENV_API_KEY).map_err(|_| format!("{ENV_API_KEY} is not set"))?;
+        let base_url = std::env::var(ENV_BASE_URL).unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
+        let model = std::env::var(ENV_MODEL).unwrap_or_else(|_| DEFAULT_MODEL.to_string());
         BailianProvider::new(BailianConfig::new(api_key, base_url, model))
     }
 

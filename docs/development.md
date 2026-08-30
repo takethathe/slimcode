@@ -50,10 +50,11 @@ cargo workspace，五个 crate（布局见 `.scratch/slimcode-v1` 的 map）：
   - `content`/`function.name`/`function.id`：可为 `''`/`null`（思考模型空内容、tool_call 续传 `name: null`）；
   - `*_tokens_details` 等未知字段：直接忽略；
 - **tool_call 拼接**：首片段带 `id`/`name`（`arguments: ""`）→ `ToolCallStart`，续传只有 `index`+`arguments` → `ToolCallArgs`，按 index 拼接；
-- **配置**：`BailianConfig` 为纯 provider 数据（api key / base URL / model，保留默认值与
-  `chat_completions_url()`）。四层优先级解析的唯一 owner 是 `slimcode-common::config`
-  （frontend overrides > env > `config.toml` > 默认值），产出 `BailianConfig`；ai 不再提供
-  `from_env`，消除与 cli 重复解析同一组 env/默认值的问题；
+- **配置**：`BailianConfig` 为纯 provider 数据（api key / base URL / model，保留
+  `chat_completions_url()`）。四层优先级解析、env 变量名与默认值（`DEFAULT_BASE_URL` /
+  `DEFAULT_MODEL`）的唯一 owner 是 `slimcode-common::config`（frontend overrides > env >
+  `config.toml` > 默认值），产出 `BailianConfig`；ai 不再提供 `from_env`，消除与 cli 重复
+  解析同一组 env/默认值的问题；
 - 两个 `#[ignore]` 冒烟测试（文本 + 工具调用）需真实 key + 网络，默认跳过，一次性手动验证已通过。
 
 ### crates/agent 工具
@@ -107,7 +108,8 @@ mean` 提示，未来 TUI/Web 前端可直接复用同一注册表与补全逻�
 自 cli 抽出的前端无关 module，任何前端（当前 REPL、未来 TUI/Web）可直接复用，不依赖终端
 二进制：
 
-- `config`：四层优先级（frontend overrides > env > `config.toml` > 默认值）的单一 owner；
+- `config`：四层优先级（frontend overrides > env > `config.toml` > 默认值）的单一 owner，
+  并拥有 env 变量名（`ENV_*`）与默认值（`DEFAULT_BASE_URL` / `DEFAULT_MODEL`）常量；
   `resolve(file_toml, env, overrides)` 纯解析核心 + `load_from(path, overrides)` /
   `load_with_overrides(overrides)` I/O 包装，产出 `slimcode_ai::BailianConfig`；API key 只
   来自 `DASHSCOPE_API_KEY`；`slimcode_home()` 解析 `$SLIMCODE_HOME` / `~/.slimcode`；

@@ -1,4 +1,5 @@
-//! Test-only helpers shared across CLI test modules.
+//! Test-only helpers shared across the workspace's test modules (exposed as
+//! `#[doc(hidden)]` so both this crate's tests and cli's tests can use them).
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};

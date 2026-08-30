@@ -347,8 +347,8 @@ pub fn new_session(store: &SessionStore) -> slimcode_agent::session::Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::unique_temp_dir;
     use slimcode_agent::session::{Message, Role, Session};
+    use slimcode_common::testutil::unique_temp_dir;
     use std::fs;
 
     #[test]

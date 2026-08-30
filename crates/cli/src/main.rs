@@ -15,9 +15,6 @@
 mod render;
 mod repl;
 
-#[cfg(test)]
-mod testutil;
-
 use std::env;
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -55,8 +52,8 @@ fn usage() -> String {
          SLIMCODE_AI_BASE_URL    override endpoint\n  \
          SLIMCODE_AI_MODEL       override model\n  \
          SLIMCODE_HOME           override ~/.slimcode\n",
-        slimcode_ai::DEFAULT_MODEL,
-        slimcode_ai::DEFAULT_BASE_URL
+        config::DEFAULT_MODEL,
+        config::DEFAULT_BASE_URL
     )
 }
 

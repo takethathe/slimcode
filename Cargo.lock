@@ -1042,6 +1042,7 @@ dependencies = [
  "serde",
  "serde_json",
  "slimcode-agent",
+ "slimcode-common",
 ]
 
 [[package]]
