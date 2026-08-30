@@ -1383,6 +1383,7 @@ dependencies = [
  "slimcode-commands",
  "slimcode-common",
  "tui-textarea",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]

@@ -81,6 +81,7 @@ impl<'a> Tui<'a> {
     /// Open raw mode + the alternate screen, seed the app, and draw the first
     /// frame. Any failure here restores the terminal via [`restore_terminal`]
     /// (the caller does that on `Err`).
+    #[allow(clippy::too_many_arguments)]
     fn new(
         provider: BailianProvider,
         tools: Vec<Tool>,
@@ -126,10 +127,10 @@ impl<'a> Tui<'a> {
             let event = event::read().map_err(|e| e.to_string())?;
             match event {
                 Event::Key(key) => {
-                    if let Some(effect) = self.app.handle_key(key) {
-                        if self.handle_effect(effect)? {
-                            break;
-                        }
+                    if let Some(effect) = self.app.handle_key(key)
+                        && self.handle_effect(effect)?
+                    {
+                        break;
                     }
                 }
                 // Resize re-renders: ratatui's draw autoresizes, so the next
@@ -191,7 +192,7 @@ impl<'a> Tui<'a> {
                 Ok(())
             }
             Effect::ShowUsage => {
-                let usage = self.provider.total_usage.clone();
+                let usage = self.provider.total_usage;
                 self.app.render(&DisplayItem::Usage(usage))?;
                 Ok(())
             }
@@ -266,10 +267,10 @@ impl<'a> Tui<'a> {
         if self.session.title.is_none() {
             self.session.title = infer_title(&context);
         }
-        if let Some(prompt) = record {
-            if let Err(e) = self.history.append(prompt) {
-                self.app.push_notice(format!("history: {e}"));
-            }
+        if let Some(prompt) = record
+            && let Err(e) = self.history.append(prompt)
+        {
+            self.app.push_notice(format!("history: {e}"));
         }
         self.app.set_running(true);
         let updated = self.drive_turn(context);
@@ -289,7 +290,7 @@ impl<'a> Tui<'a> {
         };
         self.session.messages = updated;
         self.store.save(&self.session)?;
-        let usage = self.provider.total_usage.clone();
+        let usage = self.provider.total_usage;
         self.app.render(&DisplayItem::Usage(usage))?;
         Ok(())
     }

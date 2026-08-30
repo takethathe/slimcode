@@ -159,7 +159,9 @@ cargo workspace，六个 crate：
   （Submit / ReplayPrompt / ReplayHistory / NewSession / LoadSession / Quit / …）
   由终端循环兑现（session / history / skills / quit）。`draw(Frame)` 经 `Renderer`
   实现把状态渲染到 ratatui `Frame`，用 `TestBackend` 做帧缓冲测试（spec：好的测试
-  断言**帧缓冲**，而非内部状态）。命令解析经 `slimcode_commands::find` + skill
+  断言**帧缓冲**，而非内部状态）；长行在纯 core 里按面板宽度预折行（`wrap_to_width`，
+  CJK 双宽字符按 2 列计），滚动/跟随的行数数学因此与渲染一致、内容不截断。命令解析经
+  `slimcode_commands::find` + skill
   触发 + 编号重跑（`/!N`），未知 `/` 命令给出 `did you mean` 提示；`/new` / `/load`
   会清空 transcript 再重建会话视图。输入历史 recall：输入框为空时按 `↑`/`↓` 进入
   （从最新一条开始），`Enter` 把选中的历史 prompt 作为新一轮重跑（不再写入历史）；
@@ -172,7 +174,7 @@ cargo workspace，六个 crate：
 
 **同步 provider 的运行时行为**：provider 当前是同步 seam（真实阻塞边界收在
 provider 内部）。一轮提交后循环**不再轮询按键**，同步阻塞在共享 `run_turn` 内；
-`LiveRenderer` 把每个流式 `DisplayItem` 追加进 transcript 并立即重绘，实现边跑边
+`LiveRenderer` 把每个流式 `DisplayItem` 追加进 transcript（相邻的流式文本/思考片段合并为同一条目）并立即重绘，实现边跑边
 显示。turn 结束自动保存会话；turn 报错内联进 transcript 并回到输入框。运行中的
 Ctrl+C 字节被缓冲，turn 结束后退出。中断运行中的 turn 明确不在范围内（见 spec
 Further Notes）。
@@ -192,9 +194,8 @@ Further Notes）。
 
 模块：
 
-- `render`：`TextRenderer`（`Renderer` trait 的文本实现）——把共享 `DisplayItem`
-  流（流式文本 / 结构行 / 用量汇总）渲染为终端输出，原始 tool_call delta 与
-  `Done` 事件被抑制；事件→DisplayItem 的映射是共享的 `common::render::map_event`，
+- `render`：`TextRenderer`（`Renderer` trait 的文本实现）——把共享 `DisplayItem` 流（流式文本 / 流式思考 / 结构行 / 用量汇总）渲染为终端输出，原始 tool_call delta 与
+  `Done` 事件被抑制；流式文本与思考（带 `> ` 前缀）按 delta 拼接、不逐 delta 换行，换行只来自内容本身的 `\n`，结构行（工具开始/结果、停止标记、turn 标记）总是另起一行；事件→DisplayItem 的映射是共享的 `common::render::map_event`，
   cli 不再各自实现（见 ADR-0004）；
 - provider + 工具构造经 `common::setup::setup` 与 TUI 共享，两端不会漂移。
 

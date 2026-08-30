@@ -1,15 +1,15 @@
 //! CLI `TextRenderer`: the one-shot CLI's renderer over the shared
 //! [`Renderer`] trait (ADR-0004). It consumes [`DisplayItem`]s and writes
-//! text lines / streamed fragments to a `Write`, byte-identical to the
-//! pre-migration output (spec user story 36) — only its timing changes, since
-//! the shared runner now streams items live.
+//! streamed fragments and structural lines to a `Write`.
 //!
-//! Two kinds of output: live text (printed as it streams, no trailing
-//! newline) and structural lines (tool starts/results, stop markers, turn
-//! markers, reasoning). Structural lines always start on their own row, even
-//! when the preceding assistant text didn't end with a newline. Raw
-//! `ToolCallStart`/`ToolCallArgs`/`Done` deltas never reach a renderer — they
-//! are suppressed by `map_event` in `slimcode-common`.
+//! Three kinds of output: live streamed assistant text (printed as it streams,
+//! no trailing newline), live streamed reasoning (printed as it streams with a
+//! `> ` prefix on every physical line, no trailing newline), and structural
+//! lines (tool starts/results, stop markers, turn markers, token usage).
+//! Structural lines always start on their own row, even when the preceding
+//! streamed line didn't end with a newline. Raw `ToolCallStart`/
+//! `ToolCallArgs`/`Done` deltas never reach a renderer — they are suppressed by
+//! `map_event` in `slimcode-common`.
 
 use std::io::Write;
 
@@ -17,23 +17,31 @@ use slimcode_agent::agent::StopReason;
 use slimcode_ai::TokenUsage;
 use slimcode_common::render::{DisplayItem, Renderer};
 
-/// The CLI's renderer: turns [`DisplayItem`]s into the same bytes the old
-/// post-hoc renderer produced. Wraps a `&mut dyn Write` so the one-shot path
-/// shares it with the shared turn runner.
+/// The kind of streamed line currently open (no trailing newline yet), if any.
+/// Text and reasoning never share a row: when one is open and the other kind
+/// arrives, the open row is closed first so the new kind starts on its own row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenLine {
+    /// Assistant text, written without a prefix.
+    Text,
+    /// Reasoning, written with a `> ` prefix on each physical line.
+    Reasoning,
+}
+
+/// The CLI's renderer: turns [`DisplayItem`]s into one-shot terminal output.
+/// Wraps a `&mut dyn Write` so the one-shot path shares it with the shared turn
+/// runner.
 pub struct TextRenderer<'a> {
     out: &'a mut dyn Write,
-    /// Whether the last output was streamed assistant text without a trailing
-    /// newline — the next structural line must start on its own row.
-    text_line_open: bool,
+    /// The kind of streamed line currently open (no trailing newline), if any
+    /// — the next structural line must start on its own row.
+    open: Option<OpenLine>,
 }
 
 impl<'a> TextRenderer<'a> {
     /// Wrap a `Write` target.
     pub fn new(out: &'a mut dyn Write) -> Self {
-        Self {
-            out,
-            text_line_open: false,
-        }
+        Self { out, open: None }
     }
 }
 
@@ -41,23 +49,52 @@ impl Renderer for TextRenderer<'_> {
     fn render(&mut self, item: &DisplayItem) -> Result<(), String> {
         match item {
             DisplayItem::Text(t) => {
+                // Text and reasoning never share a row.
+                if self.open == Some(OpenLine::Reasoning) {
+                    writeln!(self.out).map_err(|e| e.to_string())?;
+                }
                 write!(self.out, "{t}").map_err(|e| e.to_string())?;
-                self.text_line_open = !t.ends_with('\n');
+                self.open = if t.ends_with('\n') {
+                    None
+                } else {
+                    Some(OpenLine::Text)
+                };
+            }
+            DisplayItem::Reasoning(t) => {
+                if self.open == Some(OpenLine::Text) {
+                    writeln!(self.out).map_err(|e| e.to_string())?;
+                }
+                // Stream the fragment inline; each physical line carries the
+                // `> ` prefix. A fragment continues the open reasoning row
+                // (no extra prefix) or, when starting a fresh row, is prefixed.
+                let mut at_line_start = self.open != Some(OpenLine::Reasoning);
+                for piece in t.split_inclusive('\n') {
+                    if at_line_start {
+                        write!(self.out, "> ").map_err(|e| e.to_string())?;
+                    }
+                    write!(self.out, "{piece}").map_err(|e| e.to_string())?;
+                    at_line_start = true;
+                }
+                self.open = if t.ends_with('\n') {
+                    None
+                } else {
+                    Some(OpenLine::Reasoning)
+                };
             }
             DisplayItem::Usage(u) => {
                 // The pre-migration one-shot printed "\n{tokens}\n" after the
                 // event stream; reproduce it verbatim (the leading newline
-                // ends an unterminated assistant line and adds a blank row
-                // when the last line was terminated).
+                // ends an unterminated streamed line and adds a blank row when
+                // the last line was terminated).
                 writeln!(self.out, "\n{}", render_usage(u)).map_err(|e| e.to_string())?;
-                self.text_line_open = false;
+                self.open = None;
             }
             structural => {
-                if self.text_line_open {
-                    // The last assistant text didn't end with a newline; start
+                if self.open.is_some() {
+                    // The last streamed line didn't end with a newline; start
                     // this structural line on its own row.
                     writeln!(self.out).map_err(|e| e.to_string())?;
-                    self.text_line_open = false;
+                    self.open = None;
                 }
                 writeln!(self.out, "{}", render_structural(structural))
                     .map_err(|e| e.to_string())?;
@@ -74,7 +111,6 @@ impl Renderer for TextRenderer<'_> {
 fn render_structural(item: &DisplayItem) -> String {
     match item {
         DisplayItem::Turn { turn } => format!("── turn {turn} ──"),
-        DisplayItem::Reasoning(t) => format!("> {t}"),
         DisplayItem::ToolStart { name, arguments } => format!("  ▶ {name} {arguments}"),
         DisplayItem::ToolResult { name, ok, result } => {
             let icon = if *ok { "✔" } else { "✖" };
@@ -84,8 +120,8 @@ fn render_structural(item: &DisplayItem) -> String {
         DisplayItem::Stop(StopReason::MaxIterations) => {
             "⚠ stopped: max iterations reached".to_string()
         }
-        DisplayItem::Text(_) | DisplayItem::Usage(_) => {
-            unreachable!("Text and Usage are handled by TextRenderer::render")
+        DisplayItem::Text(_) | DisplayItem::Reasoning(_) | DisplayItem::Usage(_) => {
+            unreachable!("Text, Reasoning and Usage are handled by TextRenderer::render")
         }
     }
 }
@@ -120,51 +156,6 @@ mod tests {
         String::from_utf8(buf).unwrap()
     }
 
-    /// The pre-migration renderer (old `render_event` + old `render_events`),
-    /// kept inline as the byte-identity reference for the migration.
-    fn old_render_stream(events: &[AgentEvent]) -> String {
-        let mut out = String::new();
-        let mut text_line_open = false;
-        for e in events {
-            let rt = old_render_event(e);
-            if let Some((text, streamed)) = rt {
-                if streamed {
-                    out.push_str(&text);
-                    text_line_open = !text.ends_with('\n');
-                } else {
-                    if text_line_open {
-                        out.push('\n');
-                        text_line_open = false;
-                    }
-                    out.push_str(&text);
-                    out.push('\n');
-                }
-            }
-        }
-        out
-    }
-
-    fn old_render_event(e: &AgentEvent) -> Option<(String, bool)> {
-        let (text, streamed) = match e {
-            AgentEvent::Turn { turn } => (format!("── turn {turn} ──"), false),
-            AgentEvent::Stream(Delta::Reasoning(t)) => (format!("> {t}"), false),
-            AgentEvent::Stream(Delta::Text(t)) => (t.clone(), true),
-            AgentEvent::Stream(Delta::ToolCallStart { .. })
-            | AgentEvent::Stream(Delta::ToolCallArgs { .. })
-            | AgentEvent::Stream(Delta::Done(_)) => return None,
-            AgentEvent::ToolStart { name, arguments } => (format!("  ▶ {name} {arguments}"), false),
-            AgentEvent::ToolResult { name, ok, result } => {
-                let icon = if *ok { "✔" } else { "✖" };
-                (format!("  {icon} {name}: {result}"), false)
-            }
-            AgentEvent::Stop(StopReason::Completed) => ("✓ done".to_string(), false),
-            AgentEvent::Stop(StopReason::MaxIterations) => {
-                ("⚠ stopped: max iterations reached".to_string(), false)
-            }
-        };
-        Some((text, streamed))
-    }
-
     #[test]
     fn streamed_text_is_written_as_is() {
         assert_eq!(render_stream(&[agent_text("hi")]), "hi");
@@ -178,7 +169,45 @@ mod tests {
 
     #[test]
     fn reasoning_renders_as_prefixed_line() {
-        assert_eq!(render_stream(&[agent_reasoning("think")]), "> think\n");
+        // A single reasoning delta leaves the line open (no trailing newline).
+        assert_eq!(render_stream(&[agent_reasoning("think")]), "> think");
+    }
+
+    #[test]
+    fn reasoning_fragments_stream_inline_on_one_line() {
+        // Consecutive reasoning deltas append to the same prefixed line rather
+        // than each starting a new row.
+        assert_eq!(
+            render_stream(&[agent_reasoning("The"), agent_reasoning(" user")]),
+            "> The user"
+        );
+    }
+
+    #[test]
+    fn reasoning_embedded_newline_reprefixes_each_row() {
+        // A newline inside a reasoning delta still starts a prefixed row.
+        assert_eq!(
+            render_stream(&[agent_reasoning("line one\nline two")]),
+            "> line one\n> line two"
+        );
+    }
+
+    #[test]
+    fn reasoning_after_open_text_starts_new_row() {
+        // An open assistant-text line must not swallow the reasoning line.
+        assert_eq!(
+            render_stream(&[agent_text("answer"), agent_reasoning("think")]),
+            "answer\n> think"
+        );
+    }
+
+    #[test]
+    fn text_after_open_reasoning_starts_new_row() {
+        // An open reasoning line must not swallow the assistant text.
+        assert_eq!(
+            render_stream(&[agent_reasoning("think"), agent_text("answer")]),
+            "> think\nanswer"
+        );
     }
 
     #[test]
@@ -256,7 +285,9 @@ mod tests {
     }
 
     #[test]
-    fn byte_identical_to_old_renderer_for_full_stream() {
+    fn full_stream_renders_in_expected_order() {
+        // Text and structural lines keep the pre-migration byte layout;
+        // reasoning now streams inline instead of one line per delta.
         let events = vec![
             AgentEvent::Turn { turn: 1 },
             agent_reasoning("Let me think"),
@@ -268,7 +299,10 @@ mod tests {
             agent_tool_result(true),
             agent_stop(),
         ];
-        assert_eq!(render_stream(&events), old_render_stream(&events));
+        assert_eq!(
+            render_stream(&events),
+            "── turn 1 ──\n> Let me think\nanswer fragment\n  ▶ read {\"path\": \"a.txt\"}\n  ✔ read: hello\n✓ done\n"
+        );
     }
 
     // --- event builders ------------------------------------------------

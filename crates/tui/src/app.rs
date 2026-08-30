@@ -19,8 +19,8 @@ use slimcode_agent::agent::StopReason;
 use slimcode_commands::{COMMANDS, find};
 use slimcode_common::render::{DisplayItem, Renderer};
 use slimcode_common::skills::{Skill, SkillScope, combined_suggestions, find_skill};
-
 use tui_textarea::{CursorMove, TextArea};
+use unicode_width::UnicodeWidthChar;
 
 /// Height in rows of the input box (including its border).
 const INPUT_HEIGHT: u16 = 3;
@@ -120,6 +120,10 @@ pub struct App {
     pub scroll: usize,
     /// Whether the view auto-follows new output.
     pub follow: bool,
+    /// The transcript content width (pane width minus its borders) from the
+    /// most recent draw; 0 before the first draw. Used to wrap long lines so
+    /// scroll/window row math matches what is rendered.
+    content_width: u16,
 }
 
 impl App {
@@ -144,6 +148,7 @@ impl App {
             recall: None,
             scroll: 0,
             follow: true,
+            content_width: 0,
         };
         app.push_notice("slimcode — type /help for commands, or just start typing");
         app
@@ -249,9 +254,7 @@ impl App {
         // Enter on a recalled prompt re-runs it as a fresh turn without
         // re-recording it (same semantics as the `/!!` / `/!N` replay path).
         if let Some(recall) = self.recall.take() {
-            let Some(text) = self.history.get(recall.index).cloned() else {
-                return None;
-            };
+            let text = self.history.get(recall.index).cloned()?;
             self.clear_input();
             self.push_notice(format!("> {text}"));
             return Some(Effect::ReplayPrompt(text));
@@ -325,9 +328,12 @@ impl App {
         ])
         .areas(area);
 
-        // Transcript pane (windowed to the pane height minus its border).
+        // Transcript pane (windowed to the pane height/width minus its border;
+        // long lines are wrapped to the content width so nothing is truncated).
         let content_height = transcript_area.height.saturating_sub(2);
-        let lines = self.visible_lines(content_height);
+        let content_width = transcript_area.width.saturating_sub(2);
+        self.content_width = content_width;
+        let lines = self.visible_lines(content_height, content_width);
         let transcript = Paragraph::new(lines).block(Block::bordered().title(" transcript "));
         frame.render_widget(transcript, transcript_area);
 
@@ -340,8 +346,34 @@ impl App {
     }
 
     /// Push a streamed display item into the transcript and re-follow.
+    ///
+    /// Consecutive streamed `DisplayItem::Text` (and `DisplayItem::Reasoning`)
+    /// fragments merge into a single entry, so a multi-delta text stream
+    /// renders as one flowing block instead of one line per delta.
     fn push_display_item(&mut self, item: DisplayItem) {
-        self.transcript.push(Entry::Agent(item));
+        let merged = match &item {
+            DisplayItem::Text(fragment) => {
+                if let Some(Entry::Agent(DisplayItem::Text(prev))) = self.transcript.last_mut() {
+                    prev.push_str(fragment);
+                    true
+                } else {
+                    false
+                }
+            }
+            DisplayItem::Reasoning(fragment) => {
+                if let Some(Entry::Agent(DisplayItem::Reasoning(prev))) = self.transcript.last_mut()
+                {
+                    prev.push_str(fragment);
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        if !merged {
+            self.transcript.push(Entry::Agent(item));
+        }
         self.reset_view();
     }
 
@@ -369,14 +401,31 @@ impl App {
         }
     }
 
-    /// Number of transcript lines across all entries.
+    /// Number of transcript rows across all entries, counting wrapped rows at
+    /// the current content width (falling back to logical lines before the
+    /// first draw).
     fn total_lines(&self) -> usize {
-        self.transcript.iter().map(|e| entry_lines(e).len()).sum()
+        let width = self.content_width as usize;
+        if width == 0 {
+            return self.transcript.iter().map(|e| entry_lines(e).len()).sum();
+        }
+        self.transcript
+            .iter()
+            .map(|e| {
+                entry_lines(e)
+                    .iter()
+                    .map(|l| wrap_to_width(l, width).len())
+                    .sum::<usize>()
+            })
+            .sum()
     }
 
-    /// The window of transcript lines visible in a pane of `height` rows.
-    fn visible_lines(&self, height: u16) -> Vec<Line<'static>> {
+    /// The window of transcript rows visible in a pane of `height` rows and
+    /// `width` columns. Each entry line is wrapped to the content width first,
+    /// so every returned row fits the pane and no content is truncated.
+    fn visible_lines(&self, height: u16, width: u16) -> Vec<Line<'static>> {
         let height = height as usize;
+        let width = width as usize;
         let total = self.total_lines();
         if total == 0 || height == 0 {
             return Vec::new();
@@ -389,8 +438,16 @@ impl App {
         let mut all: Vec<Line> = Vec::with_capacity(total);
         for entry in &self.transcript {
             let style = entry_style(entry);
-            for line in entry_lines(entry) {
-                all.push(Line::styled(line, style));
+            if width == 0 {
+                for line in entry_lines(entry) {
+                    all.push(Line::styled(line, style));
+                }
+            } else {
+                for line in entry_lines(entry) {
+                    for row in wrap_to_width(&line, width) {
+                        all.push(Line::styled(row, style));
+                    }
+                }
             }
         }
         all[start..end].to_vec()
@@ -491,11 +548,12 @@ impl App {
     fn handle_unresolved_command(&mut self, name: &str, arg: Option<&str>) -> Option<Effect> {
         // Numbered replay: `/!N` (N digits) is not an exact spelling, so a
         // numbered command never matches `find` and lands here.
-        if let Some(spec) = name.strip_prefix("/!") {
-            if !spec.is_empty() && spec.chars().all(|c| c.is_ascii_digit()) {
-                let n = spec.parse::<usize>().unwrap_or(1);
-                return Some(Effect::ReplayHistory(n));
-            }
+        if let Some(spec) = name.strip_prefix("/!")
+            && !spec.is_empty()
+            && spec.chars().all(|c| c.is_ascii_digit())
+        {
+            let n = spec.parse::<usize>().unwrap_or(1);
+            return Some(Effect::ReplayHistory(n));
         }
         // Skill trigger: `/skill-name`.
         if let Some(skill) = find_skill(&self.skills, name) {
@@ -618,6 +676,32 @@ fn entry_lines(entry: &Entry) -> Vec<String> {
         Entry::Notice(text) => text.lines().map(str::to_string).collect(),
         Entry::Error(text) => text.lines().map(str::to_string).collect(),
     }
+}
+
+/// Wrap `line` so it fits `width` display columns, splitting at character
+/// boundaries when it would overflow. CJK and other wide characters count as
+/// two columns (via `unicode-width`), matching the terminal. Returns at least
+/// one row (empty input yields a single empty row) so layout stays stable.
+fn wrap_to_width(line: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    let mut rows = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    for c in line.chars() {
+        let cw = c.width().unwrap_or(0);
+        if current_width > 0 && current_width + cw > width {
+            rows.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        current.push(c);
+        current_width += cw;
+    }
+    if !current.is_empty() || rows.is_empty() {
+        rows.push(current);
+    }
+    rows
 }
 
 /// The plain text lines a display item contributes to the transcript.
@@ -764,9 +848,8 @@ mod tests {
             .unwrap();
 
         let buffer = render_buffer(&mut app, 40, 12);
-        // Streamed fragments accumulate as separate transcript lines.
-        assert!(buffer_contains(&buffer, "hello"));
-        assert!(buffer_contains(&buffer, "world"));
+        // Consecutive streamed text fragments merge onto one transcript line.
+        assert!(buffer_contains(&buffer, "hello world"));
         // A single streamed item spanning multiple lines renders fully.
         let mut app = seeded_app();
         app.render(&DisplayItem::Text("one\ntwo\n".to_string()))
@@ -774,6 +857,41 @@ mod tests {
         let buffer = render_buffer(&mut app, 40, 12);
         assert!(buffer_contains(&buffer, "one"));
         assert!(buffer_contains(&buffer, "two"));
+    }
+
+    #[test]
+    fn transcript_accumulates_streamed_reasoning() {
+        let mut app = seeded_app();
+        app.render(&DisplayItem::Reasoning("The ".to_string()))
+            .unwrap();
+        app.render(&DisplayItem::Reasoning("user said".to_string()))
+            .unwrap();
+
+        let buffer = render_buffer(&mut app, 60, 12);
+        // Consecutive reasoning deltas merge onto one prefixed line.
+        assert!(buffer_contains(&buffer, "> The user said"));
+    }
+
+    #[test]
+    fn long_line_wraps_instead_of_truncating() {
+        let mut app = seeded_app();
+        // A line far wider than the 40-wide pane (content width 38).
+        let long = format!("{}END", "x".repeat(60));
+        app.render(&DisplayItem::Text(long)).unwrap();
+        let buffer = render_buffer(&mut app, 40, 12);
+        // The tail must be visible: wrapped, not truncated.
+        assert!(buffer_contains(&buffer, "END"));
+    }
+
+    #[test]
+    fn wide_chars_wrap_by_display_width() {
+        let mut app = seeded_app();
+        // 31 CJK chars = 62 display columns, wider than the 38-column content
+        // area: the trailing char must survive via width-aware wrapping.
+        let long = format!("{}尾", "好".repeat(30));
+        app.render(&DisplayItem::Text(long)).unwrap();
+        let buffer = render_buffer(&mut app, 40, 12);
+        assert!(buffer_contains(&buffer, "尾"));
     }
 
     #[test]
