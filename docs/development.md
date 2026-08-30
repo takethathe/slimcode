@@ -45,13 +45,24 @@ cargo workspace，六个 crate：
   仅 async 路径需要，blocking 下用 `resp.text()` 一次取回整段 SSE 再解析；
 - **请求**：`stream: true` + `stream_options.include_usage: true`（ticket 05 实测 usage 只在带 `choices: []` 的最终 chunk 出现）；
   工具用 `role: tool` 消息回传结果；
+- **显式上下文缓存**（llm-cache）：`BailianConfig.cache`（默认 `true`，`with_cache(bool)` 建造式 setter）。
+  开启时 system 消息的 `content` 序列化为单元素块数组
+  `[{"type":"text","text":"…","cache_control":{"type":"ephemeral"}}]`，把稳定前缀交给端点缓存；
+  关闭时字节与未开启缓存的客户端完全一致。`message_to_wire(m, cache)` 只对 system（且文本非空）加标记，
+  assistant 工具调用空 content、tool 必带 content、空文本省略等既有语义不变；
+- **usage 缓存统计**（llm-cache）：`TokenUsage` 新增可选嵌套 `prompt_tokens_details`
+  （`cached_tokens` / `cache_creation_input_tokens`，缺省视为 0；整块缺省为 None），
+  访问器 `cached_tokens()` / `cache_creation_tokens()` 缺省返回 0；`accumulate_usage` 把两个缓存字段
+  随 prompt/completion/total 一起并入 `total_usage`；汇总行措辞由
+  `common::render::usage_summary` 共享（cli 与 TUI 各渲染点都消费它，两端不漂移）；
 - **serde 容忍清单**（全部不设 `deny_unknown_fields`，未知字段自动忽略）：
   - `reasoning_content`：思考模型每个 chunk 都带，`Option<String>`；
-  - `usage`：key 每 chunk 都在但多为 `null`，`Option<WireUsage>`（当前解析后丢弃，token 记账留给 CLI）；
+  - `usage`：key 每 chunk 都在但多为 `null`，`Option<TokenUsage>`（解析后进入 `last_usage` / `total_usage`）；
   - `content`/`function.name`/`function.id`：可为 `''`/`null`（思考模型空内容、tool_call 续传 `name: null`）；
-  - `*_tokens_details` 等未知字段：直接忽略；
+  - `prompt_tokens_details`：可选嵌套，缺省视为 0（未命中/未开缓存时端点可能不带该块）；其它
+    `*_tokens_details` 等未知字段：直接忽略；
 - **tool_call 拼接**：首片段带 `id`/`name`（`arguments: ""`）→ `ToolCallStart`，续传只有 `index`+`arguments` → `ToolCallArgs`，按 index 拼接；
-- **配置**：`BailianConfig` 为纯 provider 数据（api key / base URL / model，保留
+- **配置**：`BailianConfig` 为纯 provider 数据（api key / base URL / model / cache，保留
   `chat_completions_url()`）。四层优先级解析、env 变量名与默认值（`DEFAULT_BASE_URL` /
   `DEFAULT_MODEL`）的唯一 owner 是 `slimcode-common::config`（frontend overrides > env >
   `config.toml` > 默认值），产出 `BailianConfig`；ai 不再提供 `from_env`，消除与 cli 重复
@@ -112,6 +123,10 @@ cargo workspace，六个 crate：
 
 - `config`：四层优先级（frontend overrides > env > `config.toml` > 默认值）的单一 owner，
   并拥有 env 变量名（`ENV_*`）与默认值（`DEFAULT_BASE_URL` / `DEFAULT_MODEL`）常量；
+  `cache` 项（llm-cache）同样四层解析：`--cache`/`--no-cache` override（`Overrides.cache`）>
+  `SLIMCODE_AI_CACHE`（`true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`，大小写不敏感，非法值启动报错
+  指明变量名）> `config.toml [ai] cache` > 默认 `true`（默认开启）；与 `base_url`/`model`
+  逐项独立回落；
   `resolve(file_toml, env, overrides)` 纯解析核心 + `load_from(path, overrides)` /
   `load_with_overrides(overrides)` I/O 包装，产出 `slimcode_ai::BailianConfig`；API key 只
   来自 `DASHSCOPE_API_KEY`；`slimcode_home()` 解析 `$SLIMCODE_HOME` / `~/.slimcode`；
@@ -140,6 +155,8 @@ cargo workspace，六个 crate：
 - `render`（ADR-0004）：前端无关的显示模型。`DisplayItem` 是渲染单元（turn 标记 /
   流式文本片段 / 思考行 / 工具开始与结果 / 停止标记 / token 用量）；
   `map_event(AgentEvent) -> Option<DisplayItem>` 是事件→显示单元的共享纯映射；
+  `usage_summary(TokenUsage) -> String` 是 token 用量汇总行（含 `({cached} cached, {pct}%)`
+  与缓存命中百分比）的共享措辞，cli 汇总与 TUI `/usage` 都消费它；
   `Renderer` trait 消费 `DisplayItem`，每个前端只实现自己的渲染器（cli 的文本行、
   tui 的 widget 状态）。
 - `runner`：共享 turn runner `run_turn(provider, tools, messages, &RunConfig,

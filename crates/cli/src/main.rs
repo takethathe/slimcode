@@ -40,11 +40,14 @@ fn usage() -> String {
          OPTIONS:\n  \
          --cwd <dir>         working directory for the agent\n  \
          --model <model>     override model id (default: {})\n  \
-         --base-url <url>    override endpoint (default: {})\n\n\
+         --base-url <url>    override endpoint (default: {})\n  \
+         --cache             enable explicit context caching (default: on)\n  \
+         --no-cache          disable explicit context caching\n\n\
          ENV:\n  \
          DASHSCOPE_API_KEY       API key (required)\n  \
          SLIMCODE_AI_BASE_URL    override endpoint\n  \
          SLIMCODE_AI_MODEL       override model\n  \
+         SLIMCODE_AI_CACHE       override context caching (true/false/1/0/yes/no/on/off)\n  \
          SLIMCODE_HOME           override ~/.slimcode\n",
         config::DEFAULT_MODEL,
         config::DEFAULT_BASE_URL
@@ -132,6 +135,7 @@ fn run(args: &[String], out: &mut dyn Write, tty: bool) -> Result<i32, String> {
     let app_config = config::load_with_overrides(Overrides {
         base_url: parsed.base_url,
         model: parsed.model,
+        cache: parsed.cache,
     })?;
     let home =
         config::slimcode_home().ok_or_else(|| "cannot determine home directory".to_string())?;
@@ -154,6 +158,8 @@ struct CliArgs {
     prompt: Option<String>,
     base_url: Option<String>,
     model: Option<String>,
+    /// `--cache` / `--no-cache` on the command line; `None` = not given.
+    cache: Option<bool>,
 }
 
 /// Pure flag/positional parsing, separated from I/O for unit testing. The first
@@ -163,6 +169,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
     let mut prompt = None;
     let mut base_url = None;
     let mut model = None;
+    let mut cache = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -187,6 +194,12 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
                     .ok_or_else(|| "--base-url needs a value".to_string())?;
                 base_url = Some(value.to_string());
             }
+            "--cache" => {
+                cache = Some(true);
+            }
+            "--no-cache" => {
+                cache = Some(false);
+            }
             other => {
                 prompt = Some(other.to_string());
                 if i + 1 < args.len() {
@@ -203,6 +216,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
         prompt,
         base_url,
         model,
+        cache,
     })
 }
 
@@ -288,6 +302,50 @@ mod tests {
         );
         assert_eq!(parsed.prompt.as_deref(), Some("hello"));
         assert_eq!(parsed.cwd, None);
+        assert_eq!(parsed.cache, None, "no --cache/--no-cache passed");
+    }
+
+    #[test]
+    fn parse_args_reads_cache_flags() {
+        let args = vec!["--cache".to_string(), "hello".to_string()];
+        let parsed = parse_args(&args).unwrap();
+        assert_eq!(parsed.cache, Some(true), "--cache must enable");
+        assert_eq!(parsed.prompt.as_deref(), Some("hello"));
+        // The flag also works before other flags and without a prompt.
+        let parsed = parse_args(&[
+            "--cwd".to_string(),
+            "/tmp".to_string(),
+            "--cache".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(parsed.cache, Some(true));
+        assert_eq!(parsed.cwd, Some(PathBuf::from("/tmp")));
+        assert_eq!(parsed.prompt, None);
+        // `--no-cache` turns it off explicitly (the default is on).
+        let parsed = parse_args(&["--no-cache".to_string(), "hi".to_string()]).unwrap();
+        assert_eq!(parsed.cache, Some(false));
+        // The last cache flag wins.
+        let parsed = parse_args(&[
+            "--cache".to_string(),
+            "--no-cache".to_string(),
+            "x".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(parsed.cache, Some(false));
+    }
+
+    #[test]
+    fn help_lists_cache_flags() {
+        let mut buf = Vec::new();
+        let code = run(&["--help".to_string()], &mut buf, false).unwrap();
+        assert_eq!(code, 0);
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("--cache"), "help must list --cache");
+        assert!(s.contains("--no-cache"), "help must list --no-cache");
+        assert!(
+            s.contains("SLIMCODE_AI_CACHE"),
+            "help must list the env var"
+        );
     }
 
     #[test]

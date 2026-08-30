@@ -27,6 +27,8 @@ pub const ENV_API_KEY: &str = "DASHSCOPE_API_KEY";
 pub const ENV_BASE_URL: &str = "SLIMCODE_AI_BASE_URL";
 /// Environment variable overriding the model.
 pub const ENV_MODEL: &str = "SLIMCODE_AI_MODEL";
+/// Environment variable overriding explicit context caching.
+pub const ENV_CACHE: &str = "SLIMCODE_AI_CACHE";
 /// Environment variable overriding the slimcode home directory.
 pub const ENV_HOME: &str = "SLIMCODE_HOME";
 
@@ -37,6 +39,9 @@ pub const ENV_HOME: &str = "SLIMCODE_HOME";
 pub struct Overrides {
     pub base_url: Option<String>,
     pub model: Option<String>,
+    /// `--cache` / `--no-cache` on the command line; `None` falls through to
+    /// env / file / default.
+    pub cache: Option<bool>,
 }
 
 /// The `config.toml` file shape (non-secret overrides only).
@@ -50,6 +55,7 @@ struct FileConfig {
 struct FileAi {
     base_url: Option<String>,
     model: Option<String>,
+    cache: Option<bool>,
 }
 
 /// The slimcode home directory: `$SLIMCODE_HOME` if set, else `~/.slimcode`.
@@ -73,6 +79,19 @@ fn pick_value(
         .or(env)
         .or_else(|| file.map(str::to_string))
         .unwrap_or_else(|| default.to_string())
+}
+
+/// Parse a boolean env value (`true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`,
+/// case-insensitive). Any other value is a startup error naming the variable
+/// — never silently ignored.
+fn parse_env_bool(var: &str, value: &str) -> Result<bool, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err(format!(
+            "{var} must be one of true/false/1/0/yes/no/on/off, got {value:?}"
+        )),
+    }
 }
 
 /// Pure resolution core: given optional file contents, an override set and an
@@ -113,7 +132,18 @@ fn resolve(
         DEFAULT_MODEL,
     );
 
-    Ok(BailianConfig::new(api_key, base_url, model))
+    // Cache resolves independently of base_url / model (per-field fallback):
+    // CLI `--cache`/`--no-cache` > env > file > default on. An invalid env
+    // value fails fast instead of being silently ignored.
+    let cache = match overrides.cache {
+        Some(v) => v,
+        None => match env(ENV_CACHE) {
+            Some(raw) => parse_env_bool(ENV_CACHE, &raw)?,
+            None => file.as_ref().and_then(|f| f.ai.cache).unwrap_or(true),
+        },
+    };
+
+    Ok(BailianConfig::new(api_key, base_url, model).with_cache(cache))
 }
 
 /// Load config from the real environment and config file, applying frontend
@@ -222,6 +252,7 @@ mod tests {
         let overrides = Overrides {
             base_url: Some("https://cli.example.com/v1".to_string()),
             model: Some("cli-model".to_string()),
+            cache: None,
         };
         let cfg = resolve(Some(file), &env, &overrides).unwrap();
         assert_eq!(cfg.base_url, "https://cli.example.com/v1");
@@ -234,9 +265,110 @@ mod tests {
         let overrides = Overrides {
             base_url: None,
             model: Some("cli-model".to_string()),
+            cache: None,
         };
         let cfg = resolve(None, &env, &overrides).unwrap();
         assert_eq!(cfg.model, "cli-model");
         assert_eq!(cfg.base_url, DEFAULT_BASE_URL);
+    }
+
+    // --- cache flag (llm-cache tickets 01/03) -----------------------------
+
+    #[test]
+    fn cache_defaults_on() {
+        let env = env_of(&[(ENV_API_KEY, "sk-test")]);
+        let cfg = resolve(None, &env, &Overrides::default()).unwrap();
+        assert!(cfg.cache, "cache must default to on");
+    }
+
+    #[test]
+    fn cache_file_true_enables() {
+        let env = env_of(&[(ENV_API_KEY, "sk-test")]);
+        let file = "[ai]\ncache = true\n";
+        let cfg = resolve(Some(file), &env, &Overrides::default()).unwrap();
+        assert!(cfg.cache);
+    }
+
+    #[test]
+    fn cache_env_overrides_file() {
+        let env = env_of(&[(ENV_API_KEY, "sk-test"), (ENV_CACHE, "true")]);
+        let file = "[ai]\ncache = false\n";
+        let cfg = resolve(Some(file), &env, &Overrides::default()).unwrap();
+        assert!(cfg.cache, "env true must beat file false");
+    }
+
+    #[test]
+    fn cache_env_false_overrides_file_true() {
+        let env = env_of(&[(ENV_API_KEY, "sk-test"), (ENV_CACHE, "false")]);
+        let file = "[ai]\ncache = true\n";
+        let cfg = resolve(Some(file), &env, &Overrides::default()).unwrap();
+        assert!(!cfg.cache, "env false must beat file true");
+    }
+
+    #[test]
+    fn cache_override_beats_env() {
+        let env = env_of(&[(ENV_API_KEY, "sk-test"), (ENV_CACHE, "false")]);
+        let overrides = Overrides {
+            base_url: None,
+            model: None,
+            cache: Some(true),
+        };
+        let cfg = resolve(None, &env, &overrides).unwrap();
+        assert!(cfg.cache, "CLI --cache must beat env false");
+    }
+
+    #[test]
+    fn cache_resolves_independently_of_other_fields() {
+        let env = env_of(&[(ENV_API_KEY, "sk-test")]);
+        let file = "[ai]\ncache = true\n"; // no base_url / model
+        let cfg = resolve(Some(file), &env, &Overrides::default()).unwrap();
+        assert!(cfg.cache);
+        assert_eq!(cfg.base_url, DEFAULT_BASE_URL); // fell back per-field
+        assert_eq!(cfg.model, DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn cache_override_false_beats_env_true() {
+        // `--no-cache` on the command line must be able to turn caching off
+        // even when the env var enables it.
+        let env = env_of(&[(ENV_API_KEY, "sk-test"), (ENV_CACHE, "true")]);
+        let overrides = Overrides {
+            base_url: None,
+            model: None,
+            cache: Some(false),
+        };
+        let cfg = resolve(None, &env, &overrides).unwrap();
+        assert!(!cfg.cache, "CLI --no-cache must beat env true");
+    }
+
+    #[test]
+    fn cache_env_accepts_all_boolean_spellings() {
+        for (raw, expect) in [
+            ("true", true),
+            ("TRUE", true),
+            ("1", true),
+            ("yes", true),
+            ("on", true),
+            ("false", false),
+            ("FALSE", false),
+            ("0", false),
+            ("no", false),
+            ("off", false),
+        ] {
+            let pairs = [(ENV_API_KEY, "sk-test"), (ENV_CACHE, raw)];
+            let env = env_of(&pairs);
+            let cfg = resolve(None, &env, &Overrides::default()).unwrap();
+            assert_eq!(cfg.cache, expect, "SLIMCODE_AI_CACHE={raw:?}");
+        }
+    }
+
+    #[test]
+    fn cache_invalid_env_errors_naming_variable() {
+        let env = env_of(&[(ENV_API_KEY, "sk-test"), (ENV_CACHE, "banana")]);
+        let err = resolve(None, &env, &Overrides::default()).unwrap_err();
+        assert!(
+            err.contains(ENV_CACHE),
+            "error must name the variable: {err}"
+        );
     }
 }

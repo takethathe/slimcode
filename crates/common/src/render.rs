@@ -66,6 +66,46 @@ pub fn map_event(e: &AgentEvent) -> Option<DisplayItem> {
     }
 }
 
+/// The token-usage summary line shared by the one-shot CLI summary and the
+/// TUI `/usage` line, so the wording cannot drift between frontends. `{cached}`
+/// is the accumulated cache-hit token count and `{pct}` the cache hit
+/// percentage of the prompt tokens (`0` / `0%` when the endpoint omitted the
+/// details or caching was off).
+pub fn usage_summary(u: &TokenUsage) -> String {
+    format!(
+        "tokens: {} prompt ({} cached, {}) + {} completion = {} total",
+        u.prompt_tokens,
+        u.cached_tokens(),
+        cache_hit_percent(u),
+        u.completion_tokens,
+        u.total_tokens
+    )
+}
+
+/// Cache hit percentage of the prompt tokens (`cached / prompt`), rounded to
+/// one decimal and trimmed of a trailing `.0` (e.g. `68%`, `33.3%`). Returns
+/// `0%` when there is no prompt usage or no cache activity.
+fn cache_hit_percent(u: &TokenUsage) -> String {
+    let prompt = u.prompt_tokens;
+    if prompt == 0 {
+        return "0%".to_string();
+    }
+    // Tenths-of-a-percent with round-to-nearest; integer math, no float
+    // formatting quirks. saturating guards against absurd accumulated counts.
+    let tenths = u
+        .cached_tokens()
+        .saturating_mul(1000)
+        .saturating_add(prompt / 2)
+        / prompt;
+    let whole = tenths / 10;
+    let frac = tenths % 10;
+    if frac == 0 {
+        format!("{whole}%")
+    } else {
+        format!("{whole}.{frac}%")
+    }
+}
+
 /// The per-frontend component that turns `DisplayItem`s into frontend output —
 /// text lines for the CLI, widget state for the TUI (CONTEXT.md: Renderer).
 ///
@@ -104,6 +144,69 @@ mod tests {
     }
     fn stop(reason: StopReason) -> AgentEvent {
         AgentEvent::Stop(reason)
+    }
+
+    #[test]
+    fn usage_summary_shows_cached_and_zero_default() {
+        let with_cache = TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            prompt_tokens_details: Some(slimcode_ai::wire::PromptTokensDetails {
+                cached_tokens: 8,
+                cache_creation_input_tokens: 2,
+            }),
+        };
+        assert_eq!(
+            usage_summary(&with_cache),
+            "tokens: 10 prompt (8 cached, 80%) + 5 completion = 15 total"
+        );
+        // No details (cache off / unsupported model) → cached and % show 0.
+        let plain = TokenUsage {
+            prompt_tokens: 3,
+            completion_tokens: 1,
+            total_tokens: 4,
+            ..Default::default()
+        };
+        assert_eq!(
+            usage_summary(&plain),
+            "tokens: 3 prompt (0 cached, 0%) + 1 completion = 4 total"
+        );
+    }
+
+    #[test]
+    fn cache_hit_percent_rounds_to_one_decimal() {
+        let mut u = TokenUsage {
+            prompt_tokens: 3019,
+            completion_tokens: 104,
+            total_tokens: 3123,
+            ..Default::default()
+        };
+        // 2048/3019 ≈ 67.8%: nearest-tenth rounding, not floor.
+        u.prompt_tokens_details = Some(slimcode_ai::wire::PromptTokensDetails {
+            cached_tokens: 2048,
+            cache_creation_input_tokens: 0,
+        });
+        assert_eq!(cache_hit_percent(&u), "67.8%");
+        assert_eq!(
+            usage_summary(&u),
+            "tokens: 3019 prompt (2048 cached, 67.8%) + 104 completion = 3123 total"
+        );
+        // Whole-number percentages drop the trailing `.0`.
+        u.prompt_tokens_details = Some(slimcode_ai::wire::PromptTokensDetails {
+            cached_tokens: 3,
+            cache_creation_input_tokens: 0,
+        });
+        assert_eq!(cache_hit_percent(&u), "0.1%");
+        u.prompt_tokens = 4;
+        u.prompt_tokens_details = Some(slimcode_ai::wire::PromptTokensDetails {
+            cached_tokens: 3,
+            cache_creation_input_tokens: 0,
+        });
+        assert_eq!(cache_hit_percent(&u), "75%");
+        // Zero prompt usage never divides by zero.
+        let zero = TokenUsage::default();
+        assert_eq!(cache_hit_percent(&zero), "0%");
     }
 
     #[test]

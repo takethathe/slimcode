@@ -10,15 +10,24 @@ use std::time::Duration;
 
 use crate::config::BailianConfig;
 use crate::wire;
-use crate::wire::TokenUsage;
+use crate::wire::{PromptTokensDetails, TokenUsage};
 use slimcode_agent::agent::{Delta, Provider, Tool};
 use slimcode_agent::session::Message;
 
-/// Sum a usage sample into an accumulator (pure, unit-testable).
+/// Sum a usage sample into an accumulator (pure, unit-testable). Cache-hit
+/// details (`prompt_tokens_details`) accumulate alongside the three headline
+/// fields; a sample without details leaves existing totals untouched.
 fn accumulate_usage(total: &mut TokenUsage, sample: TokenUsage) {
     total.prompt_tokens += sample.prompt_tokens;
     total.completion_tokens += sample.completion_tokens;
     total.total_tokens += sample.total_tokens;
+    if let Some(details) = sample.prompt_tokens_details {
+        let acc = total
+            .prompt_tokens_details
+            .get_or_insert_with(PromptTokensDetails::default);
+        acc.cached_tokens += details.cached_tokens;
+        acc.cache_creation_input_tokens += details.cache_creation_input_tokens;
+    }
 }
 
 /// Provider for the Bailian compatible-mode endpoint.
@@ -56,7 +65,10 @@ impl Provider for BailianProvider {
     fn chat(&mut self, messages: &[Message], tools: &[Tool]) -> Result<Vec<Delta>, String> {
         let req = wire::WireRequest {
             model: &self.config.model,
-            messages: messages.iter().map(wire::message_to_wire).collect(),
+            messages: messages
+                .iter()
+                .map(|m| wire::message_to_wire(m, self.config.cache))
+                .collect(),
             tools: if tools.is_empty() {
                 None
             } else {
@@ -120,6 +132,7 @@ mod tests {
                 prompt_tokens: 5,
                 completion_tokens: 3,
                 total_tokens: 8,
+                ..Default::default()
             },
         );
         accumulate_usage(
@@ -128,11 +141,56 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 7,
                 total_tokens: 17,
+                ..Default::default()
             },
         );
         assert_eq!(total.prompt_tokens, 15);
         assert_eq!(total.completion_tokens, 10);
         assert_eq!(total.total_tokens, 25);
+    }
+
+    #[test]
+    fn accumulate_usage_sums_cache_details_across_calls() {
+        let mut total = TokenUsage::default();
+        accumulate_usage(
+            &mut total,
+            TokenUsage {
+                prompt_tokens: 100,
+                completion_tokens: 10,
+                total_tokens: 110,
+                prompt_tokens_details: Some(PromptTokensDetails {
+                    cached_tokens: 60,
+                    cache_creation_input_tokens: 40,
+                }),
+            },
+        );
+        // A sample without details must not clobber the accumulated counts.
+        accumulate_usage(
+            &mut total,
+            TokenUsage {
+                prompt_tokens: 200,
+                completion_tokens: 20,
+                total_tokens: 220,
+                ..Default::default()
+            },
+        );
+        accumulate_usage(
+            &mut total,
+            TokenUsage {
+                prompt_tokens: 300,
+                completion_tokens: 30,
+                total_tokens: 330,
+                prompt_tokens_details: Some(PromptTokensDetails {
+                    cached_tokens: 90,
+                    cache_creation_input_tokens: 10,
+                }),
+            },
+        );
+        assert_eq!(total.prompt_tokens, 600);
+        assert_eq!(total.completion_tokens, 60);
+        assert_eq!(total.total_tokens, 660);
+        assert_eq!(total.cached_tokens(), 150);
+        assert_eq!(total.cache_creation_tokens(), 50);
     }
 
     /// Live smoke test — requires `DASHSCOPE_API_KEY` (and optionally

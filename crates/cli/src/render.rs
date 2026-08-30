@@ -14,8 +14,7 @@
 use std::io::Write;
 
 use slimcode_agent::agent::StopReason;
-use slimcode_ai::TokenUsage;
-use slimcode_common::render::{DisplayItem, Renderer};
+use slimcode_common::render::{DisplayItem, Renderer, usage_summary};
 
 /// The kind of streamed line currently open (no trailing newline yet), if any.
 /// Text and reasoning never share a row: when one is open and the other kind
@@ -86,7 +85,7 @@ impl Renderer for TextRenderer<'_> {
                 // event stream; reproduce it verbatim (the leading newline
                 // ends an unterminated streamed line and adds a blank row when
                 // the last line was terminated).
-                writeln!(self.out, "\n{}", render_usage(u)).map_err(|e| e.to_string())?;
+                writeln!(self.out, "\n{}", usage_summary(u)).map_err(|e| e.to_string())?;
                 self.open = None;
             }
             structural => {
@@ -126,19 +125,11 @@ fn render_structural(item: &DisplayItem) -> String {
     }
 }
 
-/// Render token usage as a summary line (used by the `DisplayItem::Usage`
-/// entry after a one-shot run).
-pub fn render_usage(u: &TokenUsage) -> String {
-    format!(
-        "tokens: {} prompt + {} completion = {} total",
-        u.prompt_tokens, u.completion_tokens, u.total_tokens
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use slimcode_agent::agent::{AgentEvent, Delta, FinishReason};
+    use slimcode_ai::TokenUsage;
     use slimcode_common::render::map_event;
 
     /// Feed a stream of agent events through the shared mapping and the
@@ -257,12 +248,35 @@ mod tests {
                 prompt_tokens: 5,
                 completion_tokens: 3,
                 total_tokens: 8,
+                ..Default::default()
             };
             r.render(&DisplayItem::Usage(u)).unwrap();
         }
         assert_eq!(
             String::from_utf8(buf).unwrap(),
-            "\ntokens: 5 prompt + 3 completion = 8 total\n"
+            "\ntokens: 5 prompt (0 cached, 0%) + 3 completion = 8 total\n"
+        );
+    }
+
+    #[test]
+    fn usage_renders_cached_count_when_details_present() {
+        let mut buf = Vec::new();
+        {
+            let mut r = TextRenderer::new(&mut buf);
+            let u = TokenUsage {
+                prompt_tokens: 20,
+                completion_tokens: 4,
+                total_tokens: 24,
+                prompt_tokens_details: Some(slimcode_ai::wire::PromptTokensDetails {
+                    cached_tokens: 16,
+                    cache_creation_input_tokens: 4,
+                }),
+            };
+            r.render(&DisplayItem::Usage(u)).unwrap();
+        }
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "\ntokens: 20 prompt (16 cached, 80%) + 4 completion = 24 total\n"
         );
     }
 

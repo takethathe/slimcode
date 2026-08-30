@@ -12,10 +12,15 @@ pub struct BailianConfig {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
+    /// Explicit context caching (Bailian `cache_control` marker on the system
+    /// message). Default on; disable with `with_cache(false)` to keep request
+    /// bytes byte-identical to a non-cache client.
+    pub cache: bool,
 }
 
 impl BailianConfig {
     /// Construct explicitly (used by callers with their own config / tests).
+    /// Cache is on by default — call [`BailianConfig::with_cache`] to disable.
     pub fn new(
         api_key: impl Into<String>,
         base_url: impl Into<String>,
@@ -25,7 +30,15 @@ impl BailianConfig {
             api_key: api_key.into(),
             base_url: base_url.into(),
             model: model.into(),
+            cache: true,
         }
+    }
+
+    /// Builder-style setter for the explicit cache flag (keeps the 3-arg
+    /// `new` signature stable so existing call sites do not break).
+    pub fn with_cache(mut self, cache: bool) -> Self {
+        self.cache = cache;
+        self
     }
 
     /// `{base_url}/chat/completions`.
@@ -45,5 +58,18 @@ mod tests {
             cfg.chat_completions_url(),
             "https://x.example.com/compatible-mode/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn new_defaults_cache_on() {
+        let cfg = BailianConfig::new("k", "https://x.example.com/v1", "m");
+        assert!(cfg.cache, "cache must default to on");
+    }
+
+    #[test]
+    fn with_cache_sets_the_flag() {
+        let cfg = BailianConfig::new("k", "https://x.example.com/v1", "m");
+        assert!(cfg.clone().with_cache(true).cache);
+        assert!(!cfg.clone().with_cache(false).cache);
     }
 }

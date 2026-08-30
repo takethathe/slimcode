@@ -52,6 +52,35 @@ history**（`session.messages`）是会话中已发生的消息，可被当作 C
 token 用量保持前端关注点：运行结束后前端读取其具体 provider 的 total usage，
 喂一条 `DisplayItem::Usage` 给自己的 renderer。
 
+### 显式上下文缓存与缓存命中统计（llm-cache）
+
+每一轮 agent turn 都把完整消息历史（system + user + assistant + tool …）发给
+百炼兼容端点，其中 system 提示（含工具定义）在多轮之间几乎不变。显式上下文缓存
+把这段稳定前缀交给端点缓存：开启时（默认开启），system 消息的 `content` 序列化为
+单元素块数组并携带 `cache_control: {"type": "ephemeral"}` 标记；端点以该标记为
+终点向前回溯最长匹配前缀命中缓存，命中的 token 数经
+`usage.prompt_tokens_details.cached_tokens` 回传，创建缓存的 token 数经
+`usage.prompt_tokens_details.cache_creation_input_tokens` 回传。
+
+为什么用显式缓存而非其它方案：slimcode 走 OpenAI 兼容 **Chat Completions**
+（`/chat/completions`），显式缓存在该接口上直接可用、命中确定性最高；Responses
+API 的 Session 缓存（`x-dashscope-session-cache` header）不在范围内。隐式缓存是
+百炼自动行为，无需请求侧改动——即使关闭显式缓存，`cached_tokens` 的解析与展示对
+隐式命中同样生效。
+
+标记只落在 system 消息上：system + 工具定义是最稳定的前缀，逐轮确定性命中；
+`cache_control` 只加在 `content`（而非 `tools`），符合百炼「工具定义随 system
+参与缓存计算」的约定。关闭缓存时请求字节与未开启缓存的客户端完全一致，缓存是纯
+增量功能。
+
+缓存命中的 token 数随 `total_usage` 跨轮累计，显示在运行结束与 TUI `/usage` 的
+汇总行 `tokens: {prompt} prompt ({cached} cached, {pct}%) + {completion} completion =
+{total} total` 中；`{pct}` 为缓存命中百分比（`cached / prompt`，保留一位小数）；端点未回传
+`prompt_tokens_details`（未命中、模型不支持或缓存已关闭）时显示 0 / 0%，任何配置都不报错。创建缓存 token 数保留在 `TokenUsage` 模型上
+供未来细粒度展示。注意创建缓存按 125% 输入价计费一次、命中按低价计费，且被缓存
+前缀需 ≥ 1024 token 才会实际命中（默认 system 提示较短时可能不触发，属运行时
+行为，不影响代码正确性）。
+
 ## 设计动机
 
 上下文组装曾散落在 CLI 两个入口（非交互 `run_once` 与交互前端的 `submit_prompt`）

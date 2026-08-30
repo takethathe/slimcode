@@ -17,7 +17,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Paragraph};
 use slimcode_agent::agent::StopReason;
 use slimcode_commands::{COMMANDS, find};
-use slimcode_common::render::{DisplayItem, Renderer};
+use slimcode_common::render::{DisplayItem, Renderer, usage_summary};
 use slimcode_common::skills::{Skill, SkillScope, combined_suggestions, find_skill};
 use tui_textarea::{CursorMove, TextArea};
 use unicode_width::UnicodeWidthChar;
@@ -724,10 +724,7 @@ fn item_lines(item: &DisplayItem) -> Vec<String> {
         DisplayItem::Stop(StopReason::MaxIterations) => {
             vec!["⚠ stopped: max iterations reached".to_string()]
         }
-        DisplayItem::Usage(usage) => vec![format!(
-            "tokens: {} prompt + {} completion = {} total",
-            usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
-        )],
+        DisplayItem::Usage(usage) => vec![usage_summary(usage)],
     }
 }
 
@@ -1208,12 +1205,33 @@ mod tests {
             prompt_tokens: 10,
             completion_tokens: 5,
             total_tokens: 15,
+            ..Default::default()
         }))
         .unwrap();
         let buffer = render_buffer(&mut app, 60, 12);
         assert!(buffer_contains(
             &buffer,
-            "tokens: 10 prompt + 5 completion = 15 total"
+            "tokens: 10 prompt (0 cached, 0%) + 5 completion = 15 total"
+        ));
+    }
+
+    #[test]
+    fn usage_renders_cached_count() {
+        let mut app = seeded_app();
+        app.render(&DisplayItem::Usage(TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            prompt_tokens_details: Some(slimcode_ai::wire::PromptTokensDetails {
+                cached_tokens: 7,
+                cache_creation_input_tokens: 3,
+            }),
+        }))
+        .unwrap();
+        let buffer = render_buffer(&mut app, 80, 12);
+        assert!(buffer_contains(
+            &buffer,
+            "tokens: 10 prompt (7 cached, 70%) + 5 completion = 15 total"
         ));
     }
 

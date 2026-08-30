@@ -29,6 +29,7 @@ slimcode 的配置分四层，优先级从高到低：命令行参数 > 环境�
   ```bash
   slimcode --model qwen-max "为 README 补一段简介"
   slimcode --model qwen-max --base-url https://my.example.com/v1 "列出当前目录"
+  slimcode --no-cache "运行 cargo test 并修复失败用例"
   ```
 
 - **config.toml（可选）**：位于 `~/.slimcode/config.toml`（可用 `SLIMCODE_HOME`
@@ -38,6 +39,7 @@ slimcode 的配置分四层，优先级从高到低：命令行参数 > 环境�
   [ai]
   base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
   model = "qwen-plus"
+  cache = false   # 可选：显式关闭上下文缓存（默认开启）
   ```
 
 - **环境变量覆盖**：
@@ -47,7 +49,23 @@ slimcode 的配置分四层，优先级从高到低：命令行参数 > 环境�
   | `DASHSCOPE_API_KEY` | 百炼 API key（必填） | — |
   | `SLIMCODE_AI_BASE_URL` | 端点 base URL | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
   | `SLIMCODE_AI_MODEL` | 模型 id | `qwen-plus` |
+  | `SLIMCODE_AI_CACHE` | 显式上下文缓存开关（`true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`，非法值启动报错） | `true` |
   | `SLIMCODE_HOME` | slimcode 家目录（含 `config.toml` 与 `sessions/`） | `~/.slimcode` |
+
+### 上下文缓存（默认开启）
+
+显式上下文缓存默认开启：system 消息（含工具定义）作为稳定前缀交给端点缓存，
+多轮/多会话复用同一前缀时命中缓存，节省输入 token。
+
+- `--cache` / `--no-cache`（命令行，临时）、`SLIMCODE_AI_CACHE=true|false`（环境
+  变量）、`[ai] cache = true|false`（`config.toml`）按「命令行 > 环境变量 > 文件
+  > 默认」的优先级解析；不配置即为默认开启。
+- 运行结束与 TUI `/usage` 的 token 用量汇总行包含缓存命中数：
+  `tokens: {prompt} prompt ({cached} cached, {pct}%) + {completion} completion = {total} total`。
+  `{cached}` 为累计缓存命中 token 数、`{pct}` 为命中百分比（`cached / prompt`，保留一位小数）；
+  端点未回传命中数（未命中、模型不支持或缓存已关闭）时显示 `0` / `0%`。
+- 注意：创建缓存本身按 125% 输入价计费一次；多轮命中后由命中价回收成本。
+  系统前缀过短（< 1024 token）时可能不会实际命中，属端点运行行为。
 
 ## 使用方式
 
@@ -61,7 +79,9 @@ slimcode --cwd /path/to/repo "运行 cargo test 并修复失败用例"
 slimcode --model qwen-max "为 README 补一段简介"
 ```
 
-运行结束后打印 token 用量与本次会话的保存路径。
+运行结束后打印 token 用量（含缓存命中数，如
+`tokens: 3019 prompt (2048 cached, 67.8%) + 104 completion = 3123 total`）与本次会话的
+保存路径。
 
 ### 交互式 TUI
 

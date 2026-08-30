@@ -78,6 +78,37 @@ pub struct TokenUsage {
     pub completion_tokens: u64,
     #[serde(default)]
     pub total_tokens: u64,
+    /// Cache-hit accounting (`usage.prompt_tokens_details`). Absent when the
+    /// endpoint omits it (cache off, unsupported model, no hit); accessors
+    /// treat absence as 0 so callers never need to unwrap.
+    #[serde(default)]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+/// Cache-hit breakdown inside `usage.prompt_tokens_details`. Both fields are
+/// optional on the wire; a missing field counts as 0.
+#[derive(Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PromptTokensDetails {
+    /// Prompt tokens served from the cache (cache hits).
+    #[serde(default)]
+    pub cached_tokens: u64,
+    /// Prompt tokens spent creating the cache entry.
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+}
+
+impl TokenUsage {
+    /// Cached (cache-hit) prompt tokens; `0` when the endpoint omitted the
+    /// details (cache off, unsupported model, or no hit).
+    pub fn cached_tokens(&self) -> u64 {
+        self.prompt_tokens_details.map_or(0, |d| d.cached_tokens)
+    }
+
+    /// Prompt tokens spent creating the cache; `0` when details are absent.
+    pub fn cache_creation_tokens(&self) -> u64 {
+        self.prompt_tokens_details
+            .map_or(0, |d| d.cache_creation_input_tokens)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -99,11 +130,42 @@ pub struct WireStreamOptions {
     pub include_usage: bool,
 }
 
+/// The `content` of a wire message: either a plain string (the pre-cache wire
+/// shape, byte-identical) or a list of content blocks. `serde(untagged)` makes
+/// the same field serialize as a JSON string or a JSON array depending on the
+/// variant. Owned strings keep `message_to_wire` free of borrow gymnastics.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum WireContent {
+    /// Plain string content (unchanged wire shape).
+    Text(String),
+    /// One text block carrying `cache_control` (explicit cache marker). Only
+    /// emitted for the system message when caching is on.
+    Blocks(Vec<WireContentBlock>),
+}
+
+/// A text content block. `cache_control` marks the block as a cache-able
+/// prefix for Bailian's explicit context caching.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct WireContentBlock {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub text: String,
+    pub cache_control: WireCacheControl,
+}
+
+/// The explicit-cache marker (`{"type": "ephemeral"}`).
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct WireCacheControl {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+}
+
 #[derive(Serialize)]
 pub struct WireMessage<'a> {
     pub role: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
+    pub content: Option<WireContent>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<WireToolCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -151,21 +213,34 @@ pub fn role_to_wire(role: &Role) -> &'static str {
     }
 }
 
-pub fn message_to_wire(m: &Message) -> WireMessage<'_> {
+/// Map one agent message to the wire shape. With `cache` on, the system
+/// message's content is serialized as a one-block array carrying
+/// `cache_control` so the stable "system prompt + tool definitions" prefix is
+/// cached by the endpoint; every other message keeps the plain-string shape.
+/// With `cache` off the bytes are identical to the pre-cache client.
+pub fn message_to_wire(m: &Message, cache: bool) -> WireMessage<'_> {
     let role = role_to_wire(&m.role);
     let text = m.text_content();
     let has_tool_calls = !m.tool_calls.is_empty();
     let content = if role == "assistant" && has_tool_calls {
         // Tool-call assistant messages carry an empty content on the wire.
-        Some(String::new())
+        Some(WireContent::Text(String::new()))
     } else if role == "tool" {
         // Tool messages must carry content on the wire; an empty result still
         // sends an empty string rather than omitting the field (400 risk).
-        Some(text)
+        Some(WireContent::Text(text))
     } else if text.is_empty() {
         None
+    } else if cache && role == "system" {
+        // Explicit cache marker on the system prefix (only when enabled and
+        // the text is non-empty).
+        Some(WireContent::Blocks(vec![WireContentBlock {
+            kind: "text",
+            text,
+            cache_control: WireCacheControl { kind: "ephemeral" },
+        }]))
     } else {
-        Some(text)
+        Some(WireContent::Text(text))
     };
     let tool_calls = m
         .tool_calls
@@ -437,6 +512,56 @@ mod tests {
     }
 
     #[test]
+    fn parse_stream_captures_cache_usage_details() {
+        // The final chunk carries `usage.prompt_tokens_details` with the
+        // cache-hit and cache-creation token counts; parse_stream must
+        // surface them and the accessors must return them.
+        let body = concat!(
+            "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",",
+            "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",",
+            "\"choices\":[],\"usage\":{\"prompt_tokens\":3019,\"completion_tokens\":104,\"total_tokens\":3123,",
+            "\"prompt_tokens_details\":{\"cached_tokens\":2048,\"cache_creation_input_tokens\":1605}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let parsed = parse_stream(body).unwrap();
+        let usage = parsed.usage.expect("usage captured from final chunk");
+        assert_eq!(usage.prompt_tokens, 3019);
+        assert_eq!(usage.completion_tokens, 104);
+        assert_eq!(usage.total_tokens, 3123);
+        let details = usage.prompt_tokens_details.expect("details parsed");
+        assert_eq!(details.cached_tokens, 2048);
+        assert_eq!(details.cache_creation_input_tokens, 1605);
+        assert_eq!(usage.cached_tokens(), 2048);
+        assert_eq!(usage.cache_creation_tokens(), 1605);
+    }
+
+    #[test]
+    fn cache_accessors_return_zero_when_details_absent() {
+        // No `prompt_tokens_details` in the payload (cache off / unsupported
+        // model): the accessors must return 0, never panic.
+        let body = concat!(
+            "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",",
+            "\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let parsed = parse_stream(body).unwrap();
+        let usage = parsed.usage.expect("usage captured");
+        assert!(usage.prompt_tokens_details.is_none());
+        assert_eq!(usage.cached_tokens(), 0);
+        assert_eq!(usage.cache_creation_tokens(), 0);
+    }
+
+    #[test]
+    fn cache_accessors_return_zero_for_default_usage() {
+        // A zeroed TokenUsage (e.g. the provider's initial total) reports no
+        // cache activity.
+        let usage = TokenUsage::default();
+        assert_eq!(usage.cached_tokens(), 0);
+        assert_eq!(usage.cache_creation_tokens(), 0);
+    }
+
+    #[test]
     fn parse_stream_null_usage_yields_none() {
         // `usage:null` on a chunk must not fabricate a zeroed usage.
         let body = concat!(
@@ -451,9 +576,9 @@ mod tests {
     #[test]
     fn message_to_wire_text_messages() {
         let m = Message::text(Role::User, "hello");
-        let w = message_to_wire(&m);
+        let w = message_to_wire(&m, false);
         assert_eq!(w.role, "user");
-        assert_eq!(w.content.as_deref(), Some("hello"));
+        assert_eq!(w.content, Some(WireContent::Text("hello".to_string())));
         assert!(w.tool_calls.is_empty());
         assert!(w.tool_call_id.is_none());
     }
@@ -466,9 +591,9 @@ mod tests {
             name: "get_weather".to_string(),
             arguments: "{\"city\":\"Beijing\"}".to_string(),
         }];
-        let w = message_to_wire(&m);
+        let w = message_to_wire(&m, true);
         assert_eq!(w.role, "assistant");
-        assert_eq!(w.content.as_deref(), Some("")); // empty content, not omitted
+        assert_eq!(w.content, Some(WireContent::Text(String::new()))); // empty content, not omitted
         assert_eq!(w.tool_calls.len(), 1);
         assert_eq!(w.tool_calls[0].id, "call_1");
         assert_eq!(w.tool_calls[0].function.name, "get_weather");
@@ -478,9 +603,12 @@ mod tests {
     #[test]
     fn message_to_wire_tool_role() {
         let m = Message::tool_result("call_1", "{\"temp\":\"25C\"}");
-        let w = message_to_wire(&m);
+        let w = message_to_wire(&m, false);
         assert_eq!(w.role, "tool");
-        assert_eq!(w.content.as_deref(), Some("{\"temp\":\"25C\"}"));
+        assert_eq!(
+            w.content,
+            Some(WireContent::Text("{\"temp\":\"25C\"}".to_string()))
+        );
         assert_eq!(w.tool_call_id, Some("call_1"));
     }
 
@@ -549,8 +677,73 @@ mod tests {
         // than omit it — OpenAI-compatible endpoints require it on tool
         // messages and may reject otherwise.
         let m = Message::tool_result("call_1", "");
-        let w = message_to_wire(&m);
+        let w = message_to_wire(&m, false);
         assert_eq!(w.role, "tool");
-        assert_eq!(w.content.as_deref(), Some(""));
+        assert_eq!(w.content, Some(WireContent::Text(String::new())));
+    }
+
+    // --- explicit cache marker (llm-cache ticket 03) ----------------------
+
+    #[test]
+    fn message_to_wire_system_with_cache_emits_block_array() {
+        // cache=true + system message → content serializes as a one-block
+        // array carrying `type=text`, the verbatim text and
+        // `cache_control.type=ephemeral`.
+        let m = Message::text(Role::System, "You are slimcode.");
+        let w = message_to_wire(&m, true);
+        let json = serde_json::to_string(&w).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let blocks = v["content"].as_array().expect("content is an array");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "You are slimcode.");
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn message_to_wire_system_without_cache_stays_plain_string() {
+        // cache=false + system message → byte-identical plain string.
+        let m = Message::text(Role::System, "You are slimcode.");
+        let w = message_to_wire(&m, false);
+        assert_eq!(
+            w.content,
+            Some(WireContent::Text("You are slimcode.".to_string()))
+        );
+        let json = serde_json::to_string(&w).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["content"], "You are slimcode.");
+    }
+
+    #[test]
+    fn message_to_wire_non_system_ignores_cache_flag() {
+        // cache=true only ever touches the system message; user messages stay
+        // plain strings.
+        let m = Message::text(Role::User, "hello");
+        let w = message_to_wire(&m, true);
+        assert_eq!(w.content, Some(WireContent::Text("hello".to_string())));
+        let json = serde_json::to_string(&w).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["content"], "hello");
+    }
+
+    #[test]
+    fn message_to_wire_empty_system_with_cache_omits_content() {
+        // An empty system message must not become a cache block; it keeps the
+        // existing omit-content behavior.
+        let m = Message::text(Role::System, "");
+        let w = message_to_wire(&m, true);
+        assert_eq!(w.content, None);
+    }
+
+    #[test]
+    fn message_to_wire_cache_off_keeps_byte_shape_of_other_roles() {
+        // Regression: assistant tool-call empty content, tool messages always
+        // carry content, and empty text omission all hold with cache on.
+        let m = Message::tool_result("call_1", "");
+        let w = message_to_wire(&m, true);
+        assert_eq!(w.content, Some(WireContent::Text(String::new())));
+        let m = Message::text(Role::User, "");
+        let w = message_to_wire(&m, true);
+        assert_eq!(w.content, None);
     }
 }
