@@ -22,47 +22,11 @@ use std::path::{Path, PathBuf};
 use slimcode_agent::agent::{Message, RunConfig, Tool};
 use slimcode_ai::{BailianConfig, BailianProvider};
 use slimcode_common::config::{self, Overrides};
+use slimcode_common::context::ContextBuilder;
 use slimcode_common::history::HistoryStore;
 use slimcode_common::session::{SessionStore, infer_title};
 use slimcode_common::skills::{Skill, SkillStore};
 use slimcode_common::tools;
-
-/// Base system prompt grounding the agent in its tools and working directory.
-/// Skill descriptions are appended on top by [`build_system_prompt`].
-const BASE_SYSTEM_PROMPT: &str = concat!(
-    "You are slimcode, a coding agent that works in a repository directory.\n\n",
-    "## Tools\n\n",
-    "You have these tools: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`.\n\n",
-    "## Working style\n\n",
-    "- Plan with the tools available: inspect files before editing, run commands ",
-    "to verify, and complete the user's task.\n",
-    "- Keep answers concise.\n",
-    "- When a tool fails, read the error and retry with a corrected approach."
-);
-
-/// Build the system prompt for a fresh session: the base grounding plus a list
-/// of auto-invokable skills (those without `disable-model-invocation: true`).
-/// Skills marked `disable-model-invocation` stay out of the system prompt and
-/// are only reachable through an explicit `/name` trigger.
-pub(crate) fn build_system_prompt(skills: &[Skill]) -> String {
-    let mut prompt = BASE_SYSTEM_PROMPT.to_string();
-    let auto: Vec<&Skill> = skills
-        .iter()
-        .filter(|s| !s.disable_model_invocation)
-        .collect();
-    if !auto.is_empty() {
-        prompt.push_str("\n\n## Available skills\n\n");
-        prompt.push_str("Enter the `/name` as a command to apply it:\n\n");
-        for s in auto {
-            prompt.push_str(&format!(
-                "- `/{name}` — {desc}\n",
-                name = s.name,
-                desc = s.description
-            ));
-        }
-    }
-    prompt
-}
 
 fn usage() -> String {
     format!(
@@ -147,13 +111,10 @@ fn run_once(
     let (mut provider, tools) = setup(cwd, config)?;
     let mut session = repl::new_session(store);
     session.title = infer_title(&[Message::text(slimcode_agent::session::Role::User, prompt)]);
-    let messages = vec![
-        Message::text(
-            slimcode_agent::session::Role::System,
-            build_system_prompt(skills),
-        ),
-        Message::text(slimcode_agent::session::Role::User, prompt),
-    ];
+    let messages = ContextBuilder::new()
+        .with_skills(skills)
+        .with_user_prompt(prompt)
+        .build()?;
     let updated = run_turn(&mut provider, &tools, messages, out)?;
     session.messages = updated;
     let path = store.save(&session)?;
@@ -303,83 +264,6 @@ mod tests {
         assert_eq!(code, 0);
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("USAGE"));
-    }
-
-    fn skill(name: &str, desc: &str, disable: bool) -> Skill {
-        Skill {
-            name: name.to_string(),
-            description: desc.to_string(),
-            disable_model_invocation: disable,
-            body: String::new(),
-            scope: slimcode_common::skills::SkillScope::User,
-        }
-    }
-
-    #[test]
-    fn system_prompt_advertises_only_auto_invokable_skills() {
-        let skills = vec![
-            skill("auto", "runs automatically", false),
-            skill("manual", "only on demand", true),
-        ];
-        let prompt = build_system_prompt(&skills);
-        assert!(prompt.contains("## Available skills"), "got: {prompt}");
-        assert!(
-            prompt.contains("- `/auto` — runs automatically"),
-            "got: {prompt}"
-        );
-        assert!(!prompt.contains("manual"), "got: {prompt}");
-        assert!(!prompt.contains("only on demand"));
-    }
-
-    #[test]
-    fn system_prompt_skills_section_is_markdown() {
-        let skills = vec![
-            skill("auto", "runs automatically", false),
-            skill("hist", "history-ish", false),
-        ];
-        let prompt = build_system_prompt(&skills);
-        // Heading + blank line + instruction + blank line + bullet list.
-        assert!(prompt.contains("## Available skills\n\n"), "got: {prompt}");
-        assert!(
-            prompt.contains("Enter the `/name` as a command to apply it:\n\n"),
-            "got: {prompt}"
-        );
-        assert!(
-            prompt.contains("- `/hist` — history-ish\n"),
-            "got: {prompt}"
-        );
-        // The base grounding (markdown) is still present before the skills
-        // heading.
-        assert!(prompt.contains("You are slimcode"), "got: {prompt}");
-    }
-
-    #[test]
-    fn base_system_prompt_is_markdown_structured() {
-        let prompt = build_system_prompt(&[]);
-        // Role line, then markdown sections for tools and working style.
-        assert!(
-            prompt.contains(
-                "You are slimcode, a coding agent that works in a repository directory.\n\n"
-            ),
-            "got: {prompt}"
-        );
-        assert!(prompt.contains("## Tools\n\n"), "got: {prompt}");
-        // Tool names are wrapped in code spans.
-        assert!(prompt.contains("`read`"), "got: {prompt}");
-        assert!(prompt.contains("`bash`"), "got: {prompt}");
-        assert!(prompt.contains("## Working style\n\n"), "got: {prompt}");
-        // Working style is a bullet list.
-        assert!(
-            prompt.contains("- Keep answers concise.\n"),
-            "got: {prompt}"
-        );
-    }
-
-    #[test]
-    fn system_prompt_without_skills_has_no_skills_section() {
-        let prompt = build_system_prompt(&[]);
-        assert!(!prompt.contains("Available skills"));
-        assert!(prompt.contains("read"));
     }
 
     #[test]

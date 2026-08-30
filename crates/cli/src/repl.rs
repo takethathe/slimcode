@@ -8,16 +8,15 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use slimcode_agent::agent::Tool;
-use slimcode_agent::session::{Message, Role};
+use slimcode_agent::session::Message;
 use slimcode_ai::BailianProvider;
 
 use crate::render;
 use slimcode_commands::{COMMANDS, suggest};
+use slimcode_common::context::ContextBuilder;
 use slimcode_common::history::{HISTORY_DISPLAY, HistoryStore};
 use slimcode_common::session::{SessionStore, infer_title, now_rfc3339};
-use slimcode_common::skills::{
-    Skill, SkillScope, SkillStore, find_skill, skill_prompt, suggest_skills,
-};
+use slimcode_common::skills::{Skill, SkillScope, SkillStore, find_skill, suggest_skills};
 
 /// What a line of REPL input means.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,20 +38,6 @@ pub fn classify(line: &str) -> Input {
         return Input::Command(trimmed.to_string());
     }
     Input::Prompt(trimmed.to_string())
-}
-
-/// Build the message history for a new prompt: seed the system prompt on a
-/// fresh session, then append the user message. Pure and testable.
-pub fn messages_for_prompt(
-    mut messages: Vec<Message>,
-    system_prompt: &str,
-    prompt: &str,
-) -> Vec<Message> {
-    if messages.is_empty() {
-        messages.push(Message::text(Role::System, system_prompt));
-    }
-    messages.push(Message::text(Role::User, prompt));
-    messages
 }
 
 /// A line continues a multi-line prompt when its last non-whitespace char is `\`.
@@ -344,9 +329,26 @@ pub fn run(
     Ok(session)
 }
 
-/// Run a prompt as a fresh turn: seed the system prompt on a fresh session,
-/// infer the title, record the prompt in input history immediately, then run
-/// the turn and persist the session. History is written before the turn so a
+/// Assemble this turn's message list through the shared [`ContextBuilder`]: a
+/// fresh session seeds the system prompt (with skills advertised), a continued
+/// session is not re-seeded, and the user message comes from the given closure
+/// (`with_user_prompt` for a prompt, `with_skill` for a skill trigger).
+fn build_context(
+    ctx: &ReplCtx<'_>,
+    session: &mut slimcode_agent::session::Session,
+    user: impl FnOnce(ContextBuilder) -> ContextBuilder,
+) -> Result<Vec<Message>, String> {
+    let skills = ctx.skills.list().unwrap_or_default();
+    let builder = ContextBuilder::new()
+        .with_skills(&skills)
+        .with_history(std::mem::take(&mut session.messages));
+    user(builder).build()
+}
+
+/// Run a prompt as a fresh turn: assemble the message list through the shared
+/// [`ContextBuilder`] (seeding the system prompt on a fresh session), infer
+/// the title, record the prompt in input history immediately, then run the
+/// turn and persist the session. History is written before the turn so a
 /// failed turn still records what was typed (spec US12/US15); a history write
 /// failure is non-fatal.
 fn submit_prompt(
@@ -356,22 +358,33 @@ fn submit_prompt(
     record: bool,
     out: &mut dyn Write,
 ) -> Result<(), String> {
-    let mut messages = std::mem::take(&mut session.messages);
-    let system = if messages.is_empty() {
-        crate::build_system_prompt(&ctx.skills.list().unwrap_or_default())
-    } else {
-        String::new()
-    };
-    messages = messages_for_prompt(messages, &system, prompt);
+    let context = build_context(ctx, session, |b| b.with_user_prompt(prompt))?;
+    let record = if record { Some(prompt) } else { None };
+    finish_turn(ctx, session, context, record, out)
+}
+
+/// Shared tail of a prompt/skill turn: infer the title, optionally record the
+/// raw prompt in input history, run the turn, and persist the session. History
+/// is written before the turn so a failed turn still records what was typed
+/// (spec US12/US15); a history write failure is non-fatal.
+fn finish_turn(
+    ctx: &mut ReplCtx<'_>,
+    session: &mut slimcode_agent::session::Session,
+    context: Vec<Message>,
+    record: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<(), String> {
     if session.title.is_none() {
-        session.title = infer_title(&messages);
+        session.title = infer_title(&context);
     }
-    if record && let Err(e) = ctx.history.append(prompt) {
+    if let Some(prompt) = record
+        && let Err(e) = ctx.history.append(prompt)
+    {
         writeln!(out, "history: {e}").map_err(|e| e.to_string())?;
     }
-    let result = super::run_turn(ctx.provider, ctx.tools, messages, out)?;
+    let result = super::run_turn(ctx.provider, ctx.tools, context, out)?;
     session.messages = result;
-    ctx.store.save(session).map_err(|e| e.to_string())?;
+    ctx.store.save(session)?;
     Ok(())
 }
 
@@ -404,7 +417,8 @@ fn replay_and_report(
 }
 
 /// Submit a skill trigger as a fresh turn. The skill body becomes the user
-/// message and, like every `/` command, is NOT recorded in input history.
+/// message (via the shared builder's `with_skill` path) and, like every `/`
+/// command, is NOT recorded in input history.
 fn submit_skill(
     ctx: &mut ReplCtx<'_>,
     session: &mut slimcode_agent::session::Session,
@@ -412,8 +426,9 @@ fn submit_skill(
     arg: Option<&str>,
     out: &mut dyn Write,
 ) -> Result<(), String> {
-    let prompt = skill_prompt(skill, arg);
-    submit_prompt(ctx, session, &prompt, false, out)
+    let context = build_context(ctx, session, |b| b.with_skill(skill, arg))?;
+    // A skill trigger is a `/` command: never recorded in input history.
+    finish_turn(ctx, session, context, None, out)
 }
 
 /// Combine built-in command suggestions with skill suggestions (both triggered
@@ -529,25 +544,6 @@ mod tests {
             classify("  hi there  "),
             Input::Prompt("hi there".to_string())
         );
-    }
-
-    #[test]
-    fn fresh_prompt_seeds_system_message() {
-        let messages = messages_for_prompt(Vec::new(), "be a coder", "hello");
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].role, Role::System);
-        assert_eq!(messages[0].text_content(), "be a coder");
-        assert_eq!(messages[1].role, Role::User);
-        assert_eq!(messages[1].text_content(), "hello");
-    }
-
-    #[test]
-    fn continued_prompt_does_not_reseed_system() {
-        let history = vec![Message::text(Role::System, "sys")];
-        let messages = messages_for_prompt(history, "", "again");
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].role, Role::System);
-        assert_eq!(messages[1].text_content(), "again");
     }
 
     /// Unique temp dir per test.

@@ -32,7 +32,7 @@ cargo workspace，五个 crate（布局见 `.scratch/slimcode-v1` 的 map）：
 | `crates/ai` | `slimcode-ai` | 统一 LLM provider 层（Provider trait + OpenAI-compatible/Bailian） | 起步（Bailian provider + wire 模型） |
 | `crates/agent` | `slimcode-agent` | agent 运行时、工具、会话状态 | 起步（edit 引擎 + 运行时循环 + 消息模型） |
 | `crates/commands` | `slimcode-commands` | 前端无关的 `/` 命令注册表与预测提示 | v1 新增（registry + suggest/find） |
-| `crates/common` | `slimcode-common` | 前端无关的应用模块（配置解析 / 会话与输入历史持久化 / skills 发现与安装 / 七工具绑定） | v1 新增（自 cli 抽出） |
+| `crates/common` | `slimcode-common` | 前端无关的应用模块（配置解析 / 会话与输入历史持久化 / skills 发现与安装 / 上下文组装 / 七工具绑定） | v1 新增（自 cli 抽出） |
 | `crates/cli` | `slimcode` | 二进制入口 + 终端前端（非交互 + REPL） | v1 完成（render/repl/main） |
 
 ### crates/ai Bailian provider
@@ -127,6 +127,13 @@ crates/cli 的 `combined_suggestions`）。
   `<scope>/skills/<name>/SKILL.md`）、纯函数 `find_skill` / `suggest_skills` /
   `skill_prompt`；`disable-model-invocation: true` 的 skill 不进系统提示词，
   只通过显式 `/name` 触发；
+- `context`：`ContextBuilder`（前端无关）把一轮 prompt 的上下文组装收敛为单一
+  入口：基础系统提示（默认 `DEFAULT_SYSTEM_PROMPT` 或 `with_system` 覆盖）+
+  可自动调用 skill 广告（`with_skills`，build 时过滤 `disable-model-invocation`）+
+  可选 message history（`with_history`，非空不重复插 system）+ user prompt（
+  `with_user_prompt`）或 skill 触发（`with_skill`，复用 `skill_prompt`）；
+  `build()` 返回可直接交给 `run_agent_from_messages` 的 `Vec<Message>`，缺
+  user 时报错；空 history 前置一条 system 消息；
 - `tools`：把七工具 factory 绑定到启动 `cwd`。
 
 ### crates/cli 二进制（`slimcode`）
@@ -134,7 +141,8 @@ crates/cli 的 `combined_suggestions`）。
 两种模式，I/O 与逻辑分离（`run(args, out)` 便于测试）：
 
 - **非交互**：`slimcode "<prompt>"`（可 `--cwd <dir>`、`--model <model>`、
-  `--base-url <url>`）跑一轮七工具循环、流式渲染事件、
+  `--base-url <url>`）经共享 `ContextBuilder` 组装消息列表（新会话首轮前置系统
+  提示并广告可自动调用 skill），跑一轮七工具循环、流式渲染事件、
   打印 token 用量并保存会话；
 - **REPL**：`slimcode` 进入行式循环，`/` 命令控制（`/help /new /load <id> /sessions
   /usage /save /history /!! /!N /exit`），每轮自动保存会话。
@@ -143,13 +151,13 @@ crates/cli 的 `combined_suggestions`）。
 
 - `render`：`AgentEvent` → 终端输出（流式文本 / 结构行 / 用量汇总），原始
   tool_call delta 与 `Done` 事件被抑制；
-- `repl`：行式循环；`messages_for_prompt` 在**新会话**首轮前置系统提示（恢复的
-  会话历史已含系统消息，不重复），系统提示由 `build_system_prompt(skills)` 动态生成
-  ——基础提示 + 可自动调用的 skill 列表（`disable-model-invocation: true` 的
-  skill 描述**不**进系统提示）；基础提示与 skill 段落均以 markdown 结构呈现
-  （基础提示：`## Tools` / `## Working style` 小节，工具名反引号包裹、工作准则
-  为 bullet 列表；skill 段落：`## Available skills` 标题 + 反引号包裹 `/name`
-  的 bullet 列表）；`/load` 经 `SessionStore::load` 恢复历史；
+- `repl`：行式循环；每轮通过共享的 `ContextBuilder` 组装消息列表：**新会话**
+  首轮自动前置系统提示并广告可自动调用的 skill，恢复的会话历史已含系统消息，
+  不重复插 system（`disable-model-invocation: true` 的 skill 描述**不**进系统
+  提示）；基础提示与 skill 段落均以 markdown 结构呈现（基础提示：`## Tools` /
+  `## Working style` 小节，工具名反引号包裹、工作准则为 bullet 列表；skill
+  段落：`## Available skills` 标题 + 反引号包裹 `/name` 的 bullet 列表）；
+  `/load` 经 `SessionStore::load` 恢复历史；
   输入历史 `/history`（最近 20 条、最新在前、带编号）/`/!!`/`/!N` 重跑（verbatim、
   作为新一轮 prompt、不再写入历史）；多行 prompt 用行尾 `\` 续行、空行或非 `\` 行
   提交（无 readline 依赖、无 raw mode，见 ADR-0001）；纯函数 `is_continuation` /
@@ -162,8 +170,8 @@ crates/cli 的 `combined_suggestions`）。
   （先 `inspect` 校验源与 name，拒绝与内置命令重名），`/name` 精确命中时把
   skill 体作为用户消息跑一轮（不写入 input history）；未知 `/` 命令的预测提示
   由 `combined_suggestions` 合并内置命令与 skill（`suggest_skills`）；
-- 前端无关的 `config` / `session` / `history` / `skills` / `tools` 已移入
-  `slimcode-common`（见上节），cli 只消费它们，不再各自实现。
+- 前端无关的 `config` / `session` / `history` / `skills` / `context` / `tools` 已
+  移入 `slimcode-common`（见上节），cli 只消费它们，不再各自实现。
 
 agent crate 的 `agent` 模块 `pub use session::{Message, Role, ToolCall}`，CLI 统一从
 `slimcode_agent::agent` 引用消息类型。

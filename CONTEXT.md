@@ -32,6 +32,14 @@ _Avoid_: history (bare — collides with input history)
 The previously submitted Prompts in the REPL, persisted across runs; a UI concern, not part of a Session.
 _Avoid_: history (bare — collides with message history), shell history
 
+**Context**:
+The assembled list of Messages for one turn, produced by `ContextBuilder::build()`
+and handed straight to the agent runtime. Built from a base system prompt (default or
+overridden), an advertised skills list, an optional message history, and a user prompt
+or skill trigger. Distinct from message history (`session.messages`, which may be the
+`with_history` input) and from input history.
+_Avoid_: context window (collides with the LLM notion), assembled messages
+
 **Multi-line prompt**:
 A Prompt entered across multiple lines via continuation (a line ending in `\`, or best-effort Shift+Enter). Stored and submitted as a single Prompt.
 _Avoid_: block, paste
