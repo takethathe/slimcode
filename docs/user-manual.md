@@ -86,6 +86,18 @@ slimcode
 | `/!N` | 重跑编号 N 的 prompt（verbatim，多行原样） |
 | `/exit` / `/quit` | 退出 |
 
+#### `/` 命令预测提示
+
+输入未知的 `/` 命令时，REPL 会给出**预测提示**（来自前端无关的命令注册表
+`slimcode-commands`）：
+
+- 按已输入前缀匹配命令名或其别名，例如 `/his` → `did you mean: /history`；
+- 前缀仅为 `/` 时列出全部命令；
+- 完全无法匹配时提示运行 `/help`。
+
+`/help` 的命令列表、启动时的命令提示条也由同一注册表生成，保证单一事实来源；
+未来其它前端（TUI / Web 等）可复用同一套命令定义与补全逻辑。
+
 ### 输入历史与多行 prompt
 
 输入历史（`input history`，区别于会话的消息历史 `message history`）记录你提交过的

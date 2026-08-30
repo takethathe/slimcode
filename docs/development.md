@@ -25,12 +25,13 @@ cargo clippy --all-targets --all-features --message-format=json -- -D warnings
 
 ## 架构
 
-cargo workspace，三个 crate（布局见 `.scratch/slimcode-v1` 的 map）：
+cargo workspace，四个 crate（布局见 `.scratch/slimcode-v1` 的 map）：
 
 | crate | 包名 | 职责 | 状态 |
 | --- | --- | --- | --- |
 | `crates/ai` | `slimcode-ai` | 统一 LLM provider 层（Provider trait + OpenAI-compatible/Bailian） | 起步（Bailian provider + wire 模型） |
 | `crates/agent` | `slimcode-agent` | agent 运行时、工具、会话状态 | 起步（edit 引擎 + 运行时循环 + 消息模型） |
+| `crates/commands` | `slimcode-commands` | 前端无关的 `/` 命令注册表与预测提示 | v1 新增（registry + suggest/find） |
 | `crates/cli` | `slimcode` | 二进制入口（非交互 + REPL） | v1 完成（配置/渲染/会话/REPL + 七工具绑定） |
 
 ### crates/ai Bailian provider
@@ -83,6 +84,21 @@ cargo workspace，三个 crate（布局见 `.scratch/slimcode-v1` 的 map）：
 - `Provider` trait 是 crates/ai 已实现的 seam（当前同步、无 async 依赖，真实 provider 内部处理阻塞边界）；
 - 流式 delta（`Reasoning`/`Text`/`ToolCallStart`/`ToolCallArgs`/`Done`）镜像 ticket 05 实测 wire 形状，`assemble` 负责拼接。
 
+### crates/commands 命令注册表（`slimcode-commands`）
+
+前端无关的 `/` 命令定义与预测逻辑（纯数据 + 纯函数，无 I/O、无依赖）：
+
+- `Command`：规范名 `name`、别名 `aliases`、用法串 `usage`（含参数占位，如
+  `/load <id>`）、描述 `description`、匹配种类 `kind`；
+- `CommandKind::Exact`（按规范名/别名精确或前缀匹配）与
+  `CommandKind::Numbered`（如 `/!N`：`name` 后跟数字序列，匹配 `/!3`）；
+- `COMMANDS`：命令注册表的单一事实来源（`/help`、启动 banner、未知命令提示均由此生成）；
+- `find(input)`：精确解析规范名或别名到命令；
+- `suggest(input)`：按前缀预测匹配命令（`/` 单独列出全部，非 `/` 输入返回空）。
+
+设计上不绑定任何前端：当前行式 REPL 消费它做 `/help` 与未知命令的 `did you
+mean` 提示，未来 TUI/Web 前端可直接复用同一注册表与补全逻辑。
+
 ### crates/cli 二进制（`slimcode`）
 
 两种模式，I/O 与逻辑分离（`run(args, out)` 便于测试）：
@@ -112,7 +128,9 @@ cargo workspace，三个 crate（布局见 `.scratch/slimcode-v1` 的 map）：
   作为新一轮 prompt、不再写入历史）；多行 prompt 用行尾 `\` 续行、空行或非 `\` 行
   提交（无 readline 依赖、无 raw mode，见 ADR-0001）；纯函数 `is_continuation` /
   `strip_continuation` / `accumulate` / `parse_replay` / `resolve_replay_index` /
-  `render_history` 承接测试，共享依赖收在 `ReplCtx`；
+  `render_history` 承接测试，共享依赖收在 `ReplCtx`；`/help` 与启动 banner 由
+  `slimcode-commands::COMMANDS` 生成，未知 `/` 命令用 `suggest` 给出 `did you
+  mean` 预测提示；
 - `tools`：把七工具 factory 绑定到启动 `cwd`。
 
 agent crate 的 `agent` 模块 `pub use session::{Message, Role, ToolCall}`，CLI 统一从

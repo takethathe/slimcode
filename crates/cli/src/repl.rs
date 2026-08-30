@@ -13,6 +13,7 @@ use slimcode_ai::BailianProvider;
 use crate::history::{HISTORY_DISPLAY, HistoryStore};
 use crate::render;
 use crate::session::{SessionStore, infer_title};
+use slimcode_commands::{COMMANDS, suggest};
 
 /// What a line of REPL input means.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -156,11 +157,12 @@ pub fn run(
     input: &mut dyn BufRead,
 ) -> Result<slimcode_agent::session::Session, String> {
     writeln!(out, "slimcode REPL — cwd: {}", cwd.display()).map_err(|e| e.to_string())?;
-    writeln!(
-        out,
-        "  /help  /new  /load  /sessions  /usage  /save  /history  /!!  /!N  /exit"
-    )
-    .map_err(|e| e.to_string())?;
+    let banner = COMMANDS
+        .iter()
+        .map(|c| c.usage)
+        .collect::<Vec<_>>()
+        .join("  ");
+    writeln!(out, "  {banner}").map_err(|e| e.to_string())?;
 
     let mut pending = String::new();
     loop {
@@ -191,11 +193,21 @@ pub fn run(
                 };
                 match name {
                     "/help" => {
-                        writeln!(
-                            out,
-                            "commands: /help /new /load <id> /sessions /usage /save /history /!! /!N /exit"
-                        )
-                        .map_err(|e| e.to_string())?;
+                        writeln!(out, "commands:").map_err(|e| e.to_string())?;
+                        let width = COMMANDS
+                            .iter()
+                            .map(|c| c.usage.chars().count())
+                            .max()
+                            .unwrap_or(0);
+                        for c in COMMANDS {
+                            let alias = if c.aliases.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" (alias: {})", c.aliases.join(", "))
+                            };
+                            writeln!(out, "  {:<width$}  {}{}", c.usage, c.description, alias)
+                                .map_err(|e| e.to_string())?;
+                        }
                         writeln!(
                             out,
                             "multi-line: end a line with \\ to continue; a blank line submits"
@@ -248,6 +260,15 @@ pub fn run(
                     },
                     other => {
                         writeln!(out, "unknown command: {other}").map_err(|e| e.to_string())?;
+                        let matches = suggest(other);
+                        if matches.is_empty() {
+                            writeln!(out, "  run /help to list commands")
+                                .map_err(|e| e.to_string())?;
+                        } else {
+                            let names: Vec<_> = matches.iter().map(|c| c.usage).collect();
+                            writeln!(out, "  did you mean: {}", names.join(", "))
+                                .map_err(|e| e.to_string())?;
+                        }
                     }
                 }
             }
@@ -690,6 +711,103 @@ mod tests {
         };
         let err = run(&mut ctx, &dir, new_session(&store), &mut out, &mut input).unwrap_err();
         assert!(err.contains("session id"), "err: {err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_command_suggests_candidates() {
+        // A typo'd `/` command is met with a predictive hint, not a dead end.
+        let dir = temp_dir();
+        let store = SessionStore::new(&dir);
+        let history = HistoryStore::new(dir.join("history.json"));
+        let mut provider = dummy_provider();
+        let tools: Vec<Tool> = Vec::new();
+        let mut out = Vec::new();
+        let mut input = "/his\n/exit\n".as_bytes();
+        let mut ctx = ReplCtx {
+            provider: &mut provider,
+            tools: &tools,
+            store: &store,
+            history: &history,
+        };
+        run(&mut ctx, &dir, new_session(&store), &mut out, &mut input).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("unknown command: /his"), "got: {s}");
+        assert!(s.contains("did you mean: /history"), "got: {s}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_command_no_match_hints_help() {
+        // A completely unknown command points at `/help` instead.
+        let dir = temp_dir();
+        let store = SessionStore::new(&dir);
+        let history = HistoryStore::new(dir.join("history.json"));
+        let mut provider = dummy_provider();
+        let tools: Vec<Tool> = Vec::new();
+        let mut out = Vec::new();
+        let mut input = "/zzz\n/exit\n".as_bytes();
+        let mut ctx = ReplCtx {
+            provider: &mut provider,
+            tools: &tools,
+            store: &store,
+            history: &history,
+        };
+        run(&mut ctx, &dir, new_session(&store), &mut out, &mut input).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("unknown command: /zzz"), "got: {s}");
+        assert!(s.contains("run /help to list commands"), "got: {s}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bare_slash_suggests_every_command() {
+        // A lone `/` is the broadest prediction: every command is suggested.
+        let dir = temp_dir();
+        let store = SessionStore::new(&dir);
+        let history = HistoryStore::new(dir.join("history.json"));
+        let mut provider = dummy_provider();
+        let tools: Vec<Tool> = Vec::new();
+        let mut out = Vec::new();
+        let mut input = "/\n/exit\n".as_bytes();
+        let mut ctx = ReplCtx {
+            provider: &mut provider,
+            tools: &tools,
+            store: &store,
+            history: &history,
+        };
+        run(&mut ctx, &dir, new_session(&store), &mut out, &mut input).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("did you mean: /help"), "got: {s}");
+        assert!(s.contains("/load <id>"), "got: {s}");
+        assert!(s.contains("/!N"), "got: {s}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn help_lists_registered_commands() {
+        // `/help` is generated from the shared registry: names, usage and
+        // descriptions all come through.
+        let dir = temp_dir();
+        let store = SessionStore::new(&dir);
+        let history = HistoryStore::new(dir.join("history.json"));
+        let mut provider = dummy_provider();
+        let tools: Vec<Tool> = Vec::new();
+        let mut out = Vec::new();
+        let mut input = "/help\n/exit\n".as_bytes();
+        let mut ctx = ReplCtx {
+            provider: &mut provider,
+            tools: &tools,
+            store: &store,
+            history: &history,
+        };
+        run(&mut ctx, &dir, new_session(&store), &mut out, &mut input).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("list commands"), "got: {s}");
+        assert!(s.contains("/load <id>"), "got: {s}");
+        assert!(s.contains("load a saved session"), "got: {s}");
+        assert!(s.contains("alias: /resume"), "got: {s}");
+        assert!(s.contains("alias: /quit"), "got: {s}");
         let _ = fs::remove_dir_all(&dir);
     }
 }

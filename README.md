@@ -7,19 +7,22 @@
 ## 特性
 
 - 单次非交互模式：`slimcode "为 README 补一段简介"`
-- 交互式 REPL：`/help`、`/new`、`/load`、`/save`、`/usage`、`/history` 等命令
+- 交互式 REPL：`/help`、`/new`、`/load`、`/save`、`/usage`、`/history` 等命令，
+  未知 `/` 命令给出预测提示（前缀匹配建议）
 - 流式渲染 agent 输出，会话每轮自动保存
 - 基于 DashScope（百炼）OpenAI 兼容接口，默认使用 `qwen-plus` 模型
 - 多行 prompt（以 `\` 结尾续行）与跨运行输入历史
+- 前端无关的命令注册表与预测逻辑（`slimcode-commands`），可供其它前端复用
 
 ## 架构
 
-cargo workspace，三个 crate：
+cargo workspace，四个 crate：
 
 | crate | 包名 | 职责 |
 | --- | --- | --- |
 | `crates/ai` | `slimcode-ai` | 统一 LLM provider 层（Provider trait + OpenAI-compatible/Bailian） |
 | `crates/agent` | `slimcode-agent` | agent 运行时、七工具引擎、会话消息模型 |
+| `crates/commands` | `slimcode-commands` | 前端无关的 `/` 命令注册表与预测提示（suggest/find） |
 | `crates/cli` | `slimcode` | 二进制入口（非交互模式 + REPL） |
 
 ## 安装
@@ -103,6 +106,11 @@ slimcode
 | `/!!` | 重跑最近一条 prompt |
 | `/!N` | 重跑编号 N 的 prompt |
 | `/exit` / `/quit` | 退出 |
+
+输入未知的 `/` 命令时会给出**预测提示**：按已输入前缀匹配命令名或其别名
+（如 `/his` → `did you mean: /history`），前缀为 `/` 时列出全部命令，完全无法
+匹配时提示运行 `/help`。该提示来自前端无关的 `slimcode-commands` 注册表，
+任何前端（当前 REPL、未来 TUI/Web）都能复用同一套命令定义与补全逻辑。
 
 ## 文档
 

@@ -1024,6 +1024,7 @@ dependencies = [
  "serde_json",
  "slimcode-agent",
  "slimcode-ai",
+ "slimcode-commands",
  "toml",
 ]
 
@@ -1044,6 +1045,10 @@ dependencies = [
  "serde_json",
  "slimcode-agent",
 ]
+
+[[package]]
+name = "slimcode-commands"
+version = "0.1.0"
 
 [[package]]
 name = "smallvec"
