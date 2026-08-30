@@ -5,6 +5,7 @@ members = ["crates/ai", "crates/agent", "crates/cli"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [workspace.dependencies]
 slimcode-ai = { path = "crates/ai" }

@@ -111,3 +111,7 @@ slimcode
 - [开发文档](docs/development.md)：架构、设计决策、构建/测试方法
 - [说明文档](docs/explanation.md)：背景、概念与设计动机
 - [ADR 目录](docs/adr/)：架构决策记录
+
+## 许可证
+
+[MIT](LICENSE)
