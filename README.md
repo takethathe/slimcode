@@ -34,12 +34,19 @@ cargo build --release
 
 ## 配置
 
-配置分三层，优先级从高到低：环境变量 > `config.toml` > 默认值。
+配置分四层，优先级从高到低：命令行参数 > 环境变量 > `config.toml` > 默认值。
 
 - **API key（必填）**：只从环境变量 `DASHSCOPE_API_KEY` 读取，绝不落盘：
 
   ```bash
   export DASHSCOPE_API_KEY=sk-...
+  ```
+
+- **命令行参数（可选，临时生效）**：`--model <model>` 覆盖模型 id，
+  `--base-url <url>` 覆盖端点 base URL：
+
+  ```bash
+  slimcode --model qwen-max "为 README 补一段简介"
   ```
 
 - **config.toml（可选）**：位于 `~/.slimcode/config.toml`（可用 `SLIMCODE_HOME`
@@ -69,6 +76,7 @@ cargo build --release
 ```bash
 slimcode "为 README 补一段简介"
 slimcode --cwd /path/to/repo "运行 cargo test 并修复失败用例"
+slimcode --model qwen-max "为 README 补一段简介"
 ```
 
 运行结束后打印 token 用量与本次会话的保存路径。
@@ -99,7 +107,7 @@ slimcode
 ## 文档
 
 - [用户手册](docs/user-manual.md)：安装、配置与使用方式
-- [配置文档](docs/configuration.md)：三层配置来源、config.toml 与环境变量使用说明
+- [配置文档](docs/configuration.md)：四层配置来源、config.toml、环境变量与命令行参数使用说明
 - [开发文档](docs/development.md)：架构、设计决策、构建/测试方法
 - [说明文档](docs/explanation.md)：背景、概念与设计动机
 - [ADR 目录](docs/adr/)：架构决策记录

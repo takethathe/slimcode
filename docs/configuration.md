@@ -1,26 +1,27 @@
 # slimcode 配置文档
 
-> 本文件说明 slimcode 的配置方式：三层配置来源、每个配置项的取值规则与常见用法。
+> 本文件说明 slimcode 的配置方式：四层配置来源、每个配置项的取值规则与常见用法。
 > 随代码变更同步维护。实现见 `crates/cli/src/config.rs` 与 `crates/ai/src/config.rs`。
 
 ## 配置总览
 
-slimcode 的配置分三层，**逐项**按以下优先级解析（高 → 低）：
+slimcode 的配置分四层，**逐项**按以下优先级解析（高 → 低）：
 
-1. **环境变量**
-2. **`config.toml` 文件**
-3. **内置默认值**
+1. **命令行参数**
+2. **环境变量**
+3. **`config.toml` 文件**
+4. **内置默认值**
 
-三者共同决定最终配置：API key 只从环境变量读取；base URL 与 model 遵循
-「环境变量 > 文件 > 默认值」的覆盖顺序。
+四者共同决定最终配置：API key 只从环境变量读取；base URL 与 model 遵循
+「命令行参数 > 环境变量 > 文件 > 默认值」的覆盖顺序。
 
 ## 配置项
 
 | 配置项 | 来源 | 默认值 | 是否必填 |
 | --- | --- | --- | --- |
 | API key | 环境变量 `DASHSCOPE_API_KEY` | — | **必填** |
-| base URL | 环境变量 `SLIMCODE_AI_BASE_URL` 或 `config.toml` 的 `[ai] base_url` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | 否 |
-| model | 环境变量 `SLIMCODE_AI_MODEL` 或 `config.toml` 的 `[ai] model` | `qwen-plus` | 否 |
+| base URL | 命令行 `--base-url` 或环境变量 `SLIMCODE_AI_BASE_URL` 或 `config.toml` 的 `[ai] base_url` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | 否 |
+| model | 命令行 `--model` 或环境变量 `SLIMCODE_AI_MODEL` 或 `config.toml` 的 `[ai] model` | `qwen-plus` | 否 |
 | slimcode 家目录 | 环境变量 `SLIMCODE_HOME` | `~/.slimcode` | 否 |
 
 ### API key
@@ -43,6 +44,20 @@ export SLIMCODE_HOME=/path/to/custom/slimcode
 
 未设置 `SLIMCODE_HOME` 且 `$HOME` 为空时，slimcode 不加载 `config.toml`（文件
 加载被跳过），base URL 与 model 直接使用默认值。
+
+## 命令行参数
+
+启动时可用 `--model` 与 `--base-url` 临时覆盖模型与端点，**优先于**环境变量、
+`config.toml` 与默认值：
+
+```bash
+slimcode --model qwen-max "为 README 补一段简介"
+slimcode --model qwen-max --base-url https://my.example.com/v1 "列出当前目录"
+```
+
+- 两个参数均可选，可只写其中一个，另一项回落到环境变量 / 文件 / 默认值。
+- 参数需紧跟其值（如 `--model qwen-max`）；缺少值时启动报错。
+- 两个参数都只作用于当次启动，不写入任何文件。
 
 ## config.toml 文件
 
@@ -80,8 +95,8 @@ model = "qwen-plus"
 | `SLIMCODE_AI_MODEL` | 覆盖模型 id | 高于 `config.toml` |
 | `SLIMCODE_HOME` | 覆盖 slimcode 家目录 | 高于默认 `~/.slimcode` |
 
-`SLIMCODE_AI_BASE_URL` / `SLIMCODE_AI_MODEL` 若同时出现在环境变量与
-`config.toml` 中，**环境变量优先**。
+`SLIMCODE_AI_BASE_URL` / `SLIMCODE_AI_MODEL` 若同时出现在命令行、环境变量与
+`config.toml` 中，**命令行参数优先，环境变量次之**。
 
 ## 使用示例
 
@@ -107,6 +122,12 @@ slimcode "运行 cargo test 并修复失败用例"
 
 ```bash
 SLIMCODE_AI_MODEL=qwen-turbo slimcode "列出当前目录"
+```
+
+### 命令行参数临时覆盖
+
+```bash
+slimcode --model qwen-max --base-url https://my.example.com/v1 "列出当前目录"
 ```
 
 ### 校验配置

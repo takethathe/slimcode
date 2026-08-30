@@ -7,9 +7,10 @@
 //! - `slimcode` — line-based REPL that keeps a session and persists it after
 //!   every turn.
 //!
-//! Config (Q9): `~/.slimcode/config.toml` overrides defaults; env
-//! (`SLIMCODE_AI_BASE_URL` / `SLIMCODE_AI_MODEL`) overrides the file; the API
-//! key comes only from `DASHSCOPE_API_KEY`.
+//! Config (Q9): CLI (`--base-url` / `--model`) overrides env
+//! (`SLIMCODE_AI_BASE_URL` / `SLIMCODE_AI_MODEL`), which overrides the file
+//! (`~/.slimcode/config.toml`), which overrides defaults; the API key comes
+//! only from `DASHSCOPE_API_KEY`.
 
 mod config;
 mod history;
@@ -28,7 +29,7 @@ use std::path::{Path, PathBuf};
 use slimcode_agent::agent::{Message, RunConfig, Tool};
 use slimcode_ai::{BailianConfig, BailianProvider};
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, CliOverrides};
 use crate::history::HistoryStore;
 use crate::session::SessionStore;
 
@@ -49,13 +50,17 @@ fn usage() -> String {
          slimcode --cwd <dir> \"<prompt>\"  run one prompt in <dir>\n  \
          slimcode                       start the interactive REPL\n  \
          slimcode --help                show this help\n\n\
+         OPTIONS:\n  \
+         --cwd <dir>         working directory for the agent\n  \
+         --model <model>     override model id (default: {})\n  \
+         --base-url <url>    override endpoint (default: {})\n\n\
          ENV:\n  \
          DASHSCOPE_API_KEY       API key (required)\n  \
-         SLIMCODE_AI_BASE_URL    override endpoint (default: {}),\n  \
-         SLIMCODE_AI_MODEL       override model (default: {})\n  \
+         SLIMCODE_AI_BASE_URL    override endpoint\n  \
+         SLIMCODE_AI_MODEL       override model\n  \
          SLIMCODE_HOME           override ~/.slimcode\n",
-        slimcode_ai::DEFAULT_BASE_URL,
-        slimcode_ai::DEFAULT_MODEL
+        slimcode_ai::DEFAULT_MODEL,
+        slimcode_ai::DEFAULT_BASE_URL
     )
 }
 
@@ -181,8 +186,43 @@ fn run(args: &[String], out: &mut dyn Write) -> Result<i32, String> {
         return Ok(0);
     }
 
-    let mut cwd = env::current_dir().map_err(|e| format!("cwd: {e}"))?;
-    let mut prompt: Option<String> = None;
+    let parsed = parse_args(args)?;
+    let cwd = match parsed.cwd {
+        Some(dir) => dir,
+        None => env::current_dir().map_err(|e| format!("cwd: {e}"))?,
+    };
+
+    let config = AppConfig::load_with_overrides(CliOverrides {
+        base_url: parsed.base_url,
+        model: parsed.model,
+    })?;
+    let home =
+        config::slimcode_home().ok_or_else(|| "cannot determine home directory".to_string())?;
+    let store = SessionStore::new(home.join("sessions"));
+    let history = HistoryStore::new(home.join("history.json"));
+
+    match parsed.prompt {
+        Some(p) => run_once(&p, &cwd, config, &store, out),
+        None => run_repl(&cwd, config, &store, &history, out),
+    }
+}
+
+/// Parsed command-line arguments (before config resolution).
+#[derive(Debug, PartialEq, Eq)]
+struct CliArgs {
+    cwd: Option<PathBuf>,
+    prompt: Option<String>,
+    base_url: Option<String>,
+    model: Option<String>,
+}
+
+/// Pure flag/positional parsing, separated from I/O for unit testing. The first
+/// non-flag argument is the prompt; anything after it is ignored with a warning.
+fn parse_args(args: &[String]) -> Result<CliArgs, String> {
+    let mut cwd = None;
+    let mut prompt = None;
+    let mut base_url = None;
+    let mut model = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -191,7 +231,21 @@ fn run(args: &[String], out: &mut dyn Write) -> Result<i32, String> {
                 let dir = args
                     .get(i)
                     .ok_or_else(|| "--cwd needs a directory".to_string())?;
-                cwd = PathBuf::from(dir);
+                cwd = Some(PathBuf::from(dir));
+            }
+            "--model" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "--model needs a value".to_string())?;
+                model = Some(value.to_string());
+            }
+            "--base-url" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "--base-url needs a value".to_string())?;
+                base_url = Some(value.to_string());
             }
             other => {
                 prompt = Some(other.to_string());
@@ -204,17 +258,12 @@ fn run(args: &[String], out: &mut dyn Write) -> Result<i32, String> {
         }
         i += 1;
     }
-
-    let config = AppConfig::load()?;
-    let home =
-        config::slimcode_home().ok_or_else(|| "cannot determine home directory".to_string())?;
-    let store = SessionStore::new(home.join("sessions"));
-    let history = HistoryStore::new(home.join("history.json"));
-
-    match prompt {
-        Some(p) => run_once(&p, &cwd, config, &store, out),
-        None => run_repl(&cwd, config, &store, &history, out),
-    }
+    Ok(CliArgs {
+        cwd,
+        prompt,
+        base_url,
+        model,
+    })
 }
 
 #[cfg(test)]
@@ -275,5 +324,46 @@ mod tests {
         render_events(&events, &mut buf).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert_eq!(s, "done\n✓ done\n");
+    }
+
+    #[test]
+    fn parse_args_reads_model_and_base_url_flags() {
+        let args = vec![
+            "--model".to_string(),
+            "cli-model".to_string(),
+            "--base-url".to_string(),
+            "https://cli.example.com/v1".to_string(),
+            "hello".to_string(),
+        ];
+        let parsed = parse_args(&args).unwrap();
+        assert_eq!(parsed.model.as_deref(), Some("cli-model"));
+        assert_eq!(
+            parsed.base_url.as_deref(),
+            Some("https://cli.example.com/v1")
+        );
+        assert_eq!(parsed.prompt.as_deref(), Some("hello"));
+        assert_eq!(parsed.cwd, None);
+    }
+
+    #[test]
+    fn parse_args_cwd_flag_reads_directory() {
+        let args = vec!["--cwd".to_string(), "/tmp/repo".to_string()];
+        let parsed = parse_args(&args).unwrap();
+        assert_eq!(parsed.cwd, Some(PathBuf::from("/tmp/repo")));
+        assert_eq!(parsed.prompt, None);
+    }
+
+    #[test]
+    fn parse_args_missing_model_value_errors() {
+        let args = vec!["--model".to_string()];
+        let err = parse_args(&args).unwrap_err();
+        assert!(err.contains("--model"), "err: {err}");
+    }
+
+    #[test]
+    fn parse_args_missing_base_url_value_errors() {
+        let args = vec!["--base-url".to_string()];
+        let err = parse_args(&args).unwrap_err();
+        assert!(err.contains("--base-url"), "err: {err}");
     }
 }

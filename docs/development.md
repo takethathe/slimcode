@@ -87,15 +87,17 @@ cargo workspace，三个 crate（布局见 `.scratch/slimcode-v1` 的 map）：
 
 两种模式，I/O 与逻辑分离（`run(args, out)` 便于测试）：
 
-- **非交互**：`slimcode "<prompt>"`（可 `--cwd <dir>`）跑一轮七工具循环、流式渲染事件、
+- **非交互**：`slimcode "<prompt>"`（可 `--cwd <dir>`、`--model <model>`、
+  `--base-url <url>`）跑一轮七工具循环、流式渲染事件、
   打印 token 用量并保存会话；
 - **REPL**：`slimcode` 进入行式循环，`/` 命令控制（`/help /new /load <id> /sessions
   /usage /save /history /!! /!N /exit`），每轮自动保存会话。
 
 模块：
 
-- `config`：`config.toml`（非敏感）< env 覆盖 < 默认值；API key 只来自
-  `DASHSCOPE_API_KEY`；`load()` 委托 `load_from(path)` 复用文件加载逻辑；
+- `config`：CLI 参数（`--base-url` / `--model`）> env 覆盖 > `config.toml`
+  （非敏感）> 默认值；API key 只来自 `DASHSCOPE_API_KEY`；
+  `load_with_overrides(overrides)` 委托 `load_from(path, overrides)` 复用文件加载逻辑；
 - `render`：`AgentEvent` → 终端输出（流式文本 / 结构行 / 用量汇总），原始
   tool_call delta 与 `Done` 事件被抑制；
 - `session`：`SessionStore`（`~/.slimcode/sessions/<id>.json`），id

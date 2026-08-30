@@ -5,5 +5,5 @@
 | [development.md](./development.md) | 开发文档：架构、设计决策、构建/测试方法 |
 | [explanation.md](./explanation.md) | 说明文档：背景、概念、设计动机与原理 |
 | [user-manual.md](./user-manual.md) | 用户手册：安装、配置与使用方式 |
-| [configuration.md](./configuration.md) | 配置文档：三层配置来源、config.toml 与环境变量使用说明 |
+| [configuration.md](./configuration.md) | 配置文档：四层配置来源、config.toml、环境变量与命令行参数使用说明 |
 | [ADR 目录](./adr/) | 架构决策记录（如无依赖 REPL 输入历史） |
