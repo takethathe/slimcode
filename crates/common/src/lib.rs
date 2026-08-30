@@ -1,7 +1,7 @@
 //! slimcode-common: frontend-agnostic application modules.
 //!
-//! Everything here is reusable by any frontend — the current line-based REPL,
-//! a future TUI, or a web UI — without depending on the terminal binary.
+//! Everything here is reusable by any frontend — the one-shot CLI, the TUI,
+//! or a web UI — without depending on the terminal binary.
 //!
 //! Modules:
 //! - [`config`]: four-layer config resolution (frontend overrides > env >
@@ -13,11 +13,19 @@
 //! - [`context`]: `ContextBuilder` assembling one turn's message list from a
 //!   system prompt, skills, history, and a user prompt / skill trigger.
 //! - [`tools`]: the seven-tool set bound to a working directory.
+//! - [`render`]: the frontend-agnostic renderer seam — `DisplayItem`,
+//!   `map_event`, and the `Renderer` trait (ADR-0004).
+//! - [`runner`]: the shared turn loop that streams every `AgentEvent` to a
+//!   `Renderer` live (ADR-0004).
+//! - [`setup`]: shared frontend runtime construction (provider + tools).
 
 pub mod config;
 pub mod context;
 pub mod history;
+pub mod render;
+pub mod runner;
 pub mod session;
+pub mod setup;
 pub mod skills;
 pub mod tools;
 

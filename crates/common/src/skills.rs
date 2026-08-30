@@ -4,15 +4,18 @@
 //! frontmatter carrying `name`, `description`, and an optional
 //! `disable-model-invocation` flag. Skills are discovered from two scopes —
 //! user (`<home>/skills/`) and project (`<cwd>/.slimcode/skills/`) — and are
-//! triggered from the REPL as `/name` commands, just like the built-in
-//! commands. Only skills whose `disable_model_invocation` is false have their
-//! description advertised to the model (via the system prompt); a skill marked
-//! `disable-model-invocation: true` is available only through an explicit
+//! triggered from an interactive frontend (the TUI) as `/name` commands, just
+//! like the built-in commands. Only skills whose `disable_model_invocation` is
+//! false have their description advertised to the model (via the system
+//! prompt); a skill marked `disable-model-invocation: true` is available only
+//! through an explicit
 //! `/name` trigger.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use slimcode_commands::{COMMANDS, suggest};
 
 /// Where a skill was discovered from (or installed into).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -355,6 +358,57 @@ fn copy_dir_contents(from: &Path, to: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Does a skill name collide with a built-in command spelling?
+pub fn is_builtin_command(name: &str) -> bool {
+    COMMANDS
+        .iter()
+        .any(|c| c.spellings().any(|s| s.trim_start_matches('/') == name))
+}
+
+/// Parse the argument of `/install-skill <path> --user|--project`.
+pub fn parse_install_args(arg: Option<&str>) -> Result<(PathBuf, SkillScope), String> {
+    const USAGE: &str = "usage: /install-skill <path> --user|--project";
+    let arg = arg
+        .filter(|a| !a.is_empty())
+        .ok_or_else(|| USAGE.to_string())?;
+    let mut path = None;
+    let mut scope = None;
+    for token in arg.split_whitespace() {
+        match token {
+            "--user" => set_once(&mut scope, SkillScope::User, "scope")?,
+            "--project" => set_once(&mut scope, SkillScope::Project, "scope")?,
+            _ => {
+                if path.is_some() {
+                    return Err(format!("too many arguments; {USAGE}"));
+                }
+                path = Some(PathBuf::from(token));
+            }
+        }
+    }
+    let path = path.ok_or_else(|| USAGE.to_string())?;
+    let scope = scope.ok_or_else(|| format!("choose a scope: --user or --project; {USAGE}"))?;
+    Ok((path, scope))
+}
+
+/// Set `slot` to `value`, erroring if it was already set.
+fn set_once<T>(slot: &mut Option<T>, value: T, what: &str) -> Result<(), String> {
+    if slot.is_some() {
+        return Err(format!("{what} specified more than once"));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+/// Combine built-in command suggestions with skill suggestions (both triggered
+/// via `/`) for a partial `/` input.
+pub fn combined_suggestions(skills: &[Skill], input: &str) -> Vec<String> {
+    let mut out: Vec<String> = suggest(input).iter().map(|c| c.usage.to_string()).collect();
+    for s in suggest_skills(skills, input) {
+        out.push(format!("/{}", s.name));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -593,5 +647,49 @@ mod tests {
         let err = store.install(&src, SkillScope::User).unwrap_err();
         assert!(err.contains("SKILL.md"), "err: {err}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_install_args_reads_path_and_scope() {
+        let (path, scope) = parse_install_args(Some("/tmp/skill --project")).unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/skill"));
+        assert_eq!(scope, SkillScope::Project);
+
+        let (path, scope) = parse_install_args(Some("/tmp/skill --user")).unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/skill"));
+        assert_eq!(scope, SkillScope::User);
+    }
+
+    #[test]
+    fn parse_install_args_requires_path_and_scope() {
+        assert!(parse_install_args(None).is_err());
+        assert!(parse_install_args(Some(" --project")).is_err());
+        assert!(parse_install_args(Some("/tmp/skill")).is_err());
+    }
+
+    #[test]
+    fn parse_install_args_rejects_conflicting_or_duplicate_scope() {
+        assert!(parse_install_args(Some("/tmp/skill --user --project")).is_err());
+        assert!(parse_install_args(Some("/tmp/skill --user --user")).is_err());
+        assert!(parse_install_args(Some("/tmp/a /tmp/b --project")).is_err());
+    }
+
+    #[test]
+    fn is_builtin_command_detects_collision() {
+        assert!(is_builtin_command("help"));
+        assert!(is_builtin_command("load"));
+        assert!(!is_builtin_command("my-skill"));
+    }
+
+    #[test]
+    fn combined_suggestions_includes_skills_and_commands() {
+        let s = parse_skill(
+            "---\nname: histo\ndescription: history-ish\n---\nb\n",
+            SkillScope::User,
+        )
+        .unwrap();
+        let got = combined_suggestions(&[s], "/hist");
+        assert!(got.contains(&"/history".to_string()), "got: {got:?}");
+        assert!(got.contains(&"/histo".to_string()), "got: {got:?}");
     }
 }

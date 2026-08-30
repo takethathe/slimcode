@@ -1,13 +1,13 @@
 //! slimcode-commands: frontend-agnostic slash-command registry and prediction.
 //!
-//! A `Command` is the canonical definition of a `/xxx` REPL command: its
+//! A `Command` is the canonical definition of a `/xxx` slash command: its
 //! canonical name, aliases, usage string (with argument placeholder), and a
 //! short description. `COMMANDS` is the single source of truth; `suggest`
 //! turns a partial `/` input into matching commands (predictive hint), and
 //! `find` resolves an exact spelling to its command.
 //!
 //! The crate is pure data + pure functions with no I/O, so any frontend (the
-//! current line-based REPL, a future TUI, a web UI, ...) can reuse the same
+//! one-shot CLI, the TUI, a web UI, ...) can reuse the same
 //! registry, `/help` text, and prediction logic. Installed *skills* are a
 //! separate, dynamic `/` trigger set (`slimcode-common::skills`); the frontend
 //! combines both when predicting partial `/` input.
@@ -21,7 +21,7 @@ pub enum CommandKind {
     Numbered,
 }
 
-/// A slash command known to the REPL.
+/// A slash command known to an interactive frontend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Command {
     pub name: &'static str,
@@ -99,7 +99,7 @@ pub const COMMANDS: &[Command] = &[
     ),
     Command::new("/!!", "/!!", "rerun the most recent prompt"),
     Command::numbered("/!", "/!N", "rerun history entry N (1 = newest)"),
-    Command::aliased("/exit", &["/quit"], "/exit", "quit the REPL"),
+    Command::aliased("/exit", &["/quit"], "/exit", "quit the TUI"),
 ];
 
 /// Resolve an exact spelling (canonical name or alias) to its command.

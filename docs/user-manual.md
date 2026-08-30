@@ -63,21 +63,36 @@ slimcode --model qwen-max "为 README 补一段简介"
 
 运行结束后打印 token 用量与本次会话的保存路径。
 
-### 交互式 REPL
+### 交互式 TUI
 
-不带参数启动即进入行式 REPL，会话在每一轮后自动保存到
+不带参数启动（stdout 是终端）即进入全屏 TUI，会话在每一轮后自动保存到
 `~/.slimcode/sessions/<id>.json`：
 
 ```bash
 slimcode
 ```
 
+**布局**：上部为 transcript（滚动输出区，显示每轮开始标记、流式文本、思考行与工具调用，随输出自动滚动到底部），底部为输入框与状态行（当前会话 id、最近的 notice / error）。
+
+**按键**：
+
+| 按键 | 作用 |
+| --- | --- |
+| `Enter` | 提交输入框内容，作为用户消息运行一轮 agent 循环 |
+| `Shift+Enter` | 在输入框中插入换行，支持多行 prompt |
+| `↑` / `↓` | 输入框为空时进入输入历史 recall（从最新一条开始）；recall 中 `↑` 更早、`↓` 更新，`↓` 到最新再按退出到空输入；输入非空时移动光标 |
+| `PgUp` / `PgDn` | transcript 上/下翻页 |
+| `Ctrl+C` / `Ctrl+D` | 退出 TUI（恢复终端） |
+
+recall 状态下按 `Enter` 会把选中的历史 prompt 作为**新一轮**运行（不再写入历史）。
+
+**命令**（与行式 REPL 相同的 `/` 命令集，经共享命令注册表 `slimcode-commands`）：
+
 | 命令 | 作用 |
 | --- | --- |
-| `<prompt>` | 作为用户消息运行一轮 agent 循环；以 `\` 结尾的行续行，非 `\` 行（或空行）提交整个多行 prompt 为一条用户消息 |
 | `/help` | 列出命令 |
-| `/new` | 新建会话 |
-| `/load <id>` | 从磁盘恢复一个已保存会话（`/resume` 同义） |
+| `/new` | 新建会话（清空 transcript） |
+| `/load <id>` | 从磁盘恢复一个已保存会话（`/resume` 同义；清空 transcript 后载入其消息历史） |
 | `/sessions` | 列出已保存会话 id |
 | `/usage` | 显示累计 token 用量 |
 | `/save` | 显式保存当前会话 |
@@ -88,9 +103,11 @@ slimcode
 | `/!N` | 重跑编号 N 的 prompt（verbatim，多行原样） |
 | `/exit` / `/quit` | 退出 |
 
+**非 TTY**：不带 prompt 且 stdout 不是终端时，slimcode 打印明确错误并以非零退出码结束，不会尝试打开 TUI。
+
 #### `/` 命令预测提示
 
-输入未知的 `/` 命令时，REPL 会给出**预测提示**（来自前端无关的命令注册表
+输入未知的 `/` 命令时，TUI 会给出**预测提示**（来自前端无关的命令注册表
 `slimcode-commands`）：
 
 - 按已输入前缀匹配命令名或其别名，例如 `/his` → `did you mean: /history`；
@@ -131,11 +148,13 @@ disable-model-invocation: true   # 可选；省略 = false
 
 #### 安装与使用
 
+在 TUI 输入框中直接输入命令（无提示符）：
+
 ```text
-slimcode> /install-skill ~/skills/tdd --user
-slimcode> /install-skill ./my-skill.md --project
-slimcode> /skills
-slimcode> /tdd 为这个模块补测试
+/install-skill ~/skills/tdd --user
+/install-skill ./my-skill.md --project
+/skills
+/tdd 为这个模块补测试
 ```
 
 - `/install-skill <path> --user|--project`：把目录（含 `SKILL.md`）或单个 markdown
@@ -155,10 +174,10 @@ slimcode> /tdd 为这个模块补测试
 普通 prompt，存于 `~/.slimcode/history.json`（JSON 数组，上限 500 条，超出丢最旧），
 跨运行保留；`/` 命令不记入。`/!N` 编号以 `1` = 最新，重跑沿用当前会话、保留消息历史。
 
-多行 prompt：以 `\` 结尾的行会继续下一行，直到遇到不以 `\` 结尾的行（或空行）才提交
-为**一条**用户消息。续行态中 `/` 开头的行也作为 prompt 内容。实现无 readline 依赖、
-无 raw mode（Shift+Enter 与 Enter 在传统终端不可区分，故不支持，见
-`docs/adr/0001-repl-input-history-dependency-free.md`）。
+多行 prompt：在 TUI 输入框中按 `Shift+Enter` 插入换行，按 `Enter` 提交整个多行
+prompt 为**一条**用户消息；多行 prompt 中的 `/` 开头行是 prompt 内容而非命令。
+（ADR-0001 的 `\` 续行方案随行式 REPL 一并移除——raw mode 下 Shift+Enter 与 Enter
+可区分，故 Shift+Enter 成为多行换行键，Enter 直接提交。）
 
 ### 会话文件
 

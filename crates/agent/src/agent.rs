@@ -176,56 +176,62 @@ fn dispatch(tools: &[Tool], tc: &ToolCall) -> Result<String, String> {
     }
 }
 
-/// Append one tool result to history, emitting ToolStart/ToolResult events.
-/// `tc` is the tool call this result belongs to.
+/// A live event sink for the agent loop: invoked for every [`AgentEvent`] as
+/// it is produced. `Err` aborts the loop (used to propagate renderer errors).
+type EventSink<'a> = &'a mut dyn FnMut(AgentEvent) -> Result<(), String>;
+
+/// Append one tool result to history, emitting ToolStart/ToolResult events
+/// through the sink. `tc` is the tool call this result belongs to.
 fn push_tool_result(
     tc: &ToolCall,
     res: Result<String, String>,
-    events: &mut Vec<AgentEvent>,
+    on_event: EventSink<'_>,
     messages: &mut Vec<Message>,
-) {
+) -> Result<(), String> {
     let (ok, body) = match res {
         Ok(o) => (true, o),
         Err(e) => (false, e),
     };
-    events.push(AgentEvent::ToolStart {
+    on_event(AgentEvent::ToolStart {
         name: tc.name.clone(),
         arguments: tc.arguments.clone(),
-    });
-    events.push(AgentEvent::ToolResult {
+    })?;
+    on_event(AgentEvent::ToolResult {
         name: tc.name.clone(),
         ok,
         result: body.clone(),
-    });
+    })?;
     let content = if ok { body } else { format!("Error: {body}") };
     messages.push(Message::tool_result(&tc.id, content));
+    Ok(())
 }
 
-/// Execute tool calls and append their results to `messages`, emitting events.
-/// In serial mode each result is appended before the next call runs (so later
-/// tools can observe earlier results in history); in parallel mode all calls
-/// run first and results are appended together.
+/// Execute tool calls and append their results to `messages`, emitting events
+/// through the sink. In serial mode each result is appended before the next
+/// call runs (so later tools can observe earlier results in history); in
+/// parallel mode all calls run first and results are appended together.
 fn execute_tools(
     tools: &[Tool],
     calls: &[ToolCall],
     parallel: bool,
-    events: &mut Vec<AgentEvent>,
+    on_event: EventSink<'_>,
     messages: &mut Vec<Message>,
-) {
+) -> Result<(), String> {
     if parallel {
         // Run every call first, then append all results together.
         let results: Vec<(&ToolCall, Result<String, String>)> =
             calls.iter().map(|tc| (tc, dispatch(tools, tc))).collect();
         for (tc, res) in results {
-            push_tool_result(tc, res, events, messages);
+            push_tool_result(tc, res, on_event, messages)?;
         }
     } else {
         // Serial: dispatch and append one call at a time.
         for tc in calls {
             let res = dispatch(tools, tc);
-            push_tool_result(tc, res, events, messages);
+            push_tool_result(tc, res, on_event, messages)?;
         }
     }
+    Ok(())
 }
 
 /// The agent loop over a freshly built `[system, user]` history — the simple
@@ -244,27 +250,26 @@ pub fn run_agent<P: Provider>(
     run_agent_from_messages(provider, tools, messages, cfg)
 }
 
-/// The agent loop over an existing message history (already including the
-/// latest user message). Used by the REPL to continue a restored session:
-/// assistant replies and tool results are appended to `messages`, so the
-/// caller replaces its stored history with `RunResult::messages`.
-pub fn run_agent_from_messages<P: Provider>(
+/// The shared loop: drives one turn over `messages`, forwarding every event to
+/// `on_event` as it happens, and returns `(updated history, iterations, stop)`.
+/// A sink error (e.g. a renderer failure) aborts the run.
+fn run_loop<P: Provider>(
     provider: &mut P,
     tools: &[Tool],
     mut messages: Vec<Message>,
     cfg: &RunConfig,
-) -> Result<RunResult, String> {
-    let mut events: Vec<AgentEvent> = Vec::new();
+    on_event: EventSink<'_>,
+) -> Result<(Vec<Message>, usize, StopReason), String> {
     let mut stop = StopReason::Completed;
     let mut iterations = 0usize;
 
     for turn in 1..=cfg.max_iterations {
         iterations = turn;
-        events.push(AgentEvent::Turn { turn });
+        on_event(AgentEvent::Turn { turn })?;
 
         let deltas = provider.chat(&messages, tools)?;
         for d in &deltas {
-            events.push(AgentEvent::Stream(d.clone()));
+            on_event(AgentEvent::Stream(d.clone()))?;
         }
         let (text, tool_calls, reason) = assemble(&deltas);
         let mut asst = Message::text(Role::Assistant, text);
@@ -281,9 +286,9 @@ pub fn run_agent_from_messages<P: Provider>(
                     tools,
                     &tool_calls,
                     cfg.parallel_tools,
-                    &mut events,
+                    on_event,
                     &mut messages,
-                );
+                )?;
                 // fall through to the next turn (tool results are in history)
             }
         }
@@ -292,7 +297,41 @@ pub fn run_agent_from_messages<P: Provider>(
         }
     }
 
-    events.push(AgentEvent::Stop(stop.clone()));
+    on_event(AgentEvent::Stop(stop.clone()))?;
+    Ok((messages, iterations, stop))
+}
+
+/// The agent loop over an existing message history (already including the
+/// latest user message), streaming every event to `on_event` live and
+/// returning the updated message history. Used by `slimcode-common`'s shared
+/// runner to render live through a `Renderer`.
+pub fn run_agent_from_messages_sink<P: Provider>(
+    provider: &mut P,
+    tools: &[Tool],
+    messages: Vec<Message>,
+    cfg: &RunConfig,
+    on_event: EventSink<'_>,
+) -> Result<Vec<Message>, String> {
+    let (messages, _, _) = run_loop(provider, tools, messages, cfg, on_event)?;
+    Ok(messages)
+}
+
+/// The agent loop over an existing message history (already including the
+/// latest user message). Used by an interactive frontend to continue a
+/// restored session: assistant replies and tool results are appended to
+/// `messages`, so the caller replaces its stored history with
+/// `RunResult::messages`.
+pub fn run_agent_from_messages<P: Provider>(
+    provider: &mut P,
+    tools: &[Tool],
+    messages: Vec<Message>,
+    cfg: &RunConfig,
+) -> Result<RunResult, String> {
+    let mut events: Vec<AgentEvent> = Vec::new();
+    let (messages, iterations, stop) = run_loop(provider, tools, messages, cfg, &mut |e| {
+        events.push(e);
+        Ok(())
+    })?;
     Ok(RunResult {
         messages,
         iterations,
@@ -554,7 +593,7 @@ mod tests {
     #[test]
     fn run_agent_from_messages_continues_existing_history() {
         // A restored session already has a system + an old assistant reply;
-        // the REPL appends a new user message and continues from there.
+        // the frontend appends a new user message and continues from there.
         let history = vec![
             Message::text(Role::System, "be helpful"),
             Message::text(Role::Assistant, "Earlier answer."),

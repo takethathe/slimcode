@@ -1,17 +1,15 @@
 [package]
-name = "slimcode"
+name = "slimcode-tui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
 
-[[bin]]
-name = "slimcode"
-path = "src/main.rs"
-
 [dependencies]
-slimcode-ai.workspace = true
 slimcode-agent.workspace = true
-slimcode-commands.workspace = true
+slimcode-ai.workspace = true
 slimcode-common.workspace = true
-slimcode-tui.workspace = true
+slimcode-commands.workspace = true
+crossterm = "0.28"
+ratatui = "0.29"
+tui-textarea = "0.7"

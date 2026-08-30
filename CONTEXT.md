@@ -9,7 +9,7 @@ A single user input submitted to the agent for one turn. A prompt may span multi
 _Avoid_: input, question
 
 **Command**:
-A `/xxx` control instruction in the REPL (e.g. `/save`, `/load`), distinct from a Prompt.
+A `/xxx` control instruction in an interactive frontend (currently the TUI), e.g. `/save`, `/load`; distinct from a Prompt.
 _Avoid_: slash-command
 
 **Skill**:
@@ -31,7 +31,7 @@ The conversation messages of a Session (`session.messages`), restorable via `/lo
 _Avoid_: history (bare — collides with input history)
 
 **Input history**:
-The previously submitted Prompts in the REPL, persisted across runs; a UI concern, not part of a Session.
+The previously submitted Prompts in an interactive frontend, persisted across runs; a frontend concern, not part of a Session.
 _Avoid_: history (bare — collides with message history), shell history
 
 **Context**:
@@ -43,5 +43,21 @@ or skill trigger. Distinct from message history (`session.messages`, which may b
 _Avoid_: context window (collides with the LLM notion), assembled messages
 
 **Multi-line prompt**:
-A Prompt entered across multiple lines via continuation (a line ending in `\`, or best-effort Shift+Enter). Stored and submitted as a single Prompt.
+A Prompt entered across multiple lines in the TUI input box (Shift+Enter inserts a newline; Enter submits). Stored and submitted as a single Prompt.
 _Avoid_: block, paste
+
+**Frontend**:
+A user-facing entry point — the one-shot CLI or the interactive TUI — that reads input, drives the shared turn runner, and renders output through its own Renderer.
+_Avoid_: UI, client
+
+**TUI**:
+The interactive full-screen terminal frontend (ratatui + crossterm) entered when `slimcode` starts without a prompt; it replaces the line-based REPL.
+_Avoid_: REPL, UI
+
+**Renderer**:
+The per-frontend component that turns DisplayItems into frontend output — text lines for the CLI, widget state for the TUI.
+_Avoid_: printer, formatter
+
+**DisplayItem**:
+The frontend-agnostic unit a Renderer consumes (turn marker, streamed text fragment, reasoning line, tool start/result, stop marker, or token usage), produced from an AgentEvent by a shared mapping function.
+_Avoid_: RenderText, view model

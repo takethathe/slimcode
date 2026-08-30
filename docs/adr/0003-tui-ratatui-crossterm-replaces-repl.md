@@ -1,0 +1,5 @@
+# TUI frontend uses ratatui + crossterm and replaces the line-based REPL as the default interactive mode
+
+slimcode gains a full-screen TUI as its interactive frontend: `slimcode` with no prompt now starts the TUI (a prompt still runs the one-shot CLI), built on ratatui + crossterm. We take that dependency because a real TUI needs raw-mode keyboard events — the very thing ADR-0001 avoided for the line-based REPL — and ratatui's widget model plus `TestBackend` buy maintainability and testability a hand-rolled ANSI renderer would not. The line-based REPL is removed; starting without a prompt on a non-TTY prints an error and exits non-zero.
+
+**Consequences**: a TUI dependency tree enters the workspace (reversing ADR-0001's dependency-free stance, but only for the interactive frontend). Shift+Enter is now distinguishable as a key, so it becomes the multi-line newline key (Enter submits). `/` commands and input history move from the REPL into the TUI, reusing `slimcode-commands` and `slimcode-common::history`.

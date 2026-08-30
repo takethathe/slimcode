@@ -62,6 +62,44 @@ pub fn trim_to_limit(entries: &mut Vec<String>, limit: usize) {
     }
 }
 
+/// Map a replay number (1 = newest) to the entry, if it exists.
+pub fn resolve_replay_index(entries: &[String], n: usize) -> Option<&str> {
+    if n == 0 {
+        return None;
+    }
+    let idx = entries.len().checked_sub(n)?;
+    entries.get(idx).map(|s| s.as_str())
+}
+
+/// Render history entries for `/history`, newest first, numbered 1 = newest,
+/// limited to `limit` entries. Multi-line / over-long entries collapse to a
+/// single truncated line.
+pub fn render_history(entries: &[String], limit: usize) -> Vec<String> {
+    let total = entries.len();
+    let start = total.saturating_sub(limit);
+    entries
+        .iter()
+        .enumerate()
+        .skip(start)
+        .map(|(i, e)| format!("{}: {}", total - i, summarize_entry(e)))
+        .collect()
+}
+
+/// Collapse an entry to a single display line (first line, truncated).
+fn summarize_entry(entry: &str) -> String {
+    const MAX: usize = 48;
+    let first = entry.lines().next().unwrap_or("").trim_end();
+    let truncated: String = first.chars().take(MAX).collect();
+    let is_truncated = truncated.chars().count() < first.chars().count()
+        || first.is_empty()
+        || entry.lines().count() > 1;
+    if is_truncated {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,5 +172,44 @@ mod tests {
             Some(last_expected.as_str())
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_replay_index_newest_first() {
+        let entries = vec!["one".to_string(), "two".to_string(), "three".to_string()];
+        assert_eq!(resolve_replay_index(&entries, 1), Some("three"));
+        assert_eq!(resolve_replay_index(&entries, 3), Some("one"));
+        assert_eq!(resolve_replay_index(&entries, 4), None);
+        assert_eq!(resolve_replay_index(&entries, 0), None);
+    }
+
+    #[test]
+    fn render_history_newest_first_numbered() {
+        let entries = vec!["one".to_string(), "two".to_string(), "three".to_string()];
+        assert_eq!(
+            render_history(&entries, 20),
+            vec!["3: one", "2: two", "1: three"]
+        );
+    }
+
+    #[test]
+    fn render_history_respects_display_limit() {
+        let entries: Vec<String> = (0..30).map(|i| format!("p{i}")).collect();
+        let lines = render_history(&entries, 20);
+        assert_eq!(lines.len(), 20);
+        // Newest 20 shown (p10..=p29), newest first, 1 = newest.
+        assert_eq!(lines.first().unwrap(), "20: p10");
+        assert_eq!(lines.last().unwrap(), "1: p29");
+    }
+
+    #[test]
+    fn render_history_collapses_multiline_and_long() {
+        let entries = vec!["first line\nsecond line".to_string()];
+        assert_eq!(render_history(&entries, 20), vec!["1: first line…"]);
+        let long = vec!["x".repeat(80).to_string()];
+        let lines = render_history(&long, 20);
+        assert!(lines[0].starts_with("1: "), "got: {lines:?}");
+        assert!(lines[0].ends_with('…'), "got: {lines:?}");
+        assert!(lines[0].chars().count() <= 60, "got: {lines:?}");
     }
 }

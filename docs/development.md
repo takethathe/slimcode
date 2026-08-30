@@ -25,15 +25,16 @@ cargo clippy --all-targets --all-features --message-format=json -- -D warnings
 
 ## 架构
 
-cargo workspace，五个 crate（布局见 `.scratch/slimcode-v1` 的 map）：
+cargo workspace，六个 crate：
 
 | crate | 包名 | 职责 | 状态 |
 | --- | --- | --- | --- |
 | `crates/ai` | `slimcode-ai` | 统一 LLM provider 层（Provider trait + OpenAI-compatible/Bailian） | 起步（Bailian provider + wire 模型） |
 | `crates/agent` | `slimcode-agent` | agent 运行时、工具、会话状态 | 起步（edit 引擎 + 运行时循环 + 消息模型） |
 | `crates/commands` | `slimcode-commands` | 前端无关的 `/` 命令注册表与预测提示 | v1 新增（registry + suggest/find） |
-| `crates/common` | `slimcode-common` | 前端无关的应用模块（配置解析 / 会话与输入历史持久化 / skills 发现与安装 / 上下文组装 / 七工具绑定） | v1 新增（自 cli 抽出） |
-| `crates/cli` | `slimcode` | 二进制入口 + 终端前端（非交互 + REPL） | v1 完成（render/repl/main） |
+| `crates/common` | `slimcode-common` | 前端无关的应用模块（配置解析 / 会话与输入历史持久化 / skills 发现与安装 / 上下文组装 / 七工具绑定 / 共享渲染模型与 turn runner / setup seam） | v1 新增（自 cli 抽出 + TUI 共享 seam） |
+| `crates/tui` | `slimcode-tui` | 交互式全屏 TUI（纯 App core + crossterm/ratatui 终端循环） | v1 完成（app/terminal） |
+| `crates/cli` | `slimcode` | 二进制入口 + 非交互 one-shot 前端（共享 runner + TextRenderer） | v1 完成（render/main） |
 
 ### crates/ai Bailian provider
 
@@ -82,7 +83,7 @@ cargo workspace，五个 crate（布局见 `.scratch/slimcode-v1` 的 map）：
 折入自 ticket 04 原型，决策：
 
 - 循环：模型带 `tool_calls` 的响应 → 执行工具 → 追加 `role: tool` 结果 → 循环，直到模型不再调工具；
-- 停止：无 tool_calls → `Completed`；`max_iterations` → `MaxIterations`（运行时唯一硬保险；用户中断由 CLI 层做 cancellation）；
+- 停止：无 tool_calls → `Completed`；`max_iterations` → `MaxIterations`（运行时唯一硬保险；运行中用户中断不在范围内，见 crates/tui 一节）；
 - 工具执行默认**串行**（本地工具引擎安全），`RunConfig.parallel_tools` 开关留给未来 IO 工具；
 - 工具报错以 `Error: …` 前缀作 `role: tool` 内容进 history，模型自然恢复；
 - `Provider` trait 是 crates/ai 已实现的 seam（当前同步、无 async 依赖，真实 provider 内部处理阻塞边界）；
@@ -101,12 +102,12 @@ cargo workspace，五个 crate（布局见 `.scratch/slimcode-v1` 的 map）：
 - `suggest(input)`：按前缀预测匹配命令（`/` 单独列出全部，非 `/` 输入返回空）。
 
 这里只登记**内置**命令；安装的 **skill** 是另一组动态 `/` 触发
-（`slimcode-common::skills`），前端在预测部分 `/` 输入时把两者合并（见
-crates/cli 的 `combined_suggestions`）。
+（`slimcode-common::skills`），前端在预测部分 `/` 输入时把两者合并
+（`combined_suggestions`，同样在 `slimcode-common::skills`）。
 
 ### crates/common 前端无关应用模块（`slimcode-common`）
 
-自 cli 抽出的前端无关 module，任何前端（当前 REPL、未来 TUI/Web）可直接复用，不依赖终端
+自 cli 抽出的前端无关 module，任何前端（one-shot CLI、TUI、未来 Web）可直接复用，不依赖终端
 二进制：
 
 - `config`：四层优先级（frontend overrides > env > `config.toml` > 默认值）的单一 owner，
@@ -136,44 +137,69 @@ crates/cli 的 `combined_suggestions`）。
   `build()` 返回可直接交给 `run_agent_from_messages` 的 `Vec<Message>`，缺
   user 时报错；空 history 前置一条 system 消息；
 - `tools`：把七工具 factory 绑定到启动 `cwd`。
+- `render`（ADR-0004）：前端无关的显示模型。`DisplayItem` 是渲染单元（turn 标记 /
+  流式文本片段 / 思考行 / 工具开始与结果 / 停止标记 / token 用量）；
+  `map_event(AgentEvent) -> Option<DisplayItem>` 是事件→显示单元的共享纯映射；
+  `Renderer` trait 消费 `DisplayItem`，每个前端只实现自己的渲染器（cli 的文本行、
+  tui 的 widget 状态）。
+- `runner`：共享 turn runner `run_turn(provider, tools, messages, &RunConfig,
+  &mut dyn Renderer) -> Result<Vec<Message>, String>`，逐事件流式回调渲染器，返回
+  更新后的消息历史。cli 与 tui 共用同一 turn 循环，行为不漂移。
+- `setup`：`setup(cwd, config) -> (BailianProvider, Vec<Tool>)` 共享 seam，cli 与
+  tui 用同一套 provider + 工具构造，两端不会各自实现而漂移。
+
+### crates/tui 交互式 TUI（`slimcode-tui`）
+
+`crates/tui` 提供交互式全屏 TUI（ADR-0003），替代行式 REPL。分两层：
+
+- **纯 App core（`app`）**：前端无关、无 I/O 的 reducer。持有 `transcript`
+  （`DisplayItem` 序列）、输入框、`history`（input history 快照，最旧在前）、
+  `recall` 态、`status`（当前会话 id / notice / error）。`handle_key(KeyEvent) ->
+  Option<Effect>` 是纯 reducer，把按键映射为副作用声明；`Effect` 枚举
+  （Submit / ReplayPrompt / ReplayHistory / NewSession / LoadSession / Quit / …）
+  由终端循环兑现（session / history / skills / quit）。`draw(Frame)` 经 `Renderer`
+  实现把状态渲染到 ratatui `Frame`，用 `TestBackend` 做帧缓冲测试（spec：好的测试
+  断言**帧缓冲**，而非内部状态）。命令解析经 `slimcode_commands::find` + skill
+  触发 + 编号重跑（`/!N`），未知 `/` 命令给出 `did you mean` 提示；`/new` / `/load`
+  会清空 transcript 再重建会话视图。输入历史 recall：输入框为空时按 `↑`/`↓` 进入
+  （从最新一条开始），`Enter` 把选中的历史 prompt 作为新一轮重跑（不再写入历史）；
+  记录在每轮提交时追加（不查重，同 `HistoryStore::append`）。
+- **终端循环（`terminal`）**：薄壳。`run(cwd, config, store, history, skills)` 先经
+  `common::setup::setup` 构造 provider + 工具（**在**进入 raw mode / alternate
+  screen 之前，API-key/配置错误在普通终端上浮现），再 `enable_raw_mode` +
+  `EnterAlternateScreen`，泵 crossterm 事件、喂给 App reducer、兑现 `Effect`，
+  每事件 `draw`（ratatui 自动 autoresize），退出路径统一 `restore_terminal()`。
+
+**同步 provider 的运行时行为**：provider 当前是同步 seam（真实阻塞边界收在
+provider 内部）。一轮提交后循环**不再轮询按键**，同步阻塞在共享 `run_turn` 内；
+`LiveRenderer` 把每个流式 `DisplayItem` 追加进 transcript 并立即重绘，实现边跑边
+显示。turn 结束自动保存会话；turn 报错内联进 transcript 并回到输入框。运行中的
+Ctrl+C 字节被缓冲，turn 结束后退出。中断运行中的 turn 明确不在范围内（见 spec
+Further Notes）。
 
 ### crates/cli 二进制（`slimcode`）
 
-两种模式，I/O 与逻辑分离（`run(args, out)` 便于测试）：
+二进制入口 + 非交互 one-shot 前端，I/O 与逻辑分离（`run(args, out, tty)` 便于测试），
+按启动规则分派（`std::io::IsTerminal` 判定 stdout 是否 TTY）：
 
-- **非交互**：`slimcode "<prompt>"`（可 `--cwd <dir>`、`--model <model>`、
+- `--help` / `-h`：打印用法后退出；
+- **one-shot**：`slimcode "<prompt>"`（可 `--cwd <dir>`、`--model <model>`、
   `--base-url <url>`）经共享 `ContextBuilder` 组装消息列表（新会话首轮前置系统
-  提示并广告可自动调用 skill），跑一轮七工具循环、流式渲染事件、
+  提示并广告可自动调用 skill），经共享 `run_turn` 跑一轮七工具循环、流式渲染事件、
   打印 token 用量并保存会话；
-- **REPL**：`slimcode` 进入行式循环，`/` 命令控制（`/help /new /load <id> /sessions
-  /usage /save /history /!! /!N /exit`），每轮自动保存会话。
+- **无 prompt + TTY**：交给 `slimcode_tui::terminal::run` 启动全屏 TUI（见上节）；
+- **无 prompt + 非 TTY**：在配置解析前就以明确错误退出（非零退出码）。
 
 模块：
 
-- `render`：`AgentEvent` → 终端输出（流式文本 / 结构行 / 用量汇总），原始
-  tool_call delta 与 `Done` 事件被抑制；
-- `repl`：行式循环；每轮通过共享的 `ContextBuilder` 组装消息列表：**新会话**
-  首轮自动前置系统提示并广告可自动调用的 skill，恢复的会话历史已含系统消息，
-  不重复插 system（`disable-model-invocation: true` 的 skill 描述**不**进系统
-  提示）；基础提示与 skill 段落均以 markdown 结构呈现（基础提示：`## Tools` /
-  `## Working style` 小节，工具名反引号包裹、工作准则为 bullet 列表；skill
-  段落：`## Available skills` 标题 + 反引号包裹 `/name` 的 bullet 列表）；
-  `/load` 经 `SessionStore::load` 恢复历史；
-  输入历史 `/history`（最近 20 条、最新在前、带编号）/`/!!`/`/!N` 重跑（verbatim、
-  作为新一轮 prompt、不再写入历史）；多行 prompt 用行尾 `\` 续行、空行或非 `\` 行
-  提交（无 readline 依赖、无 raw mode，见 ADR-0001）；纯函数 `is_continuation` /
-  `strip_continuation` / `accumulate` / `parse_replay` / `resolve_replay_index` /
-  `render_history` 承接测试，共享依赖收在 `ReplCtx`；`/help` 与启动 banner 由
-  `slimcode-commands::COMMANDS` 生成，未知 `/` 命令用 `suggest` 给出 `did you
-  mean` 预测提示；
-- **skills 集成**：`ReplCtx` 持有 `SkillStore`；`/skills` 列出已安装 skill（含
-  scope 与 manual-only 标记），`/install-skill <path> --user|--project` 安装
-  （先 `inspect` 校验源与 name，拒绝与内置命令重名），`/name` 精确命中时把
-  skill 正文（含其目录，便于解析相对路径）作为用户消息跑一轮（不写入 input
-  history）；未知 `/` 命令的预测提示由 `combined_suggestions` 合并内置命令
-  与 skill（`suggest_skills`）；
-- 前端无关的 `config` / `session` / `history` / `skills` / `context` / `tools` 已
-  移入 `slimcode-common`（见上节），cli 只消费它们，不再各自实现。
+- `render`：`TextRenderer`（`Renderer` trait 的文本实现）——把共享 `DisplayItem`
+  流（流式文本 / 结构行 / 用量汇总）渲染为终端输出，原始 tool_call delta 与
+  `Done` 事件被抑制；事件→DisplayItem 的映射是共享的 `common::render::map_event`，
+  cli 不再各自实现（见 ADR-0004）；
+- provider + 工具构造经 `common::setup::setup` 与 TUI 共享，两端不会漂移。
+
+交互能力（历史 recall、`/` 命令、skills、`/new`、`/load`、`/exit`）已整体移入
+TUI（`slimcode-tui`，见上节），行式 REPL 已移除（见 ADR-0003）。
 
 agent crate 的 `agent` 模块 `pub use session::{Message, Role, ToolCall}`，CLI 统一从
 `slimcode_agent::agent` 引用消息类型。

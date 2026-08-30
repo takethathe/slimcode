@@ -2,9 +2,9 @@
 //! an advertised skills list, an optional message history, and a user prompt
 //! or skill trigger.
 //!
-//! Frontend-agnostic: any frontend (the current line-based REPL, a future TUI,
-//! or a web UI) builds a turn through [`ContextBuilder`] and hands the result
-//! straight to `run_agent_from_messages`. See `.scratch/context-builder` spec.
+//! Frontend-agnostic: any frontend (the one-shot CLI, the TUI, or a web UI)
+//! builds a turn through [`ContextBuilder`] and hands the result straight to
+//! `run_agent_from_messages`. See `.scratch/context-builder` spec.
 
 use slimcode_agent::session::{Message, Role};
 

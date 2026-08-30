@@ -92,6 +92,16 @@ impl SessionStore {
         format!("slimcode-{unix}-{}-{n}", std::process::id())
     }
 
+    /// Build a fresh session with a new id and timestamp.
+    pub fn new_session(&self) -> Session {
+        Session {
+            id: self.new_id(),
+            created_at: now_rfc3339(),
+            messages: Vec::new(),
+            title: None,
+        }
+    }
+
     /// Absolute path for a session id (id is validated to be a safe filename).
     pub fn session_path(&self, id: &str) -> Result<PathBuf, String> {
         if id.is_empty()
@@ -204,6 +214,16 @@ mod tests {
         let b = s.new_id();
         assert_ne!(a, b);
         assert!(a.starts_with("slimcode-"));
+    }
+
+    #[test]
+    fn new_session_has_fresh_id_and_empty_messages() {
+        let s = SessionStore::new(std::env::temp_dir());
+        let session = s.new_session();
+        assert!(session.id.starts_with("slimcode-"));
+        assert!(session.messages.is_empty());
+        assert!(session.title.is_none());
+        assert!(!session.created_at.is_empty());
     }
 
     #[test]

@@ -70,7 +70,7 @@ pub struct WireFunctionDelta {
 }
 
 /// Token usage reported by the endpoint (streamed with `include_usage=true`).
-#[derive(Deserialize, Debug, Default, Clone, Copy)]
+#[derive(Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct TokenUsage {
     #[serde(default)]
     pub prompt_tokens: u64,

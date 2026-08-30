@@ -29,7 +29,7 @@ pub struct BailianProvider {
     /// when the endpoint omitted it).
     pub last_usage: Option<TokenUsage>,
     /// Cumulative token usage across every `chat` call since construction
-    /// (drives the CLI's end-of-run and REPL totals).
+    /// (drives the frontend's end-of-run totals).
     pub total_usage: TokenUsage,
 }
 
