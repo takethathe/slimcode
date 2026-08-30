@@ -30,6 +30,8 @@ history**（`session.messages`）是会话中已发生的消息，可被当作 C
   system，不重复插入。
 - 只有 `disable-model-invocation: false` 的 skill 描述进入 system 的
   `## Available skills` 段落；`true` 的 skill 仅通过显式 `/name` 触发。
+- `/name` 触发时，skill 正文与 skill 目录一并成为当轮 user 消息，模型无需
+  再 read `SKILL.md`，直接按正文里的相对路径引用辅助文件。
 - 当轮 user 消息必须存在（`with_user_prompt` 或 `with_skill`），否则
   `build()` 报错，而不是静默产出没有 user 消息的 turn。
 

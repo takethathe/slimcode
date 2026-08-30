@@ -142,8 +142,9 @@ slimcode> /tdd 为这个模块补测试
   文件复制到对应 scope，`--user` 与 `--project` 二选一；同名 skill 会被覆盖更新；
   与内置命令重名的 skill 会被拒绝安装；
 - `/skills`：列出已安装 skill（触发名、描述、manual-only 标记、scope）；
-- `/name [任务]`：触发一个 skill，把其正文（+ 可选任务）作为一轮 agent 指令执行；
-  与其它 `/` 命令一样，skill 触发**不**写入输入历史；
+- `/name [任务]`：触发一个 skill，把其正文（+ 可选任务，另附 skill 所在目录，
+  供正文里的相对路径解析）作为一轮 agent 指令执行；与其它 `/` 命令一样，skill
+  触发**不**写入输入历史；
 - 预测提示：输入未知的 `/` 前缀时，候选同时包含内置命令与 skill（如 `/td` →
   `did you mean: /tdd`）；裸 `/` 列出全部。
 

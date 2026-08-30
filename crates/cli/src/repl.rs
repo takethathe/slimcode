@@ -1005,6 +1005,7 @@ mod tests {
             disable_model_invocation: disable,
             body: String::new(),
             scope: SkillScope::User,
+            dir: PathBuf::new(),
         }
     }
 

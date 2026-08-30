@@ -34,6 +34,20 @@ pub struct Skill {
     /// The markdown body (everything after the frontmatter block).
     pub body: String,
     pub scope: SkillScope,
+    /// Directory this skill's files live in (or are installed into). Relative
+    /// paths in the body resolve against this directory; it is injected into
+    /// the skill-trigger prompt so the model can find referenced assets.
+    pub dir: PathBuf,
+}
+
+impl Skill {
+    /// Set the on-disk directory and return the skill. Producers that know the
+    /// location (`SkillStore`) call this; `parse_skill` leaves `dir` empty
+    /// because it only sees the markdown text, not where it came from.
+    fn with_dir(mut self, dir: PathBuf) -> Self {
+        self.dir = dir;
+        self
+    }
 }
 
 /// Parsed frontmatter (a tiny, line-based subset of YAML).
@@ -97,7 +111,9 @@ impl SkillStore {
     /// bad sources (or name collisions) before anything is written.
     pub fn inspect(&self, source: &Path, scope: SkillScope) -> Result<Skill, String> {
         let (content, _) = read_source(source)?;
-        parse_skill(&content, scope)
+        let skill = parse_skill(&content, scope)?;
+        let dir = self.skill_dir(scope, &skill.name);
+        Ok(skill.with_dir(dir))
     }
 
     /// Install `source` into a scope, returning the parsed skill. `source` is
@@ -117,7 +133,7 @@ impl SkillStore {
         fs::write(target.join("SKILL.md"), content)
             .map_err(|e| format!("{}: {e}", target.join("SKILL.md").display()))?;
 
-        Ok(skill)
+        Ok(skill.with_dir(target))
     }
 }
 
@@ -141,13 +157,15 @@ pub fn suggest_skills<'a>(skills: &'a [Skill], input: &str) -> Vec<&'a Skill> {
         .collect()
 }
 
-/// The markdown content a skill trigger submits as the user message.
+/// The markdown content a skill trigger submits as the user message: an
+/// instruction header (plus the skill's directory when known, so the model can
+/// resolve relative paths in the body), the skill body, and an optional task.
 pub fn skill_prompt(skill: &Skill, arg: Option<&str>) -> String {
-    let mut prompt = format!(
-        "Use the following skill instructions to complete the task.\n\n# {}\n\n{}",
-        skill.name,
-        skill.body.trim()
-    );
+    let mut prompt = String::from("Use the following skill instructions to complete the task.");
+    if !skill.dir.as_os_str().is_empty() {
+        prompt.push_str(&format!("\nSkill directory: {}", skill.dir.display()));
+    }
+    prompt.push_str(&format!("\n\n# {}\n\n{}", skill.name, skill.body.trim()));
     if let Some(arg) = arg.filter(|a| !a.is_empty()) {
         prompt.push_str("\n\nTask: ");
         prompt.push_str(arg);
@@ -174,6 +192,7 @@ fn parse_skill(content: &str, scope: SkillScope) -> Result<Skill, String> {
         disable_model_invocation: fm.disable_model_invocation.unwrap_or(false),
         body: body.to_string(),
         scope,
+        dir: PathBuf::new(),
     })
 }
 
@@ -307,11 +326,14 @@ fn read_skill_dir(dir: &Path, scope: SkillScope) -> Result<Vec<Skill>, String> {
             }
             let content = fs::read_to_string(&skill_md)
                 .map_err(|e| format!("{}: {e}", skill_md.display()))?;
-            out.push(parse_skill(&content, scope)?);
+            out.push(parse_skill(&content, scope)?.with_dir(path.clone()));
         } else if path.is_file() && path.extension().is_some_and(|e| e == "md") {
             let content =
                 fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-            out.push(parse_skill(&content, scope)?);
+            // A root-level `.md` skill has no dedicated directory; its parent
+            // (the skills root) is the closest base for relative references.
+            let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+            out.push(parse_skill(&content, scope)?.with_dir(dir));
         }
     }
     Ok(out)
@@ -436,8 +458,28 @@ mod tests {
         let p = skill_prompt(&s, None);
         assert!(p.contains("Do the demo."));
         assert!(!p.contains("Task:"));
+        assert!(!p.contains("Skill directory"), "got: {p}");
         let p = skill_prompt(&s, Some("run it now"));
         assert!(p.ends_with("Task: run it now"));
+    }
+
+    #[test]
+    fn skill_prompt_embeds_directory_when_set() {
+        let s = parse_skill(&skill_md(""), SkillScope::User)
+            .unwrap()
+            .with_dir(PathBuf::from("/home/u/skills/demo"));
+        let p = skill_prompt(&s, None);
+        assert!(
+            p.contains("Skill directory: /home/u/skills/demo"),
+            "got: {p}"
+        );
+        assert!(p.contains("Do the demo."));
+    }
+
+    #[test]
+    fn parse_skill_dir_defaults_empty() {
+        let s = parse_skill(&skill_md(""), SkillScope::User).unwrap();
+        assert!(s.dir.as_os_str().is_empty());
     }
 
     #[test]
@@ -474,6 +516,12 @@ mod tests {
         let shared = find_skill(&skills, "shared").unwrap();
         assert_eq!(shared.description, "project version");
         assert_eq!(shared.scope, SkillScope::Project);
+        assert_eq!(
+            shared.dir,
+            cwd.join(".slimcode").join("skills").join("shared")
+        );
+        let useronly = find_skill(&skills, "useronly").unwrap();
+        assert_eq!(useronly.dir, home.join("skills").join("useronly"));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -502,6 +550,7 @@ mod tests {
 
         let target = home.join("skills").join("demo");
         assert!(target.join("SKILL.md").is_file());
+        assert_eq!(skill.dir, target);
         assert_eq!(
             fs::read_to_string(target.join("notes.txt")).unwrap(),
             "supporting file"
@@ -523,6 +572,7 @@ mod tests {
         let store = SkillStore::new(&home, &cwd);
         let skill = store.install(&src, SkillScope::Project).unwrap();
         assert_eq!(skill.name, "demo");
+        assert_eq!(skill.dir, cwd.join(".slimcode").join("skills").join("demo"));
         let target = cwd
             .join(".slimcode")
             .join("skills")

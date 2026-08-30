@@ -18,6 +18,8 @@ An installable set of agent instructions (a `SKILL.md` with frontmatter `name` /
 (`<home>/skills/`) or a project scope (`<cwd>/.slimcode/skills/`) and triggered
 like a Command via `/name`. `disable-model-invocation: true` keeps the skill out
 of the system prompt so the model only uses it on an explicit `/name` trigger.
+A `/name` trigger injects the skill body plus its directory (the base for
+relative paths in the body) as that turn's user message.
 _Avoid_: plugin, extension
 
 **Session**:

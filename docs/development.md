@@ -126,7 +126,8 @@ crates/cli 的 `combined_suggestions`）。
   发现（同名时 project 优先）、`install`（目录或单文件源，落为
   `<scope>/skills/<name>/SKILL.md`）、纯函数 `find_skill` / `suggest_skills` /
   `skill_prompt`；`disable-model-invocation: true` 的 skill 不进系统提示词，
-  只通过显式 `/name` 触发；
+  只通过显式 `/name` 触发；`Skill` 携带 `dir`（发现/安装时确定），
+  `skill_prompt` 把它注入触发消息，供模型解析正文里的相对路径；
 - `context`：`ContextBuilder`（前端无关）把一轮 prompt 的上下文组装收敛为单一
   入口：基础系统提示（默认 `DEFAULT_SYSTEM_PROMPT` 或 `with_system` 覆盖）+
   可自动调用 skill 广告（`with_skills`，build 时过滤 `disable-model-invocation`）+
@@ -168,8 +169,9 @@ crates/cli 的 `combined_suggestions`）。
 - **skills 集成**：`ReplCtx` 持有 `SkillStore`；`/skills` 列出已安装 skill（含
   scope 与 manual-only 标记），`/install-skill <path> --user|--project` 安装
   （先 `inspect` 校验源与 name，拒绝与内置命令重名），`/name` 精确命中时把
-  skill 体作为用户消息跑一轮（不写入 input history）；未知 `/` 命令的预测提示
-  由 `combined_suggestions` 合并内置命令与 skill（`suggest_skills`）；
+  skill 正文（含其目录，便于解析相对路径）作为用户消息跑一轮（不写入 input
+  history）；未知 `/` 命令的预测提示由 `combined_suggestions` 合并内置命令
+  与 skill（`suggest_skills`）；
 - 前端无关的 `config` / `session` / `history` / `skills` / `context` / `tools` 已
   移入 `slimcode-common`（见上节），cli 只消费它们，不再各自实现。
 

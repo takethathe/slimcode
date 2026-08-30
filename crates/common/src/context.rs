@@ -148,6 +148,7 @@ mod tests {
             disable_model_invocation: disable,
             body: String::new(),
             scope: SkillScope::User,
+            dir: std::path::PathBuf::new(),
         }
     }
 
@@ -305,6 +306,28 @@ mod tests {
         let user = messages[1].text_content();
         assert!(user.contains("demo"), "got: {user}");
         assert!(!user.contains("Task:"), "got: {user}");
+    }
+
+    #[test]
+    fn with_skill_embeds_skill_directory() {
+        let s = Skill {
+            name: "demo".to_string(),
+            description: "A demo skill".to_string(),
+            disable_model_invocation: false,
+            body: "Do the demo.".to_string(),
+            scope: SkillScope::User,
+            dir: std::path::PathBuf::from("/tmp/skills/demo"),
+        };
+        let messages = ContextBuilder::new()
+            .with_system("sys")
+            .with_skill(&s, None)
+            .build()
+            .unwrap();
+        let user = messages[1].text_content();
+        assert!(
+            user.contains("Skill directory: /tmp/skills/demo"),
+            "got: {user}"
+        );
     }
 
     #[test]
