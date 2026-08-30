@@ -8,11 +8,14 @@
 //!   `config.toml` > defaults), producing a [`slimcode_ai::BailianConfig`].
 //! - [`session`]: `SessionStore` + session metadata helpers.
 //! - [`history`]: `HistoryStore` for input history persistence.
+//! - [`skills`]: `Skill` model + `SkillStore` for user/project-scoped skill
+//!   discovery, installation, and `/`-trigger prediction.
 //! - [`tools`]: the seven-tool set bound to a working directory.
 
 pub mod config;
 pub mod history;
 pub mod session;
+pub mod skills;
 pub mod tools;
 
 #[doc(hidden)]

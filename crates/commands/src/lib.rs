@@ -8,7 +8,9 @@
 //!
 //! The crate is pure data + pure functions with no I/O, so any frontend (the
 //! current line-based REPL, a future TUI, a web UI, ...) can reuse the same
-//! registry, `/help` text, and prediction logic.
+//! registry, `/help` text, and prediction logic. Installed *skills* are a
+//! separate, dynamic `/` trigger set (`slimcode-common::skills`); the frontend
+//! combines both when predicting partial `/` input.
 
 /// How a command matches input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +91,12 @@ pub const COMMANDS: &[Command] = &[
     Command::new("/usage", "/usage", "show token usage"),
     Command::new("/save", "/save", "save the current session"),
     Command::new("/history", "/history", "list input history"),
+    Command::new("/skills", "/skills", "list installed skills"),
+    Command::new(
+        "/install-skill",
+        "/install-skill <path> --user|--project",
+        "install a skill (user or project scope)",
+    ),
     Command::new("/!!", "/!!", "rerun the most recent prompt"),
     Command::numbered("/!", "/!N", "rerun history entry N (1 = newest)"),
     Command::aliased("/exit", &["/quit"], "/exit", "quit the REPL"),

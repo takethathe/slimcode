@@ -12,6 +12,14 @@ _Avoid_: input, question
 A `/xxx` control instruction in the REPL (e.g. `/save`, `/load`), distinct from a Prompt.
 _Avoid_: slash-command
 
+**Skill**:
+An installable set of agent instructions (a `SKILL.md` with frontmatter `name` /
+`description` / `disable-model-invocation`), discovered from a user scope
+(`<home>/skills/`) or a project scope (`<cwd>/.slimcode/skills/`) and triggered
+like a Command via `/name`. `disable-model-invocation: true` keeps the skill out
+of the system prompt so the model only uses it on an explicit `/name` trigger.
+_Avoid_: plugin, extension
+
 **Session**:
 A conversation with a stable id, timestamp, messages, and optional title; persisted as JSON and restorable via `/load`.
 _Avoid_: conversation (used interchangeably)

@@ -36,8 +36,8 @@ export DASHSCOPE_API_KEY=sk-...
 
 ### 家目录
 
-slimcode 家目录存放 `config.toml` 与会话文件（`sessions/`），默认是
-`~/.slimcode`。可用 `SLIMCODE_HOME` 覆盖：
+slimcode 家目录存放 `config.toml`、会话文件（`sessions/`）与 user 级 skill
+（`skills/`），默认是 `~/.slimcode`。可用 `SLIMCODE_HOME` 覆盖：
 
 ```bash
 export SLIMCODE_HOME=/path/to/custom/slimcode
@@ -45,6 +45,15 @@ export SLIMCODE_HOME=/path/to/custom/slimcode
 
 未设置 `SLIMCODE_HOME` 且 `$HOME` 为空时，slimcode 不加载 `config.toml`（文件
 加载被跳过），base URL 与 model 直接使用默认值。
+
+### Skill 目录（非 config.toml）
+
+skill 不写入 `config.toml`，按 scope 从目录发现：
+
+- **user scope**：`<家目录>/skills/`（随 `SLIMCODE_HOME` 走），跨项目共享；
+- **project scope**：启动目录下的 `.slimcode/skills/`，仅当前项目，同名 skill 优先于 user。
+
+详见 [user-manual.md](./user-manual.md) 的 Skills 节。
 
 ## 命令行参数
 

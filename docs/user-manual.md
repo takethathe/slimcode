@@ -82,6 +82,8 @@ slimcode
 | `/usage` | 显示累计 token 用量 |
 | `/save` | 显式保存当前会话 |
 | `/history` | 列出输入历史（最近 20 条、最新在前、带编号） |
+| `/skills` | 列出已安装的 skill（含 user/project scope 与 manual-only 标记） |
+| `/install-skill <path> --user\|--project` | 从路径安装一个 skill（目录含 `SKILL.md`，或单个 markdown 文件） |
 | `/!!` | 重跑最近一条 prompt（作为新一轮，不重复写入历史） |
 | `/!N` | 重跑编号 N 的 prompt（verbatim，多行原样） |
 | `/exit` / `/quit` | 退出 |
@@ -96,7 +98,55 @@ slimcode
 - 完全无法匹配时提示运行 `/help`。
 
 `/help` 的命令列表、启动时的命令提示条也由同一注册表生成，保证单一事实来源；
-未来其它前端（TUI / Web 等）可复用同一套命令定义与补全逻辑。
+未来其它前端（TUI / Web 等）可复用同一套命令定义与补全逻辑。**Skill** 也以 `/` 触发，
+未知 `/` 命令的预测提示会把内置命令与已安装 skill 合并展示（见下节 Skills）。
+
+### Skills（技能）
+
+Skill 是一份可安装的 agent 指令：一个 `SKILL.md` 文件，开头为 YAML 风格
+frontmatter，后接 markdown 正文。frontmatter 支持：
+
+```markdown
+---
+name: my-skill
+description: What this skill does and when to use it
+disable-model-invocation: true   # 可选；省略 = false
+---
+
+# 正文（触发 /my-skill 时作为指令交给 agent）
+```
+
+- `name`：触发名（`/name`），只能是字母、数字、`_`、`-`，不能与内置命令重名；
+- `description`：一句话说明（用于 `/skills` 列表与系统提示词）；
+- `disable-model-invocation`：可选。设为 `true` 时该 skill 的**描述不会写入系统提示词**
+  （agent 不会自动得知/调用它），只能通过显式 `/name` 触发；省略或 `false` 时描述会
+  进入系统提示词，agent 可按需选用。
+
+#### 作用域（user / project）
+
+- **user**：`~/.slimcode/skills/`（可用 `SLIMCODE_HOME` 覆盖家目录），跨项目共享；
+- **project**：`<cwd>/.slimcode/skills/`，仅当前项目；同名 skill 时 project 优先。
+
+每个 skill 在对应目录下以 `<name>/SKILL.md` 存放；也可直接放 `<name>.md` 单文件。
+
+#### 安装与使用
+
+```text
+slimcode> /install-skill ~/skills/tdd --user
+slimcode> /install-skill ./my-skill.md --project
+slimcode> /skills
+slimcode> /tdd 为这个模块补测试
+```
+
+- `/install-skill <path> --user|--project`：把目录（含 `SKILL.md`）或单个 markdown
+  文件复制到对应 scope，`--user` 与 `--project` 二选一；同名 skill 会被覆盖更新；
+  与内置命令重名的 skill 会被拒绝安装；
+- `/skills`：列出已安装 skill（触发名、描述、manual-only 标记、scope）；
+- `/name [任务]`：触发一个 skill，把其正文（+ 可选任务）作为一轮 agent 指令执行；
+  与其它 `/` 命令一样，skill 触发**不**写入输入历史；
+- 预测提示：输入未知的 `/` 前缀时，候选同时包含内置命令与 skill（如 `/td` →
+  `did you mean: /tdd`）；裸 `/` 列出全部。
+
 
 ### 输入历史与多行 prompt
 

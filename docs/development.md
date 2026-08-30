@@ -32,7 +32,7 @@ cargo workspace，五个 crate（布局见 `.scratch/slimcode-v1` 的 map）：
 | `crates/ai` | `slimcode-ai` | 统一 LLM provider 层（Provider trait + OpenAI-compatible/Bailian） | 起步（Bailian provider + wire 模型） |
 | `crates/agent` | `slimcode-agent` | agent 运行时、工具、会话状态 | 起步（edit 引擎 + 运行时循环 + 消息模型） |
 | `crates/commands` | `slimcode-commands` | 前端无关的 `/` 命令注册表与预测提示 | v1 新增（registry + suggest/find） |
-| `crates/common` | `slimcode-common` | 前端无关的应用模块（配置解析 / 会话与输入历史持久化 / 七工具绑定） | v1 新增（自 cli 抽出） |
+| `crates/common` | `slimcode-common` | 前端无关的应用模块（配置解析 / 会话与输入历史持久化 / skills 发现与安装 / 七工具绑定） | v1 新增（自 cli 抽出） |
 | `crates/cli` | `slimcode` | 二进制入口 + 终端前端（非交互 + REPL） | v1 完成（render/repl/main） |
 
 ### crates/ai Bailian provider
@@ -100,8 +100,9 @@ cargo workspace，五个 crate（布局见 `.scratch/slimcode-v1` 的 map）：
 - `find(input)`：精确解析规范名或别名到命令；
 - `suggest(input)`：按前缀预测匹配命令（`/` 单独列出全部，非 `/` 输入返回空）。
 
-设计上不绑定任何前端：当前行式 REPL 消费它做 `/help` 与未知命令的 `did you
-mean` 提示，未来 TUI/Web 前端可直接复用同一注册表与补全逻辑。
+这里只登记**内置**命令；安装的 **skill** 是另一组动态 `/` 触发
+（`slimcode-common::skills`），前端在预测部分 `/` 输入时把两者合并（见
+crates/cli 的 `combined_suggestions`）。
 
 ### crates/common 前端无关应用模块（`slimcode-common`）
 
@@ -119,6 +120,13 @@ mean` 提示，未来 TUI/Web 前端可直接复用同一注册表与补全逻�
 - `history`：`HistoryStore`（`~/.slimcode/history.json`，JSON 数组，上限 500 条丢最旧）
   记录 `input history`（仅普通 prompt，不含 `/` 命令），与会话 `message history` 严格区分
   （见 CONTEXT.md）；
+- `skills`：`Skill` 模型 + `SkillStore`（前端无关）：`SKILL.md` 的 YAML 风格
+  frontmatter（`name` / `description` / `disable-model-invocation`）解析、
+  user（`<home>/skills/`）与 project（`<cwd>/.slimcode/skills/`）两 scope 的
+  发现（同名时 project 优先）、`install`（目录或单文件源，落为
+  `<scope>/skills/<name>/SKILL.md`）、纯函数 `find_skill` / `suggest_skills` /
+  `skill_prompt`；`disable-model-invocation: true` 的 skill 不进系统提示词，
+  只通过显式 `/name` 触发；
 - `tools`：把七工具 factory 绑定到启动 `cwd`。
 
 ### crates/cli 二进制（`slimcode`）
@@ -136,7 +144,12 @@ mean` 提示，未来 TUI/Web 前端可直接复用同一注册表与补全逻�
 - `render`：`AgentEvent` → 终端输出（流式文本 / 结构行 / 用量汇总），原始
   tool_call delta 与 `Done` 事件被抑制；
 - `repl`：行式循环；`messages_for_prompt` 在**新会话**首轮前置系统提示（恢复的
-  会话历史已含系统消息，不重复），`/load` 经 `SessionStore::load` 恢复历史；
+  会话历史已含系统消息，不重复），系统提示由 `build_system_prompt(skills)` 动态生成
+  ——基础提示 + 可自动调用的 skill 列表（`disable-model-invocation: true` 的
+  skill 描述**不**进系统提示）；基础提示与 skill 段落均以 markdown 结构呈现
+  （基础提示：`## Tools` / `## Working style` 小节，工具名反引号包裹、工作准则
+  为 bullet 列表；skill 段落：`## Available skills` 标题 + 反引号包裹 `/name`
+  的 bullet 列表）；`/load` 经 `SessionStore::load` 恢复历史；
   输入历史 `/history`（最近 20 条、最新在前、带编号）/`/!!`/`/!N` 重跑（verbatim、
   作为新一轮 prompt、不再写入历史）；多行 prompt 用行尾 `\` 续行、空行或非 `\` 行
   提交（无 readline 依赖、无 raw mode，见 ADR-0001）；纯函数 `is_continuation` /
@@ -144,8 +157,13 @@ mean` 提示，未来 TUI/Web 前端可直接复用同一注册表与补全逻�
   `render_history` 承接测试，共享依赖收在 `ReplCtx`；`/help` 与启动 banner 由
   `slimcode-commands::COMMANDS` 生成，未知 `/` 命令用 `suggest` 给出 `did you
   mean` 预测提示；
-- 前端无关的 `config` / `session` / `history` / `tools` 已移入 `slimcode-common`（见上节），
-  cli 只消费它们，不再各自实现。
+- **skills 集成**：`ReplCtx` 持有 `SkillStore`；`/skills` 列出已安装 skill（含
+  scope 与 manual-only 标记），`/install-skill <path> --user|--project` 安装
+  （先 `inspect` 校验源与 name，拒绝与内置命令重名），`/name` 精确命中时把
+  skill 体作为用户消息跑一轮（不写入 input history）；未知 `/` 命令的预测提示
+  由 `combined_suggestions` 合并内置命令与 skill（`suggest_skills`）；
+- 前端无关的 `config` / `session` / `history` / `skills` / `tools` 已移入
+  `slimcode-common`（见上节），cli 只消费它们，不再各自实现。
 
 agent crate 的 `agent` 模块 `pub use session::{Message, Role, ToolCall}`，CLI 统一从
 `slimcode_agent::agent` 引用消息类型。

@@ -5,6 +5,7 @@
 //! Shift+Enter).
 
 use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
 
 use slimcode_agent::agent::Tool;
 use slimcode_agent::session::{Message, Role};
@@ -14,6 +15,9 @@ use crate::render;
 use slimcode_commands::{COMMANDS, suggest};
 use slimcode_common::history::{HISTORY_DISPLAY, HistoryStore};
 use slimcode_common::session::{SessionStore, infer_title, now_rfc3339};
+use slimcode_common::skills::{
+    Skill, SkillScope, SkillStore, find_skill, skill_prompt, suggest_skills,
+};
 
 /// What a line of REPL input means.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,9 +43,13 @@ pub fn classify(line: &str) -> Input {
 
 /// Build the message history for a new prompt: seed the system prompt on a
 /// fresh session, then append the user message. Pure and testable.
-pub fn messages_for_prompt(mut messages: Vec<Message>, prompt: &str) -> Vec<Message> {
+pub fn messages_for_prompt(
+    mut messages: Vec<Message>,
+    system_prompt: &str,
+    prompt: &str,
+) -> Vec<Message> {
     if messages.is_empty() {
-        messages.push(Message::text(Role::System, crate::SYSTEM_PROMPT));
+        messages.push(Message::text(Role::System, system_prompt));
     }
     messages.push(Message::text(Role::User, prompt));
     messages
@@ -145,6 +153,7 @@ pub struct ReplCtx<'a> {
     pub tools: &'a [Tool],
     pub store: &'a SessionStore,
     pub history: &'a HistoryStore,
+    pub skills: &'a SkillStore,
 }
 
 /// The interactive loop. `cwd` is the working directory for the tools.
@@ -213,6 +222,11 @@ pub fn run(
                             "multi-line: end a line with \\ to continue; a blank line submits"
                         )
                         .map_err(|e| e.to_string())?;
+                        writeln!(
+                            out,
+                            "skills: /skills lists installed skills; /<skill> runs one"
+                        )
+                        .map_err(|e| e.to_string())?;
                     }
                     "/exit" | "/quit" => break,
                     "/new" => {
@@ -258,16 +272,66 @@ pub fn run(
                         Ok(n) => replay_and_report(ctx, &mut session, n, out)?,
                         Err(e) => writeln!(out, "{e}").map_err(|e| e.to_string())?,
                     },
+                    "/skills" => match ctx.skills.list() {
+                        Ok(skills) if skills.is_empty() => {
+                            writeln!(out, "no skills installed").map_err(|e| e.to_string())?;
+                        }
+                        Ok(skills) => {
+                            writeln!(out, "skills:").map_err(|e| e.to_string())?;
+                            let width = skills
+                                .iter()
+                                .map(|s| s.name.chars().count())
+                                .max()
+                                .unwrap_or(0);
+                            for s in &skills {
+                                let src = match s.scope {
+                                    SkillScope::User => "user",
+                                    SkillScope::Project => "project",
+                                };
+                                let manual = if s.disable_model_invocation {
+                                    " (manual only)"
+                                } else {
+                                    ""
+                                };
+                                writeln!(
+                                    out,
+                                    "  /{:<width$}  {}{}  [{}]",
+                                    s.name, s.description, manual, src
+                                )
+                                .map_err(|e| e.to_string())?;
+                            }
+                        }
+                        Err(e) => {
+                            writeln!(out, "{e}").map_err(|e| e.to_string())?;
+                        }
+                    },
+                    "/install-skill" => {
+                        install_and_report(ctx, arg, out)?;
+                    }
                     other => {
-                        writeln!(out, "unknown command: {other}").map_err(|e| e.to_string())?;
-                        let matches = suggest(other);
-                        if matches.is_empty() {
-                            writeln!(out, "  run /help to list commands")
-                                .map_err(|e| e.to_string())?;
-                        } else {
-                            let names: Vec<_> = matches.iter().map(|c| c.usage).collect();
-                            writeln!(out, "  did you mean: {}", names.join(", "))
-                                .map_err(|e| e.to_string())?;
+                        let skills = match ctx.skills.list() {
+                            Ok(s) => s,
+                            Err(e) => {
+                                writeln!(out, "{e}").map_err(|e| e.to_string())?;
+                                Vec::new()
+                            }
+                        };
+                        match find_skill(&skills, other) {
+                            Some(skill) => {
+                                submit_skill(ctx, &mut session, skill, arg, out)?;
+                            }
+                            None => {
+                                writeln!(out, "unknown command: {other}")
+                                    .map_err(|e| e.to_string())?;
+                                let matches = combined_suggestions(&skills, other);
+                                if matches.is_empty() {
+                                    writeln!(out, "  run /help to list commands")
+                                        .map_err(|e| e.to_string())?;
+                                } else {
+                                    writeln!(out, "  did you mean: {}", matches.join(", "))
+                                        .map_err(|e| e.to_string())?;
+                                }
+                            }
                         }
                     }
                 }
@@ -293,7 +357,12 @@ fn submit_prompt(
     out: &mut dyn Write,
 ) -> Result<(), String> {
     let mut messages = std::mem::take(&mut session.messages);
-    messages = messages_for_prompt(messages, prompt);
+    let system = if messages.is_empty() {
+        crate::build_system_prompt(&ctx.skills.list().unwrap_or_default())
+    } else {
+        String::new()
+    };
+    messages = messages_for_prompt(messages, &system, prompt);
     if session.title.is_none() {
         session.title = infer_title(&messages);
     }
@@ -334,6 +403,104 @@ fn replay_and_report(
     Ok(())
 }
 
+/// Submit a skill trigger as a fresh turn. The skill body becomes the user
+/// message and, like every `/` command, is NOT recorded in input history.
+fn submit_skill(
+    ctx: &mut ReplCtx<'_>,
+    session: &mut slimcode_agent::session::Session,
+    skill: &Skill,
+    arg: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    let prompt = skill_prompt(skill, arg);
+    submit_prompt(ctx, session, &prompt, false, out)
+}
+
+/// Combine built-in command suggestions with skill suggestions (both triggered
+/// via `/`) for a partial `/` input.
+fn combined_suggestions(skills: &[Skill], input: &str) -> Vec<String> {
+    let mut out: Vec<String> = suggest(input).iter().map(|c| c.usage.to_string()).collect();
+    for s in suggest_skills(skills, input) {
+        out.push(format!("/{}", s.name));
+    }
+    out
+}
+
+/// Does a skill name collide with a built-in command spelling?
+fn is_builtin_command(name: &str) -> bool {
+    COMMANDS
+        .iter()
+        .any(|c| c.spellings().any(|s| s.trim_start_matches('/') == name))
+}
+
+/// Parse the argument of `/install-skill <path> --user|--project`.
+pub fn parse_install_args(arg: Option<&str>) -> Result<(PathBuf, SkillScope), String> {
+    const USAGE: &str = "usage: /install-skill <path> --user|--project";
+    let arg = arg
+        .filter(|a| !a.is_empty())
+        .ok_or_else(|| USAGE.to_string())?;
+    let mut path = None;
+    let mut scope = None;
+    for token in arg.split_whitespace() {
+        match token {
+            "--user" => set_once(&mut scope, SkillScope::User, "scope")?,
+            "--project" => set_once(&mut scope, SkillScope::Project, "scope")?,
+            _ => {
+                if path.is_some() {
+                    return Err(format!("too many arguments; {USAGE}"));
+                }
+                path = Some(PathBuf::from(token));
+            }
+        }
+    }
+    let path = path.ok_or_else(|| USAGE.to_string())?;
+    let scope = scope.ok_or_else(|| format!("choose a scope: --user or --project; {USAGE}"))?;
+    Ok((path, scope))
+}
+
+/// Set `slot` to `value`, erroring if it was already set.
+fn set_once<T>(slot: &mut Option<T>, value: T, what: &str) -> Result<(), String> {
+    if slot.is_some() {
+        return Err(format!("{what} specified more than once"));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+/// Install a skill after validating the source and rejecting built-in name
+/// collisions. Returns a human-readable confirmation line.
+fn install_skill(ctx: &ReplCtx<'_>, path: &Path, scope: SkillScope) -> Result<String, String> {
+    let inspected = ctx.skills.inspect(path, scope)?;
+    if is_builtin_command(&inspected.name) {
+        return Err(format!(
+            "skill name {:?} conflicts with a built-in command",
+            inspected.name
+        ));
+    }
+    let skill = ctx.skills.install(path, scope)?;
+    let target = ctx.skills.skill_dir(scope, &skill.name);
+    Ok(format!(
+        "installed skill /{} to {}",
+        skill.name,
+        target.display()
+    ))
+}
+
+/// Run `/install-skill`, printing (not propagating) any error so the REPL
+/// keeps going.
+fn install_and_report(
+    ctx: &ReplCtx<'_>,
+    arg: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    let result = parse_install_args(arg).and_then(|(path, scope)| install_skill(ctx, &path, scope));
+    match result {
+        Ok(msg) => writeln!(out, "{msg}").map_err(|e| e.to_string())?,
+        Err(e) => writeln!(out, "{e}").map_err(|e| e.to_string())?,
+    }
+    Ok(())
+}
+
 /// Build a fresh session with a new id and timestamp.
 pub fn new_session(store: &SessionStore) -> slimcode_agent::session::Session {
     slimcode_agent::session::Session {
@@ -366,18 +533,18 @@ mod tests {
 
     #[test]
     fn fresh_prompt_seeds_system_message() {
-        let messages = messages_for_prompt(Vec::new(), "hello");
+        let messages = messages_for_prompt(Vec::new(), "be a coder", "hello");
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, Role::System);
-        assert_eq!(messages[0].text_content(), crate::SYSTEM_PROMPT);
+        assert_eq!(messages[0].text_content(), "be a coder");
         assert_eq!(messages[1].role, Role::User);
         assert_eq!(messages[1].text_content(), "hello");
     }
 
     #[test]
     fn continued_prompt_does_not_reseed_system() {
-        let history = vec![Message::text(Role::System, crate::SYSTEM_PROMPT)];
-        let messages = messages_for_prompt(history, "again");
+        let history = vec![Message::text(Role::System, "sys")];
+        let messages = messages_for_prompt(history, "", "again");
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, Role::System);
         assert_eq!(messages[1].text_content(), "again");
@@ -530,11 +697,13 @@ mod tests {
         let tools: Vec<Tool> = Vec::new();
         let mut out = Vec::new();
         let mut input = "/history\n/exit\n".as_bytes();
+        let skills = SkillStore::new(&dir, &dir);
         let mut ctx = ReplCtx {
             provider: &mut provider,
             tools: &tools,
             store: &store,
             history: &history,
+            skills: &skills,
         };
         run(&mut ctx, &dir, new_session(&store), &mut out, &mut input).unwrap();
         let s = String::from_utf8(out).unwrap();
@@ -553,11 +722,13 @@ mod tests {
         let tools: Vec<Tool> = Vec::new();
         let mut out = Vec::new();
         let mut input = "/!99\n/exit\n".as_bytes();
+        let skills = SkillStore::new(&dir, &dir);
         let mut ctx = ReplCtx {
             provider: &mut provider,
             tools: &tools,
             store: &store,
             history: &history,
+            skills: &skills,
         };
         // Errors are surfaced to the output and the REPL continues.
         run(&mut ctx, &dir, new_session(&store), &mut out, &mut input).unwrap();
@@ -576,11 +747,13 @@ mod tests {
         let tools: Vec<Tool> = Vec::new();
         let mut out = Vec::new();
         let mut input = "/!!\n/exit\n".as_bytes();
+        let skills = SkillStore::new(&dir, &dir);
         let mut ctx = ReplCtx {
             provider: &mut provider,
             tools: &tools,
             store: &store,
             history: &history,
+            skills: &skills,
         };
         run(&mut ctx, &dir, new_session(&store), &mut out, &mut input).unwrap();
         let s = String::from_utf8(out).unwrap();
@@ -600,11 +773,13 @@ mod tests {
         let tools: Vec<Tool> = Vec::new();
         let mut out = Vec::new();
         let mut input = "/!abc\n/!\n/exit\n".as_bytes();
+        let skills = SkillStore::new(&dir, &dir);
         let mut ctx = ReplCtx {
             provider: &mut provider,
             tools: &tools,
             store: &store,
             history: &history,
+            skills: &skills,
         };
         run(&mut ctx, &dir, new_session(&store), &mut out, &mut input).unwrap();
         let s = String::from_utf8(out).unwrap();
@@ -627,11 +802,13 @@ mod tests {
         let tools: Vec<Tool> = Vec::new();
         let mut out = Vec::new();
         let mut input = "/history\n/exit\n".as_bytes();
+        let skills = SkillStore::new(&dir, &dir);
         let mut ctx = ReplCtx {
             provider: &mut provider,
             tools: &tools,
             store: &store,
             history: &history,
+            skills: &skills,
         };
         run(&mut ctx, &dir, new_session(&store), &mut out, &mut input).unwrap();
         let s = String::from_utf8(out).unwrap();
@@ -650,11 +827,13 @@ mod tests {
         let tools: Vec<Tool> = Vec::new();
         let mut out = Vec::new();
         let mut input = "\n  \n/exit\n".as_bytes();
+        let skills = SkillStore::new(&dir, &dir);
         let mut ctx = ReplCtx {
             provider: &mut provider,
             tools: &tools,
             store: &store,
             history: &history,
+            skills: &skills,
         };
         run(&mut ctx, &dir, new_session(&store), &mut out, &mut input).unwrap();
         let _ = fs::remove_dir_all(&dir);
@@ -680,11 +859,13 @@ mod tests {
         let tools: Vec<Tool> = Vec::new();
         let mut out = Vec::new();
         let mut input = "/load repl-restore-test\n/exit\n".as_bytes();
+        let skills = SkillStore::new(&dir, &dir);
         let mut ctx = ReplCtx {
             provider: &mut provider,
             tools: &tools,
             store: &store,
             history: &history,
+            skills: &skills,
         };
         let final_session = run(&mut ctx, &dir, new_session(&store), &mut out, &mut input).unwrap();
 
@@ -703,11 +884,13 @@ mod tests {
         let tools: Vec<Tool> = Vec::new();
         let mut out = Vec::new();
         let mut input = "/load\n/exit\n".as_bytes();
+        let skills = SkillStore::new(&dir, &dir);
         let mut ctx = ReplCtx {
             provider: &mut provider,
             tools: &tools,
             store: &store,
             history: &history,
+            skills: &skills,
         };
         let err = run(&mut ctx, &dir, new_session(&store), &mut out, &mut input).unwrap_err();
         assert!(err.contains("session id"), "err: {err}");
@@ -724,11 +907,13 @@ mod tests {
         let tools: Vec<Tool> = Vec::new();
         let mut out = Vec::new();
         let mut input = "/his\n/exit\n".as_bytes();
+        let skills = SkillStore::new(&dir, &dir);
         let mut ctx = ReplCtx {
             provider: &mut provider,
             tools: &tools,
             store: &store,
             history: &history,
+            skills: &skills,
         };
         run(&mut ctx, &dir, new_session(&store), &mut out, &mut input).unwrap();
         let s = String::from_utf8(out).unwrap();
@@ -747,11 +932,13 @@ mod tests {
         let tools: Vec<Tool> = Vec::new();
         let mut out = Vec::new();
         let mut input = "/zzz\n/exit\n".as_bytes();
+        let skills = SkillStore::new(&dir, &dir);
         let mut ctx = ReplCtx {
             provider: &mut provider,
             tools: &tools,
             store: &store,
             history: &history,
+            skills: &skills,
         };
         run(&mut ctx, &dir, new_session(&store), &mut out, &mut input).unwrap();
         let s = String::from_utf8(out).unwrap();
@@ -770,11 +957,13 @@ mod tests {
         let tools: Vec<Tool> = Vec::new();
         let mut out = Vec::new();
         let mut input = "/\n/exit\n".as_bytes();
+        let skills = SkillStore::new(&dir, &dir);
         let mut ctx = ReplCtx {
             provider: &mut provider,
             tools: &tools,
             store: &store,
             history: &history,
+            skills: &skills,
         };
         run(&mut ctx, &dir, new_session(&store), &mut out, &mut input).unwrap();
         let s = String::from_utf8(out).unwrap();
@@ -795,11 +984,13 @@ mod tests {
         let tools: Vec<Tool> = Vec::new();
         let mut out = Vec::new();
         let mut input = "/help\n/exit\n".as_bytes();
+        let skills = SkillStore::new(&dir, &dir);
         let mut ctx = ReplCtx {
             provider: &mut provider,
             tools: &tools,
             store: &store,
             history: &history,
+            skills: &skills,
         };
         run(&mut ctx, &dir, new_session(&store), &mut out, &mut input).unwrap();
         let s = String::from_utf8(out).unwrap();
@@ -808,6 +999,243 @@ mod tests {
         assert!(s.contains("load a saved session"), "got: {s}");
         assert!(s.contains("alias: /resume"), "got: {s}");
         assert!(s.contains("alias: /quit"), "got: {s}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn skill(name: &str, desc: &str, disable: bool) -> Skill {
+        Skill {
+            name: name.to_string(),
+            description: desc.to_string(),
+            disable_model_invocation: disable,
+            body: String::new(),
+            scope: SkillScope::User,
+        }
+    }
+
+    /// A provider whose endpoint refuses connections instantly (no DNS, no
+    /// hang) — used to prove a skill trigger is dispatched as a turn.
+    fn local_refused_provider() -> BailianProvider {
+        BailianProvider::new(slimcode_ai::BailianConfig::new(
+            "sk-test",
+            "http://127.0.0.1:9",
+            "qwen-plus",
+        ))
+        .unwrap()
+    }
+
+    /// Write a user-scope skill named `demo` under `dir`.
+    fn write_demo_skill(dir: &std::path::Path) {
+        let skill_dir = dir.join("skills").join("demo");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: A demo skill\n---\nbody\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn parse_install_args_reads_path_and_scope() {
+        let (path, scope) = parse_install_args(Some("/tmp/skill --project")).unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/skill"));
+        assert_eq!(scope, SkillScope::Project);
+
+        let (path, scope) = parse_install_args(Some("/tmp/skill --user")).unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/skill"));
+        assert_eq!(scope, SkillScope::User);
+    }
+
+    #[test]
+    fn parse_install_args_requires_path_and_scope() {
+        assert!(parse_install_args(None).is_err());
+        assert!(parse_install_args(Some(" --project")).is_err());
+        assert!(parse_install_args(Some("/tmp/skill")).is_err());
+    }
+
+    #[test]
+    fn parse_install_args_rejects_conflicting_or_duplicate_scope() {
+        assert!(parse_install_args(Some("/tmp/skill --user --project")).is_err());
+        assert!(parse_install_args(Some("/tmp/skill --user --user")).is_err());
+        assert!(parse_install_args(Some("/tmp/a /tmp/b --project")).is_err());
+    }
+
+    #[test]
+    fn combined_suggestions_includes_skills_and_commands() {
+        let skills = [skill("histo", "history-ish", false)];
+        let got = combined_suggestions(&skills, "/hist");
+        assert!(got.contains(&"/history".to_string()), "got: {got:?}");
+        assert!(got.contains(&"/histo".to_string()), "got: {got:?}");
+    }
+
+    #[test]
+    fn skills_command_lists_installed_skills() {
+        let dir = temp_dir();
+        write_demo_skill(&dir);
+        let store = SessionStore::new(&dir);
+        let history = HistoryStore::new(dir.join("history.json"));
+        let skills = SkillStore::new(&dir, &dir);
+        let mut provider = dummy_provider();
+        let tools: Vec<Tool> = Vec::new();
+        let mut out = Vec::new();
+        let mut input = "/skills\n/exit\n".as_bytes();
+        let mut ctx = ReplCtx {
+            provider: &mut provider,
+            tools: &tools,
+            store: &store,
+            history: &history,
+            skills: &skills,
+        };
+        run(&mut ctx, &dir, new_session(&store), &mut out, &mut input).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("/demo"), "got: {s}");
+        assert!(s.contains("A demo skill"), "got: {s}");
+        assert!(s.contains("user"), "got: {s}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn skills_command_empty_reports_none() {
+        let dir = temp_dir();
+        let store = SessionStore::new(&dir);
+        let history = HistoryStore::new(dir.join("history.json"));
+        let skills = SkillStore::new(&dir, &dir);
+        let mut provider = dummy_provider();
+        let tools: Vec<Tool> = Vec::new();
+        let mut out = Vec::new();
+        let mut input = "/skills\n/exit\n".as_bytes();
+        let mut ctx = ReplCtx {
+            provider: &mut provider,
+            tools: &tools,
+            store: &store,
+            history: &history,
+            skills: &skills,
+        };
+        run(&mut ctx, &dir, new_session(&store), &mut out, &mut input).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("no skills installed"), "got: {s}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn install_skill_command_installs_project_scope() {
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("SKILL.md"),
+            "---\nname: demo\ndescription: A demo skill\n---\nbody\n",
+        )
+        .unwrap();
+        let store = SessionStore::new(&dir);
+        let history = HistoryStore::new(dir.join("history.json"));
+        let skills = SkillStore::new(&dir, &dir);
+        let mut provider = dummy_provider();
+        let tools: Vec<Tool> = Vec::new();
+        let mut out = Vec::new();
+        let input_str = format!("/install-skill {} --project\n/exit\n", src.display());
+        let mut input = input_str.as_bytes();
+        let mut ctx = ReplCtx {
+            provider: &mut provider,
+            tools: &tools,
+            store: &store,
+            history: &history,
+            skills: &skills,
+        };
+        run(&mut ctx, &dir, new_session(&store), &mut out, &mut input).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("installed skill /demo"), "got: {s}");
+        let target = dir
+            .join(".slimcode")
+            .join("skills")
+            .join("demo")
+            .join("SKILL.md");
+        assert!(target.is_file());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn install_skill_rejects_builtin_name_collision() {
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("SKILL.md"),
+            "---\nname: help\ndescription: nope\n---\nbody\n",
+        )
+        .unwrap();
+        let store = SessionStore::new(&dir);
+        let history = HistoryStore::new(dir.join("history.json"));
+        let skills = SkillStore::new(&dir, &dir);
+        let mut provider = dummy_provider();
+        let tools: Vec<Tool> = Vec::new();
+        let mut out = Vec::new();
+        let input_str = format!("/install-skill {} --user\n/exit\n", src.display());
+        let mut input = input_str.as_bytes();
+        let mut ctx = ReplCtx {
+            provider: &mut provider,
+            tools: &tools,
+            store: &store,
+            history: &history,
+            skills: &skills,
+        };
+        run(&mut ctx, &dir, new_session(&store), &mut out, &mut input).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("conflicts with a built-in command"), "got: {s}");
+        assert!(!dir.join("skills").join("help").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_command_suggests_skills() {
+        let dir = temp_dir();
+        write_demo_skill(&dir);
+        let store = SessionStore::new(&dir);
+        let history = HistoryStore::new(dir.join("history.json"));
+        let skills = SkillStore::new(&dir, &dir);
+        let mut provider = dummy_provider();
+        let tools: Vec<Tool> = Vec::new();
+        let mut out = Vec::new();
+        let mut input = "/dem\n/exit\n".as_bytes();
+        let mut ctx = ReplCtx {
+            provider: &mut provider,
+            tools: &tools,
+            store: &store,
+            history: &history,
+            skills: &skills,
+        };
+        run(&mut ctx, &dir, new_session(&store), &mut out, &mut input).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("did you mean: /demo"), "got: {s}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn skill_trigger_dispatches_a_turn_not_unknown_command() {
+        let dir = temp_dir();
+        write_demo_skill(&dir);
+        let store = SessionStore::new(&dir);
+        let history = HistoryStore::new(dir.join("history.json"));
+        let skills = SkillStore::new(&dir, &dir);
+        let mut provider = local_refused_provider();
+        let tools: Vec<Tool> = Vec::new();
+        let mut out = Vec::new();
+        let mut input = "/demo\n".as_bytes();
+        let mut ctx = ReplCtx {
+            provider: &mut provider,
+            tools: &tools,
+            store: &store,
+            history: &history,
+            skills: &skills,
+        };
+        // The trigger is dispatched as a prompt, whose turn fails only because
+        // the provider endpoint refuses the connection — never as "unknown
+        // command".
+        let err = run(&mut ctx, &dir, new_session(&store), &mut out, &mut input).unwrap_err();
+        let s = String::from_utf8(out).unwrap();
+        assert!(!s.contains("unknown command"), "got: {s}");
+        assert!(!err.is_empty(), "expected a provider error, got: {err}");
         let _ = fs::remove_dir_all(&dir);
     }
 }
