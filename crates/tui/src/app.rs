@@ -187,6 +187,11 @@ pub struct Completion {
     /// First row of the scroll window into `items` (keeps the selection
     /// visible without scrolling every keystroke).
     pub offset: usize,
+    /// Whether the user moved the highlight (↑/↓/Page) during the current
+    /// popup. While false the highlight tracks the re-ranked best match on
+    /// every keystroke; once true it sticks to the chosen candidate while
+    /// that candidate stays in the list.
+    pub manual: bool,
 }
 
 impl Completion {
@@ -485,10 +490,13 @@ impl App {
             && !self.input_text()[1..].contains(char::is_whitespace)
     }
 
-    /// Recompute the candidate list from the current input. Preserves the
-    /// selected value when it is still a candidate; otherwise selects the best
-    /// match (first). Closes the popup when the input leaves the `/` context
-    /// or nothing matches.
+    /// Recompute the candidate list from the current input. An untouched
+    /// auto-highlight re-ranks with every keystroke so the best match is
+    /// always pre-selected; the selection becomes sticky only after the user
+    /// moves it (↑/↓/Page), and then only while that candidate stays in the
+    /// list — a pick that leaves the filtered list falls back to auto.
+    /// Closes the popup when the input leaves the `/` context or nothing
+    /// matches.
     fn refresh_completion(&mut self) {
         if !self.completion_active() {
             self.completion = None;
@@ -502,14 +510,18 @@ impl App {
         let kept = self
             .completion
             .as_ref()
+            .filter(|c| c.manual)
             .and_then(|c| c.items.get(c.selected).map(|i| i.value.clone()));
-        let selected = kept
-            .and_then(|value| items.iter().position(|i| i.value == value))
-            .unwrap_or(0);
+        let kept_index = kept
+            .as_ref()
+            .and_then(|value| items.iter().position(|i| i.value == *value));
         let mut comp = Completion {
             items,
-            selected,
+            // No kept pick (auto mode, or the manual pick got filtered out)
+            // selects the current best match and re-enters auto mode.
+            selected: kept_index.unwrap_or(0),
             offset: 0,
+            manual: kept_index.is_some(),
         };
         comp.clamp_offset();
         self.completion = Some(comp);
@@ -529,6 +541,8 @@ impl App {
             KeyCode::Down => comp.selected = (comp.selected + 1) % len,
             _ => {}
         }
+        // A user move makes the highlight sticky across later keystrokes.
+        comp.manual = true;
         comp.clamp_offset();
     }
 
@@ -544,6 +558,7 @@ impl App {
         } else {
             comp.selected = (comp.selected + lines).min(max);
         }
+        comp.manual = true;
         comp.clamp_offset();
     }
 
@@ -2509,6 +2524,39 @@ mod tests {
         type_text(&mut app, "a");
         let comp = app.completion.as_ref().unwrap();
         assert_eq!(comp.items[comp.selected].value, "/save");
+    }
+
+    #[test]
+    fn auto_selection_follows_reranked_best_match_while_typing() {
+        // Two skills share the `to-` prefix, so until the letters diverge the
+        // top pick is simply the pool-order first. Once `/to-s` ranks
+        // /skill:to-spec strictly above /skill:to-questionnaire (which is
+        // still a candidate), the untouched highlight must follow the new
+        // best match instead of sticking to the earlier pick.
+        let mut app = App::new(
+            "~/proj",
+            "sess-1",
+            "model-x",
+            "9.9.9",
+            vec![
+                skill("to-questionnaire", "questionnaire for someone else"),
+                skill("to-spec", "collapse an idea into a spec"),
+            ],
+        );
+        type_text(&mut app, "/t");
+        let comp = app.completion.as_ref().unwrap();
+        assert_eq!(comp.items[comp.selected].value, "/skill:to-questionnaire");
+        type_text(&mut app, "o-");
+        let comp = app.completion.as_ref().unwrap();
+        assert_eq!(comp.items[comp.selected].value, "/skill:to-questionnaire");
+        type_text(&mut app, "s");
+        let comp = app.completion.as_ref().unwrap();
+        let values: Vec<&str> = comp.items.iter().map(|i| i.value.as_str()).collect();
+        assert!(
+            values.contains(&"/skill:to-questionnaire"),
+            "old pick still a candidate: {values:?}"
+        );
+        assert_eq!(comp.items[comp.selected].value, "/skill:to-spec");
     }
 
     #[test]

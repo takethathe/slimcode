@@ -568,7 +568,10 @@ pub struct CompletionItem {
 /// spelling (canonical name and aliases) plus every installed skill, fuzzy
 /// matched and sorted best-first. A bare `/` yields every candidate in
 /// registry order (commands first, then skills); a non-`/` input yields none.
-/// Skills are advertised under their canonical `/skill:name` spelling.
+/// Skills are matched on their bare name only — the `/skill:` trigger prefix
+/// is never scored, so its letters cannot match every skill — and advertised
+/// under their canonical `/skill:name` spelling (a typed `/skill:name`
+/// trigger is likewise matched by its name part).
 pub fn complete(input: &str, skills: &[Skill]) -> Vec<CompletionItem> {
     let trimmed = input.trim();
     if !trimmed.starts_with('/') {
@@ -589,11 +592,14 @@ pub fn complete(input: &str, skills: &[Skill]) -> Vec<CompletionItem> {
             pool.push((bare, command.description));
         }
     }
-    // Skills pool under their canonical `/skill:name` spelling (matched with
-    // the `skill:` prefix so `/gr` still finds `/skill:grill`).
+    // Skills pool keyed on the bare skill *name*: the `/skill:` trigger is
+    // pure spelling, so matching against it would let any letter of "skill"
+    // (s, k, i, l) match every installed skill and would drown the name's own
+    // boundary bonuses. Only the name is scored; the committed value is
+    // rebuilt as the canonical `/skill:name` trigger below.
     let skill_pool: Vec<(String, String)> = skills
         .iter()
-        .map(|s| (skill_trigger(&s.name), s.description.clone()))
+        .map(|s| (s.name.clone(), s.description.clone()))
         .collect();
 
     let mut scored: Vec<(i64, usize, CompletionItem)> = Vec::new();
@@ -607,7 +613,7 @@ pub fn complete(input: &str, skills: &[Skill]) -> Vec<CompletionItem> {
             })
             .collect();
         out.extend(skill_pool.into_iter().map(|(name, desc)| CompletionItem {
-            value: name,
+            value: skill_trigger(&name),
             description: desc,
         }));
         return out;
@@ -627,14 +633,18 @@ pub fn complete(input: &str, skills: &[Skill]) -> Vec<CompletionItem> {
             ));
         }
     }
+    // A typed `/skill:name` trigger matches by its name part only: strip the
+    // spelling prefix before scoring so it cannot distort the ranking, and a
+    // bare `/skill:` lists every skill (score 0) exactly like a bare `/`.
+    let skill_query = query.strip_prefix("skill:").unwrap_or(query);
     for (name, desc) in skill_pool {
-        if let Some(score) = fuzzy_match(query, &name) {
+        if let Some(score) = fuzzy_match(skill_query, &name) {
             let idx = scored.len();
             scored.push((
                 score,
                 idx,
                 CompletionItem {
-                    value: name,
+                    value: skill_trigger(&name),
                     description: desc,
                 },
             ));
@@ -1220,25 +1230,82 @@ mod tests {
     }
 
     #[test]
-    fn complete_ranks_fuzzy_matches_best_first() {
-        let s = parse_skill(
-            "---\nname: save-notes\ndescription: save loose notes\n---\nb\n",
+    fn complete_matches_skill_by_bare_name_not_trigger_prefix() {
+        // The `/skill:` trigger is pure spelling: matching against it would
+        // let any letter of "skill" (k, i, l, s) match every installed skill.
+        // A query containing only such a letter must find nothing.
+        let alpha = parse_skill(
+            "---\nname: alpha\ndescription: first\n---\nb\n",
             SkillScope::User,
         )
         .unwrap();
-        // Query "sav" matches /save (contiguous) far better than the skill
-        // "save-notes" (gappy s..a..v spread over the word).
+        let beta = parse_skill(
+            "---\nname: beta\ndescription: second\n---\nb\n",
+            SkillScope::User,
+        )
+        .unwrap();
+        let skills = [alpha, beta];
+        // 'k' is in the literal trigger prefix but in neither name.
+        let items = complete("/k", &skills);
+        assert!(
+            items.iter().all(|i| !i.value.starts_with("/skill:")),
+            "trigger-prefix letters must not match skills: {items:?}"
+        );
+        // Name letters still match, under the canonical trigger value.
+        let items = complete("/bet", &skills);
+        let values: Vec<&str> = items.iter().map(|i| i.value.as_str()).collect();
+        assert_eq!(values, vec!["/skill:beta"]);
+        assert_eq!(items[0].description, "second");
+        // The exact canonical name alone (not a skill candidate) does not
+        // leak: `/skill` matches only commands, never every skill.
+        let items = complete("/skill", &skills);
+        assert!(
+            items.iter().all(|i| !i.value.starts_with("/skill:")),
+            "trigger spelling without a name must not match skills: {items:?}"
+        );
+    }
+
+    #[test]
+    fn complete_typed_trigger_prefix_matches_name_part_and_lists_all_when_bare() {
+        let alpha = parse_skill(
+            "---\nname: alpha\ndescription: first\n---\nb\n",
+            SkillScope::User,
+        )
+        .unwrap();
+        let beta = parse_skill(
+            "---\nname: beta\ndescription: second\n---\nb\n",
+            SkillScope::User,
+        )
+        .unwrap();
+        let skills = [alpha, beta];
+        // `/skill:bet` matches by the name part after the trigger prefix.
+        let items = complete("/skill:bet", &skills);
+        let values: Vec<&str> = items.iter().map(|i| i.value.as_str()).collect();
+        assert_eq!(values, vec!["/skill:beta"]);
+        // A bare `/skill:` lists every skill, like a bare `/` does.
+        let items = complete("/skill:", &skills);
+        let values: Vec<&str> = items.iter().map(|i| i.value.as_str()).collect();
+        assert_eq!(values, vec!["/skill:alpha", "/skill:beta"]);
+    }
+
+    #[test]
+    fn complete_ranks_fuzzy_matches_best_first() {
+        // A skill whose bare name exactly equals the query scores the exact
+        // match (best) and outranks the /save command that only starts with
+        // the same letters: matching happens on the name, not the trigger.
+        let s = parse_skill(
+            "---\nname: sav\ndescription: save quick\n---\nb\n",
+            SkillScope::User,
+        )
+        .unwrap();
         let items = complete("/sav", &[s]);
         let values: Vec<&str> = items.iter().map(|i| i.value.as_str()).collect();
-        assert_eq!(*values.first().unwrap(), "/save");
-        assert!(values.contains(&"/skill:save-notes"), "got: {values:?}");
-        // The fuzzy order places the contiguous match first.
+        assert_eq!(*values.first().unwrap(), "/skill:sav", "{values:?}");
+        assert!(values.contains(&"/save"), "got: {values:?}");
+        // The exact-name match is ranked strictly above the fuzzy command hit.
+        let sav = items.iter().position(|i| i.value == "/skill:sav").unwrap();
         let save = items.iter().position(|i| i.value == "/save").unwrap();
-        let notes = items
-            .iter()
-            .position(|i| i.value == "/skill:save-notes")
-            .unwrap();
-        assert!(save < notes, "{values:?}");
+        assert!(sav < save, "{values:?}");
     }
 
     #[test]

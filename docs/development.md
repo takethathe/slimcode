@@ -175,7 +175,11 @@ cargo workspace，六个 crate：
   与每个已安装 skill 合成候选池，用 `fuzzy::fuzzy_match` 模糊排序（裸 `/` 按注册表顺序列全部，
   命令在前、skill 在后；非 `/` 输入返回空）；候选 `value` 是命令的裸拼写（`/save`、`/resume`）
   与 skill 的规范触发 `/skill:name`，**不含** `usage` 的参数占位符，提交时经
-  `find`/`find_skill` 可解析；
+  `find`/`find_skill` 可解析；skill 只按**裸名字**参与模糊打分（`/skill:` 前缀是纯拼写，
+  若一起打分会让 `s`/`k`/`i`/`l` 等前缀字母命中所有 skill、并淹没名字自身的边界奖励），
+  输入里的 `/skill:name` 触发拼写也会先剥掉 `skill:` 前缀再按名字匹配；弹框高亮：用户未
+  用 `↑`/`↓`/`PgUp`/`PgDn` 移动时，每个按键后高亮自动跟随重排后的最佳候选，只有手动移动过
+  才在后续输入里粘住当前选中值（直到该值被过滤掉或弹框关闭）；
 - `context`：`ContextBuilder`（前端无关）把一轮 prompt 的上下文组装收敛为单一
   入口：基础系统提示（默认 `DEFAULT_SYSTEM_PROMPT` 或 `with_system` 覆盖）+
   可自动调用 skill 广告（`with_skills`，build 时经 `format_skills_for_prompt` 过滤
