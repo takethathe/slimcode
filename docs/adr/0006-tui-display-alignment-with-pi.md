@@ -1,3 +1,5 @@
+> Superseded in part by [ADR-0007](./0007-tui-r2-alignment-with-pi.md): the dock order is now `[transcript | popup | editor | footer]` (no separate status row), the editor box is borderless (top/bottom `─` lines only) with the runner status embedded in its top border, and the completion popup is borderless and sits above the editor. D1 (tokens) and D2 (message blocks) are unchanged.
+
 # TUI display follows pi's interaction model (semantic theme, message blocks, dock layout)
 
 slimcode's TUI display is realigned to match the [pi](https://github.com/earendil-works/pi)

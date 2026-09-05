@@ -13,8 +13,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
 use slimcode_agent::agent::StopReason;
 use slimcode_commands::{COMMANDS, find};
 use slimcode_common::render::{DisplayItem, Renderer, usage_summary};
@@ -44,10 +44,6 @@ const COMPLETION_VISIBLE: usize = 5;
 
 /// Number of lines a PageUp / PageDown key scrolls the transcript by.
 const PAGE_LINES: usize = 10;
-
-/// Rows available to the status indicator row (spinner) above the editor;
-/// collapses to 0 when idle (the indicator hides completely, pi-style).
-const STATUS_HEIGHT: u16 = 1;
 
 /// Rows available to the footer (pi's two-line footer).
 const FOOTER_HEIGHT: u16 = 2;
@@ -671,8 +667,13 @@ impl App {
             .map(|c| c.items.len().min(COMPLETION_VISIBLE))
             .unwrap_or(0);
         let scroll_info = completion.map(|c| c.items.len() > visible).unwrap_or(false);
+        // Borderless SelectList popup (ticket 02) with a full-width top
+        // separator line (ticket 05): one row per visible candidate plus the
+        // `(i/n)` overflow row when it overflows, plus 1 separator row. The
+        // separator keeps a clear visual gap between the transcript and the
+        // popup (which sits directly above the input box). No box border.
         let popup_height = if completion.is_some() && visible > 0 {
-            ((visible + usize::from(scroll_info)) as u16).saturating_add(2)
+            (visible + usize::from(scroll_info)) as u16 + 1
         } else {
             0
         };
@@ -685,21 +686,15 @@ impl App {
         let input_height = input_box_height(area.height, input_rows.len());
         let running = self.status.running;
 
-        // ADR-0006 D4 dock: transcript | status row | editor | popup | footer.
-        // The status indicator row collapses to 0 height when idle (pi hides
-        // the row completely; the transcript then uses the row).
-        let status_height = if running { STATUS_HEIGHT } else { 0 };
-        let [
-            transcript_area,
-            status_area,
-            input_area,
-            popup_area,
-            footer_area,
-        ] = Layout::vertical([
+        // Ticket-02 dock: transcript | popup | editor | footer. The popup
+        // (0 rows when closed) sits directly above the editor so the editor
+        // and footer stay anchored and the input box never shifts when the
+        // popup opens/closes (the popup eats into the transcript instead). The
+        // runner status is embedded in the editor's top border while running.
+        let [transcript_area, popup_area, input_area, footer_area] = Layout::vertical([
             Constraint::Min(0),
-            Constraint::Length(status_height),
-            Constraint::Length(input_height),
             Constraint::Length(popup_height),
+            Constraint::Length(input_height),
             Constraint::Length(FOOTER_HEIGHT),
         ])
         .areas(area);
@@ -714,33 +709,29 @@ impl App {
         self.render_scrollbar(frame, transcript_area, self.total_lines());
 
         // Input box: word-wrapped rows, dynamic height, cursor kept visible.
-        render_input(frame, input_area, &self.input, &input_rows, cursor, running);
+        // The runner status is drawn into the box's top border while running.
+        render_input(
+            frame,
+            input_area,
+            &self.input,
+            &input_rows,
+            cursor,
+            running,
+            self.spinner_char(),
+        );
 
-        // Completion popup, when active (SelectList tokens, bordered form
-        // per ADR-0005).
+        // Completion popup, when active (pi SelectList style, borderless,
+        // above the input box — ticket 02).
         if let Some(comp) = &self.completion
             && popup_height > 0
         {
             self.render_completion(frame, popup_area, comp);
         }
 
-        // Status indicator while running: accent spinner + muted message.
-        // (Footer below is drawn unconditionally.)
-        if running && !status_area.is_empty() {
-            self.render_status_indicator(frame, status_area);
-        }
+        // Status indicator: the runner status is embedded in the input box's
+        // top border (render_input) while a turn runs; there is no separate
+        // status row.
         self.render_footer(frame, footer_area);
-    }
-
-    /// Render the running status indicator row: accent braille spinner frame
-    /// plus muted `Working...` (pi's `Loader` default working message). The
-    /// row collapses to 0 height when idle, hiding the indicator entirely.
-    fn render_status_indicator(&self, frame: &mut Frame, area: Rect) {
-        let line = Line::from(vec![
-            Span::styled(self.spinner_char().to_string(), fg(Token::Accent)),
-            Span::styled(format!(" {}", WORKING_MESSAGE), fg(Token::Muted)),
-        ]);
-        frame.render_widget(Paragraph::new(line), area);
     }
 
     /// Render the pi-style two-line dock footer (ADR-0006 D5): line 1 = dim
@@ -771,10 +762,13 @@ impl App {
         frame.render_widget(Paragraph::new(rows), area);
     }
 
-    /// Render the `/` completion popup into `area`: a bordered list of the
-    /// visible candidates styled with pi SelectList tokens — selected row in
-    /// `accent` with a `→ ` cursor, descriptions `muted`, and a muted
-    /// `(i/n)` overflow indicator (ADR-0006 D4).
+    /// Render the `/` completion popup into `area`: a full-width top separator
+    /// line (`─`, `Token::Border`) followed by bare SelectList rows (pi style,
+    /// no box, no title) — selected row `→ ` prefix + name in `accent`,
+    /// non-selected rows default, descriptions `muted`, and a muted `(i/n)`
+    /// overflow row when the list overflows [`COMPLETION_VISIBLE`] (tickets
+    /// 02 + 05). Rendered above the input box so the input position stays
+    /// stable; the separator keeps a visual gap from the transcript.
     fn render_completion(&self, frame: &mut Frame, area: Rect, comp: &Completion) {
         let visible = comp.items.len().min(COMPLETION_VISIBLE);
         let start = comp.offset;
@@ -786,7 +780,14 @@ impl App {
             .map(|i| i.value.chars().count())
             .max()
             .unwrap_or(0);
-        let mut rows: Vec<ListItem> = Vec::with_capacity(window.len());
+        let mut rows: Vec<Line> =
+            Vec::with_capacity(window.len() + usize::from(comp.items.len() > visible) + 1);
+        // Top separator: full-width `─` in the semantic border color, so the
+        // popup reads as a distinct region from the transcript above it.
+        rows.push(Line::from(vec![Span::styled(
+            "─".repeat(area.width as usize),
+            fg(Token::Border),
+        )]));
         for (i, item) in window.iter().enumerate() {
             let selected = (start + i) == comp.selected;
             let prefix = if selected { "→ " } else { "  " };
@@ -805,27 +806,18 @@ impl App {
                     fg(Token::Muted),
                 ));
             }
-            rows.push(ListItem::new(Line::from(spans)));
+            rows.push(Line::from(spans));
         }
 
         let total = comp.items.len();
-        let title = if total > visible {
-            format!(" completion {}–{}/{total} ", start + 1, end)
-        } else {
-            " completion ".to_string()
-        };
         if total > visible {
-            // SelectList scroll info `(i/n)`, muted (its own row inside the
-            // bordered popup, last).
-            rows.push(ListItem::new(Line::styled(
+            // SelectList scroll info `(i/n)`, muted (its own row, last).
+            rows.push(Line::styled(
                 format!("  ({}/{total})", comp.selected + 1),
                 fg(Token::Muted),
-            )));
+            ));
         }
-        let list = List::new(rows).block(Block::bordered().title(title));
-        let mut state = ListState::default();
-        state.select(Some(comp.selected.saturating_sub(start)));
-        frame.render_stateful_widget(list, area, &mut state);
+        frame.render_widget(Paragraph::new(rows), area);
     }
 
     /// Push a streamed display item into the transcript and re-follow.
@@ -1238,13 +1230,12 @@ fn decorate_input(textarea: &mut TextArea<'static>) {
 /// Height of the input box (including its border): the wrapped content height
 /// plus the border, grown with content but capped at [`MAX_INPUT_RATIO`] of the
 /// terminal height (pi-style). At least the resting [`INPUT_HEIGHT`], and never
-/// so tall that the status line is pushed off screen.
+/// so tall that the footer is pushed off screen.
 fn input_box_height(area_height: u16, wrapped_rows: usize) -> u16 {
     let desired = (wrapped_rows as u16).saturating_add(2); // + border
-    let dock = STATUS_HEIGHT + FOOTER_HEIGHT;
     let max = (area_height.saturating_mul(MAX_INPUT_RATIO) / 100)
         .max(INPUT_HEIGHT)
-        .min(area_height.saturating_sub(dock));
+        .min(area_height.saturating_sub(FOOTER_HEIGHT));
     desired.clamp(INPUT_HEIGHT, max.max(INPUT_HEIGHT))
 }
 
@@ -1291,7 +1282,9 @@ fn render_input(
     rows: &[String],
     cursor: Option<(usize, usize)>,
     running: bool,
+    spinner: char,
 ) {
+    let width = area.width as usize;
     let inner_h = area.height.saturating_sub(2) as usize;
     // Keep the cursor row visible when the content is taller than the box.
     let top = match cursor {
@@ -1300,33 +1293,58 @@ fn render_input(
     };
     let window: Vec<String> = rows.iter().skip(top).take(inner_h).cloned().collect();
 
-    let text: Text = if input.is_empty() {
-        // Placeholder: a cursor-width space plus the dim placeholder text.
-        Text::from(Line::from(vec![
-            Span::raw(" "),
-            Span::styled(
-                input.placeholder_text().to_string(),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]))
-    } else {
-        Text::from(
-            window
-                .iter()
-                .cloned()
-                .map(Line::from)
-                .collect::<Vec<Line>>(),
-        )
-    };
     // Semantic border color: `border` blue at rest, `borderAccent` cyan while
-    // a turn runs (ADR-0006 D4).
-    let border_color = if running {
-        Token::BorderAccent.color()
+    // a turn runs (ADR-0006 D4). The whole status+border row shares it.
+    let border_style = fg(if running {
+        Token::BorderAccent
     } else {
-        Token::Border.color()
+        Token::Border
+    });
+
+    // Borderless-sides editor (ticket 01, pi editor): full-width top and
+    // bottom `─` lines with no corners and no vertical sides. While a turn
+    // runs the top border embeds the runner status, left-aligned, matching
+    // pi's embedWorkingStatus (`── ⠋ Working... ────`).
+    let status: String = if running {
+        format!("── {spinner} {WORKING_MESSAGE} ")
+    } else {
+        String::new()
     };
-    let block = Block::bordered().border_style(Style::default().fg(border_color));
-    frame.render_widget(Paragraph::new(text).block(block), area);
+    let status_width = display_width(status.as_str());
+    let top_fill = "─".repeat(width.saturating_sub(status_width));
+    let mut lines: Vec<Line> = Vec::with_capacity(window.len() + 2);
+    lines.push(Line::from(vec![Span::styled(
+        format!("{status}{top_fill}"),
+        border_style,
+    )]));
+
+    let content_width = width.saturating_sub(1); // 1-space left inset
+    if input.is_empty() {
+        // Placeholder: a cursor-width space plus the dim placeholder text.
+        let placeholder = input.placeholder_text().to_string();
+        let pad = content_width.saturating_sub(1 + display_width(&placeholder));
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(placeholder, Style::default().fg(Color::DarkGray)),
+            Span::raw(" ".repeat(pad)),
+        ]));
+    } else {
+        for row in &window {
+            let row_width = display_width(row);
+            let pad = content_width.saturating_sub(row_width);
+            lines.push(Line::from(vec![
+                Span::raw(" "),
+                Span::raw(row.clone()),
+                Span::raw(" ".repeat(pad)),
+            ]));
+        }
+    }
+
+    lines.push(Line::from(vec![Span::styled(
+        "─".repeat(width),
+        border_style,
+    )]));
+    frame.render_widget(Paragraph::new(lines), area);
 
     // Place the terminal cursor at the input cursor's visual position.
     if let Some((row, col)) = cursor {
@@ -2536,15 +2554,60 @@ mod tests {
     }
 
     #[test]
-    fn completion_popup_renders_below_input_with_selection() {
+    fn completion_popup_renders_above_input_with_selection() {
         let mut app = seeded_app();
         type_text(&mut app, "/sav");
-        let buffer = render_buffer(&mut app, 60, 14);
+        let buffer = render_buffer(&mut app, 60, 16);
         // The candidate is drawn with its name and description, selected.
         assert!(buffer_contains(&buffer, "/save"));
         assert!(buffer_contains(&buffer, "save the current session"));
-        // The completion box title marks it as such.
-        assert!(buffer_contains(&buffer, "completion"));
+        // No bordered box and no ` completion ` title any more (ticket 02).
+        assert!(!buffer_contains(&buffer, "completion"));
+        let h: u16 = 16;
+        let input_top = h - FOOTER_HEIGHT - INPUT_HEIGHT;
+        // The popup rows sit ABOVE the input box's top border row.
+        let popup_y = row_containing(&buffer, "→ /save").unwrap();
+        assert!(
+            popup_y < input_top,
+            "popup above input: {popup_y} vs {input_top}"
+        );
+    }
+
+    #[test]
+    fn completion_popup_does_not_shift_the_input_box() {
+        let mut app = seeded_app();
+        let h: u16 = 16;
+        let input_top = h - FOOTER_HEIGHT - INPUT_HEIGHT;
+        // Closed: the input top border is at its anchored row.
+        let closed = render_buffer(&mut app, 60, h);
+        assert!(line_at(&closed, input_top).trim_matches('─').is_empty());
+        // Open: the popup eats into the transcript; the input top border row
+        // stays exactly where it was (input position stability).
+        type_text(&mut app, "/sav");
+        let open = render_buffer(&mut app, 60, h);
+        assert_eq!(line_at(&open, input_top), line_at(&closed, input_top));
+        let closed_top = line_at(&closed, input_top);
+        assert!(closed_top.trim_matches('─').is_empty(), "{closed_top:?}");
+    }
+
+    #[test]
+    fn completion_popup_has_top_separator_line() {
+        let mut app = seeded_app();
+        type_text(&mut app, "/sav");
+        let buffer = render_buffer(&mut app, 60, 16);
+        // The row directly above the first candidate is a full-width `─`
+        // separator line, giving the popup a top border and a clear visual
+        // gap from the transcript (ticket 05).
+        let popup_y = row_containing(&buffer, "→ /save").unwrap();
+        let sep_y = popup_y - 1;
+        let sep = line_at(&buffer, sep_y);
+        assert!(sep.starts_with('─'), "separator row: {sep:?}");
+        assert_eq!(sep.trim_end_matches('─').len(), 0, "full-width: {sep:?}");
+        // The separator uses the semantic border color, matching the editor.
+        assert_eq!(
+            cell_style(&buffer, 0, sep_y).fg,
+            Some(Token::Border.color())
+        );
     }
 
     #[test]
@@ -3060,6 +3123,9 @@ mod tests {
             cell_style(&buffer, 5, border_y).fg,
             Some(Token::BorderAccent.color())
         );
+        // The running border color also carries the embedded status text on
+        // the same (top border) row (ticket 01).
+        assert!(line_at(&buffer, border_y).contains("Working..."));
     }
 
     #[test]
@@ -3082,7 +3148,6 @@ mod tests {
             cell_style(&buffer, desc_x, desc_y).fg,
             Some(Token::Muted.color())
         );
-        assert!(buffer_contains(&buffer, "completion"));
     }
 
     #[test]
@@ -3152,39 +3217,64 @@ mod tests {
     }
 
     #[test]
-    fn status_indicator_only_while_running_and_animates() {
+    fn runner_status_embedded_in_input_top_border_and_animates() {
         let mut app = seeded_app();
         let h: u16 = 12;
-        // Idle: no status row (the row above the input is transcript space).
+        let border_y = h - FOOTER_HEIGHT - INPUT_HEIGHT;
+        // Idle: the input top border is a plain full-width `─` line, no status.
         let idle = render_buffer(&mut app, 60, h);
-        let status_y = h - FOOTER_HEIGHT - INPUT_HEIGHT - STATUS_HEIGHT;
-        assert!(!line_at(&idle, status_y).contains("Working..."));
+        let line = line_at(&idle, border_y);
+        assert!(!line.contains("Working"), "{line:?}");
+        assert_eq!(
+            line.trim_end_matches('─').len(),
+            0,
+            "plain border: {line:?}"
+        );
 
+        // Running: the status sits on the input top border, left-aligned
+        // (`── ⠋ Working... ────`), like pi's embedWorkingStatus.
         app.set_running(true);
         let buffer = render_buffer(&mut app, 60, h);
-        let line = line_at(&buffer, status_y);
+        let line = line_at(&buffer, border_y);
+        assert!(line.starts_with("── "), "status prefix: {line:?}");
         assert!(line.contains("Working..."), "{line:?}");
-        // Spinner cell is accent, message cell is muted.
+        // The whole status+border row is the running border color (pi embeds
+        // the status in the border and colors them together).
+        let spinner_x = 3; // after `── `
         assert_eq!(
-            cell_style(&buffer, 0, status_y).fg,
-            Some(Token::Accent.color())
+            cell_style(&buffer, spinner_x, border_y).fg,
+            Some(Token::BorderAccent.color())
         );
         assert_eq!(
-            cell_style(&buffer, 2, status_y).fg,
-            Some(Token::Muted.color())
+            cell_style(&buffer, spinner_x + 2, border_y).fg,
+            Some(Token::BorderAccent.color())
         );
 
         // tick() advances the braille frame (each of the 10 frames differs).
-        let frame1 = buffer.cell((0, status_y)).unwrap().symbol().to_string();
+        let frame1 = buffer
+            .cell((spinner_x, border_y))
+            .unwrap()
+            .symbol()
+            .to_string();
         app.tick();
         let buffer2 = render_buffer(&mut app, 60, h);
-        let frame2 = buffer2.cell((0, status_y)).unwrap().symbol().to_string();
+        let frame2 = buffer2
+            .cell((spinner_x, border_y))
+            .unwrap()
+            .symbol()
+            .to_string();
         assert_ne!(frame1, frame2);
 
-        // Idle again: row hidden, frame restarts.
+        // Idle again: the border row is a plain `─` line again.
         app.set_running(false);
         let idle2 = render_buffer(&mut app, 60, h);
-        assert!(!line_at(&idle2, status_y).contains("Working..."));
+        let line2 = line_at(&idle2, border_y);
+        assert!(!line2.contains("Working"), "{line2:?}");
+        assert_eq!(
+            line2.trim_end_matches('─').len(),
+            0,
+            "plain border: {line2:?}"
+        );
     }
 
     #[test]

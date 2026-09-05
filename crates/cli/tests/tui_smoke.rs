@@ -362,8 +362,11 @@ fn tmux_smoke_renders_pi_style_ui() {
         redact(&ui.capture())
     );
 
-    // 5. Spinner row while running: "Working..." with frames that differ
-    // between captures, then the final answer from turn 2.
+    // 5. Runner status embedded in the input's top border while running:
+    // `── ⠋ Working... ────` (pi embedWorkingStatus, ticket 01). Frames must
+    // differ between captures. The spinner is no longer the first char of a
+    // dedicated row — it follows the `── ` border prefix — so we pull the
+    // first char that is neither the border `─` nor a space.
     let spin_start = Instant::now();
     let mut frames: Vec<char> = vec![];
     let mut saw_working = false;
@@ -375,7 +378,12 @@ fn tmux_smoke_renders_pi_style_ui() {
         for line in cap.lines() {
             if line.contains("Working") {
                 saw_working = true;
-                if let Some(ch) = line.trim_start().chars().next() {
+                assert!(
+                    line.trim_start().starts_with("── "),
+                    "status should be embedded in the input top border: {:?}",
+                    line
+                );
+                if let Some(ch) = line.chars().find(|c| *c != '─' && *c != ' ') {
                     frames.push(ch);
                 }
             }

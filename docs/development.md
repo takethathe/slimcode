@@ -218,8 +218,9 @@ reducer + draw）、`terminal`（薄壳 + worker-thread runner）。分层：
   `… (N more lines, Ctrl+O to expand)`，`Ctrl+O` 全局展开）；启动头部是 transcript 顶部的
   `Header` 条目（bold accent `slimcode` + dim ` v<version>` + 一行 dim 快捷键提示）；
   错误红字、notice dim；**不**渲染 turn 标记 / `done` 行 / 每轮用量行。`/new`、
-  `/load` 清空后重建会话视图。`/` 补全弹框是 SelectList 样式（选中行 `→` + accent、
-  无反色，描述 muted，滚动标记 muted）。
+  `/load` 清空后重建会话视图。`/` 补全弹框是 SelectList 裸行样式（无边框、无标题，顶部一条
+  全宽 `─` 分隔线（border 色）把弹框与上方 transcript 隔开；选中行
+  `→` + accent、无反色，描述 muted，滚动标记 `(i/n)` muted），显示在输入框正上方。
 - **纯 App core（`app`）**：前端无关、无 I/O 的 reducer。持有 transcript、输入框、
   `history`（input history 快照）、`recall` 态、`completion`、`scroll` /
   `scrollbar_ticks`（auto 模式滚动条：出现后 ~1s 淡出，与 scroll 位置无关）、
@@ -229,9 +230,10 @@ reducer + draw）、`terminal`（薄壳 + worker-thread runner）。分层：
   reducer；`Effect` 枚举（Submit / ReplayPrompt / ReplayHistory / NewSession /
   LoadSession / ShowUsage / Quit / QuitAfterTurn / …）由终端循环兑现。`draw` 用
   ratatui `TestBackend` 做帧缓冲测试（spec：好测试断言**帧缓冲**而非内部状态）。
-  布局是 ADR-0006 D4 五区 dock：`[transcript(Min0) | status(Length 0|1) | input |
-  popup | footer(2)]`；status 行运行中 1 行、空闲 0 行（收起），编辑器边框蓝色
-  （`border`）闲置 / 青色（`borderAccent`）运行中，右缘滚动条 thumb。命令解析经
+  布局是 ADR-0007 D4 四区 dock：`[transcript(Min0) | popup(0|n) | input |
+  footer(2)]`；补全弹框（0 行时收起）位于输入框正上方，开合只吃 transcript、不移动输入框；
+  编辑器为无左右竖线/圆角的上下两条全宽 `─` 横线，边框色蓝色（`border`）闲置 / 青色
+  （`borderAccent`）运行中，右缘滚动条 thumb。命令解析经
   `slimcode_commands::find` + skill 触发 + 编号重跑（`/!N`）。输入历史 recall：输入框
   为空时 `↑`/`↓` 进入（最新一条开始），`Enter` 把选中的历史 prompt 作为新一轮重跑
   （不再写入历史）；每轮提交时追加（不查重，同 `HistoryStore::append`）。
@@ -239,8 +241,9 @@ reducer + draw）、`terminal`（薄壳 + worker-thread runner）。分层：
   `~/cwd (branch) • session`（`footer::format_cwd_for_footer`：只在词法上位于 `$HOME`
   内时缩写为 `~` / `~/rel`），第二行 `stats_line`（`↑in ↓out Rcache WcacheWrite
   CH{pct}%`，零值省略；`format_tokens` 与 pi 同表：<1000 原样、<10k `x.xk`、<1M 取整
-  `xk`、<10M `x.xM`、否则取整 `M`），模型名右对齐，宽度不足时右侧截断。运行中在输入框
-  上方渲染一行 spinner（braille 帧、80ms 一帧）+ muted `Working...`，空闲收起。
+  `xk`、<10M `x.xM`、否则取整 `M`），模型名右对齐，宽度不足时右侧截断。运行中把
+  `⠋ Working...`（braille 帧、80ms 一帧）嵌入输入框上边框左侧，整行用运行色
+  （borderAccent 青）渲染，空闲恢复纯 `─` 上边框（不再占独立状态行）。
 - **worker-thread turn runner（ADR-0006 D6/D6a）**：`terminal::run` 先 `setup_with_cancel`
   构造 provider + 可取消工具集（再进 raw mode / alternate screen），设终端标题（OSC 0
   `slimcode - <session> - <cwd 目录名>`，`/new` `/load` 时更新），并尽力
@@ -261,7 +264,7 @@ reducer + draw）、`terminal`（薄壳 + worker-thread runner）。分层：
   纯单测）；`terminal` 只有原始 I/O + 通道搬移。worker 通道有端到端测试（脚本化
   provider + 通道录制渲染器断言有序 `DisplayItem` 流与最终结果）；tmux 冒烟在
   `crates/cli/tests/tui_smoke.rs`（无 tmux 自动跳过）：对本地 mock SSE 服务器起真终端，
-  capture-pane 断言头部/色块 prompt/markdown 思考/工具块/spinner 动画/footer 两行/补全
+  capture-pane 断言头部/色块 prompt/markdown 思考/工具块/spinner 动画（已嵌入上边框）/footer 两行/补全
   弹框/滚动/改尺寸 dock 固定/OSC 0 标题/Ctrl+C 退出/Esc 中途取消（spinner 消失、已流式
   partial 文本保留、无错误文本、下一 prompt 正常运行）。
 - **CLI 并行不变**：one-shot 前端字节不变地复用 `common`（`render::map_event` 共享；

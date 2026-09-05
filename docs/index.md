@@ -6,4 +6,4 @@
 | [explanation.md](./explanation.md) | 说明文档：背景、概念、设计动机与原理 |
 | [user-manual.md](./user-manual.md) | 用户手册：安装、配置与使用方式 |
 | [configuration.md](./configuration.md) | 配置文档：四层配置来源、config.toml、环境变量与命令行参数使用说明 |
-| [ADR 目录](./adr/) | 架构决策记录（无依赖 REPL 输入历史 ADR-0001、TUI 前端 ADR-0003、前端无关渲染 seam ADR-0004、`/` 补全弹框 ADR-0005、TUI 显示对齐 pi ADR-0006 等） |
+| [ADR 目录](./adr/) | 架构决策记录（无依赖 REPL 输入历史 ADR-0001、TUI 前端 ADR-0003、前端无关渲染 seam ADR-0004、`/` 补全弹框 ADR-0005、TUI 显示对齐 pi ADR-0006、TUI 第二轮对齐 pi（无边框编辑器/嵌入状态/弹框上移）ADR-0007 等） |

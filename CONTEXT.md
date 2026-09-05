@@ -56,7 +56,7 @@ A Prompt entered across multiple lines in the TUI input box (Shift+Enter or Ctrl
 _Avoid_: block, paste
 
 **Completion popup**:
-The fuzzy candidate list shown below the TUI input box while a partial `/` command is typed (commands + installed skills, ranked best-first). `↑`/`↓` move the selection, `Tab` commits it to the buffer, `Enter` executes it, `Esc` cancels. Distinct from the post-submit "did you mean" notice.
+The fuzzy candidate list shown above the TUI input box while a partial `/` command is typed (commands + installed skills, ranked best-first); it renders as bare SelectList rows (no box) directly above the input so the input box stays put when it opens/closes. `↑`/`↓` move the selection, `Tab` commits it to the buffer, `Enter` executes it, `Esc` cancels. Distinct from the post-submit "did you mean" notice.
 _Avoid_: autocomplete box, suggestion popup, picker
 
 **Commit to buffer**:
@@ -88,13 +88,13 @@ The scrollable top region of the TUI holding the startup header, user/assistant 
 _Avoid_: chat area, message list
 
 **Dock**:
-The fixed bottom region of the TUI (status indicator row, editor, completion popup, footer) that never scrolls; the transcript scrolls above it.
+The fixed bottom region of the TUI (completion popup, editor, footer) that never scrolls; the transcript scrolls above it. The popup (0 rows when closed) sits directly above the editor so opening it never shifts the input box or footer.
 _Avoid_: footer bar, bottom bar
 
 **Footer**:
-The bottom two lines: a dim cwd/branch/session line plus a dim token-stats line with the model name right-aligned. Distinct from the status indicator row above the editor.
+The bottom two lines: a dim cwd/branch/session line plus a dim token-stats line with the model name right-aligned. Distinct from the runner status embedded in the editor's top border.
 _Avoid_: status bar, statusline, status line
 
 **Status indicator**:
-The spinner row above the editor shown while a turn runs (braille frames, "Working..."); hidden when idle. Distinct from the Footer and from the old single-line StatusLine.
+The runner status embedded in the editor's top border while a turn runs: a braille spinner + "Working..." drawn left-aligned on the top `─` line, in the running border color (`borderAccent` cyan); idle is a plain `─` border line. Replaces the old separate spinner row above the editor (ADR-0007 D2).
 _Avoid_: loading bar, RUNNING flag, spinner line
