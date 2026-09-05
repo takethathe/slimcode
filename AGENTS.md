@@ -53,6 +53,11 @@ test(core): cover timeout path
 - 代码注释只用英文。
 - `docs/` 文档可中可英，术语前后一致。
 
+### 7. TODO.md 仅作待办输入
+
+- 人工维护：只放尚未完成的事项，完成即删；历史交给 `git log`。
+- agent 工作追踪走 `.scratch/` issue tracker（见下文 Agent skills）。
+
 ---
 
 ## Agent skills
