@@ -98,3 +98,15 @@ _Avoid_: status bar, statusline, status line
 **Status indicator**:
 The runner status embedded in the editor's top border while a turn runs: a braille spinner + "Working..." drawn left-aligned on the top `─` line, in the running border color (`borderAccent` cyan); idle is a plain `─` border line. Replaces the old separate spinner row above the editor (ADR-0007 D2).
 _Avoid_: loading bar, RUNNING flag, spinner line
+
+**Config**:
+The resolved, non-secret application settings (model, base URL, cache flag) produced by the four-layer resolution in `slimcode-common::config` (frontend overrides > env > `config.toml` > defaults), handed to the frontends as a `BailianConfig`. Distinct from credentials.
+_Avoid_: settings file, options
+
+**config.toml**:
+The user-level config file at `~/.slimcode/config.toml` (or `$SLIMCODE_HOME/config.toml`): a TOML `[ai]` table with optional `base_url` / `model` / `cache` / `api_key`. Edited by hand or interactively via `slimcode config`. Distinct from credentials management.
+_Avoid_: config directory, rc file
+
+**API key / credential**:
+A secret (e.g. `DASHSCOPE_API_KEY` / `[ai] api_key`) with source precedence `--api-key` > env > `config.toml`, distinct from non-secret Config. When stored in `config.toml` it is plaintext on disk, so slimcode suggests `chmod 600` on loose permissions and `slimcode config` tightens to 0600 after writing a key.
+_Avoid_: config value, setting

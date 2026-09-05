@@ -13,14 +13,15 @@ slimcode 的配置分四层，**逐项**按以下优先级解析（高 → 低�
 3. **`config.toml` 文件**
 4. **内置默认值**
 
-四者共同决定最终配置：API key 只从环境变量读取；base URL、model 与上下文缓存
-（cache）遵循「命令行参数 > 环境变量 > 文件 > 默认值」的覆盖顺序。
+四者共同决定最终配置：API key 从命令行 `--api-key`、环境变量 `DASHSCOPE_API_KEY`
+或 `config.toml` 的 `[ai] api_key` 三者之一读取（优先级见下）；base URL、model 与
+上下文缓存（cache）遵循「命令行参数 > 环境变量 > 文件 > 默认值」的覆盖顺序。
 
 ## 配置项
 
 | 配置项 | 来源 | 默认值 | 是否必填 |
 | --- | --- | --- | --- |
-| API key | 环境变量 `DASHSCOPE_API_KEY` | — | **必填** |
+| API key | 命令行 `--api-key` 或环境变量 `DASHSCOPE_API_KEY` 或 `config.toml` 的 `[ai] api_key` | — | **必填** |
 | base URL | 命令行 `--base-url` 或环境变量 `SLIMCODE_AI_BASE_URL` 或 `config.toml` 的 `[ai] base_url` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | 否 |
 | model | 命令行 `--model` 或环境变量 `SLIMCODE_AI_MODEL` 或 `config.toml` 的 `[ai] model` | `qwen-plus` | 否 |
 | 上下文缓存 | 命令行 `--cache` / `--no-cache` 或环境变量 `SLIMCODE_AI_CACHE` 或 `config.toml` 的 `[ai] cache` | **`true`（默认开启）** | 否 |
@@ -36,12 +37,28 @@ token 用量汇总行中（`({cached} cached, {pct}%)`）。
 
 ### API key
 
-API key 只从环境变量 `DASHSCOPE_API_KEY` 读取，**绝不落盘**（不写入
-`config.toml`，也不从文件读取）。未设置时启动报错并给出提示：
+API key 是**必填**的秘密（credential），来源优先级：
+
+```text
+--api-key > DASHSCOPE_API_KEY > config.toml [ai] api_key
+```
+
+即：命令行 `--api-key` 临时覆盖单次运行（不落盘）；环境变量 `DASHSCOPE_API_KEY`
+次之；`config.toml` 的 `[ai] api_key` 是便捷回退（文件里只认字面量，不支持
+`$ENV` / `!command` 插值）。与 base_url / model 同构的**逐项**解析，互不牵连。
+
+三者皆缺时启动报错，措辞同时指向环境变量与 config.toml 两种来源。
 
 ```bash
 export DASHSCOPE_API_KEY=sk-...
+# 或写进 config.toml（见下）
 ```
+
+**权限提示**：API key 写入 `config.toml` 时是明文落盘（对早前「key 绝不落盘」
+决策的有意识反转——env 仍是更高优先级的秘密来源，文件是便捷回退）。若 key 来自
+文件且（Unix）`config.toml` 存在 group/other 读权限（`mode & 0o077 != 0`），
+slimcode 启动时会在 stderr 打印一条 `chmod 600` 提示；权限已收紧（0600）时不打扰。
+`slimcode config` 写入 api_key 后会自动 chmod 600。
 
 ### 家目录
 
@@ -68,20 +85,21 @@ skill 集完全由用户安装内容决定。详见 [user-manual.md](./user-manu
 
 ## 命令行参数
 
-启动时可用 `--model` 与 `--base-url` 临时覆盖模型与端点，**优先于**环境变量、
-`config.toml` 与默认值；`--cache` / `--no-cache` 可临时开关显式上下文缓存
-（默认开启，见上）：
+启动时可用 `--model`、`--base-url` 与 `--api-key` 临时覆盖模型、端点与 API key，
+**优先于**环境变量、`config.toml` 与默认值；`--cache` / `--no-cache` 可临时开关
+显式上下文缓存（默认开启，见上）：
 
 ```bash
 slimcode --model qwen-max "为 README 补一段简介"
 slimcode --model qwen-max --base-url https://my.example.com/v1 "列出当前目录"
+slimcode --api-key sk-temp "运行一次使用临时 key"
 slimcode --no-cache "运行 cargo test 并修复失败用例"
 ```
 
-- 三个配置项均可选，可只写其中一个，其余回落到环境变量 / 文件 / 默认值。
-- 参数需紧跟其值（如 `--model qwen-max`）；缺少值时启动报错。`--cache` 与
-  `--no-cache` 是布尔开关，不需要值；后者用于显式关闭（默认开启的缓存）。
-- 参数只作用于当次启动，不写入任何文件。
+- 配置项均可选，可只写其中一个，其余回落到环境变量 / 文件 / 默认值。
+- 参数需紧跟其值（如 `--model qwen-max`、`--api-key sk-...`）；缺少值时启动报错。
+  `--cache` 与 `--no-cache` 是布尔开关，不需要值；后者用于显式关闭（默认开启的缓存）。
+- 参数只作用于当次启动，不写入任何文件（`--api-key` 的一次性覆盖也不落盘）。
 
 ## config.toml 文件
 
@@ -92,30 +110,49 @@ slimcode --no-cache "运行 cargo test 并修复失败用例"
 
 ### 格式
 
-TOML 格式，只放**非敏感**覆盖项。`[ai]` 下的 `base_url`、`model` 与 `cache`
-均可选，可只写其中任意几项：
+TOML 格式，`[ai]` 下的 `base_url`、`model`、`cache` 与 `api_key` 均可选，可只写
+其中任意几项（`api_key` 是明文秘密，见上节权限提示）：
 
 ```toml
 [ai]
 base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 model = "qwen-plus"
 cache = false   # 可选：显式关闭上下文缓存（默认开启）
+api_key = "sk-..."  # 可选：明文 key，写入后建议 chmod 600
 ```
+
+### slimcode config 子命令
+
+不想手写 TOML 时，可用 `slimcode config` 交互式补填：
+
+```bash
+slimcode config
+```
+
+- 读取现有 `config.toml`（若存在），对缺失/已有的 `model` / `base_url` / `api_key`
+  逐项询问；已有值显示为默认值，回车保留，填入则覆盖。
+- 只覆盖你填写的项，保留已有项（含 `cache`，不交互）——重复运行安全。
+- 写回时按解析后的 TOML 文档重写：未触碰的表与键保留，文件里的注释会丢失。
+- 写入 `api_key` 后（Unix）自动 `chmod 600` 并打印文件路径。
+- 交互式命令需要终端（stdin/stdout 均为 TTY）；非 TTY 时报错。
+- 不处理 `cache` 字段（保持手动编辑）。
+- 子命令写入的是文件默认值；解析优先级不变（CLI / env 仍压过文件）。
 
 ### 解析规则
 
 - 文件**可选**：不存在时静默跳过，直接使用环境变量与默认值。
-- **逐项覆盖**：`base_url`、`model` 与 `cache` 独立解析——文件只写了 `model` 时，
-  `base_url` 与 `cache` 各自回落到环境变量或默认值（不互相牵连）。
+- **逐项覆盖**：`base_url`、`model`、`cache` 与 `api_key` 独立解析——文件只写了
+  `model` 时，其余各项各自回落到环境变量或默认值（不互相牵连）。
 - **空文件**（全空白）视为不存在，跳过。
 - **格式错误**（非法 TOML）：启动时报错，提示 `config.toml: …`。
-- 文件里**不应**写 API key（该字段不会被读取）。
+- API key 优先级 `--api-key > DASHSCOPE_API_KEY > [ai] api_key`（与 base_url /
+  model 同构的逐项解析；无默认值，三者皆缺时启动报错）。
 
 ## 环境变量
 
 | 变量 | 作用 | 优先级 |
 | --- | --- | --- |
-| `DASHSCOPE_API_KEY` | 百炼 API key（必填） | 唯一来源 |
+| `DASHSCOPE_API_KEY` | 百炼 API key（必填） | 高于 `config.toml`、低于 `--api-key` |
 | `SLIMCODE_AI_BASE_URL` | 覆盖端点 base URL | 高于 `config.toml` |
 | `SLIMCODE_AI_MODEL` | 覆盖模型 id | 高于 `config.toml` |
 | `SLIMCODE_AI_CACHE` | 覆盖显式上下文缓存开关 | 高于 `config.toml` |
@@ -136,14 +173,19 @@ export DASHSCOPE_API_KEY=sk-...
 slimcode "为 README 补一段简介"
 ```
 
-### 用 config.toml 固定模型
+### 用 config.toml 固定模型与 API key（一次配好，不再 export）
 
 ```bash
-export DASHSCOPE_API_KEY=sk-...
+slimcode config
+# 按提示填入 model / base_url / api_key；写入 api_key 后自动 chmod 600
+
+# 等价的手写方式：
 cat > ~/.slimcode/config.toml <<'EOF'
 [ai]
 model = "qwen-max"
+api_key = "sk-..."
 EOF
+chmod 600 ~/.slimcode/config.toml
 slimcode "运行 cargo test 并修复失败用例"
 ```
 
@@ -151,6 +193,7 @@ slimcode "运行 cargo test 并修复失败用例"
 
 ```bash
 SLIMCODE_AI_MODEL=qwen-turbo slimcode "列出当前目录"
+slimcode --api-key sk-temp "单次运行使用临时 key"
 ```
 
 ### 命令行参数临时覆盖
@@ -178,5 +221,6 @@ EOF
 ### 校验配置
 
 配置错误会在启动时直接报错（例如缺失 API key、`SLIMCODE_AI_CACHE` 非法、
-`config.toml` 非法）。运行一条 prompt 观察输出即可确认模型/端点是否生效；
-运行结束的 token 用量汇总行里的 `({cached} cached)` 可确认缓存是否命中。
+`config.toml` 非法）。缺失 API key 的报错同时指向 `DASHSCOPE_API_KEY` 与
+`config.toml [ai] api_key` 两种配置方式。运行一条 prompt 观察输出即可确认模型/端点
+是否生效；运行结束的 token 用量汇总行里的 `({cached} cached)` 可确认缓存是否命中。

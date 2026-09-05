@@ -18,10 +18,15 @@ cargo build --release
 
 slimcode 的配置分四层，优先级从高到低：命令行参数 > 环境变量 > `config.toml` > 默认值。
 
-- **API key（必填）**：只从环境变量 `DASHSCOPE_API_KEY` 读取，绝不落盘：
+- **API key（必填）**：来源优先级 `--api-key > DASHSCOPE_API_KEY > [ai] api_key`——
+  命令行临时覆盖、环境变量、或写进 `config.toml`（明文，见下权限提示）：
 
   ```bash
   export DASHSCOPE_API_KEY=sk-...
+  # 或：
+  slimcode config   # 交互式把 api_key 写进 ~/.slimcode/config.toml
+  # 或单次覆盖：
+  slimcode --api-key sk-temp "…"
   ```
 
 - **命令行参数（可选，临时生效）**：
@@ -29,24 +34,31 @@ slimcode 的配置分四层，优先级从高到低：命令行参数 > 环境�
   ```bash
   slimcode --model qwen-max "为 README 补一段简介"
   slimcode --model qwen-max --base-url https://my.example.com/v1 "列出当前目录"
+  slimcode --api-key sk-temp "运行一次使用临时 key"
   slimcode --no-cache "运行 cargo test 并修复失败用例"
   ```
 
 - **config.toml（可选）**：位于 `~/.slimcode/config.toml`（可用 `SLIMCODE_HOME`
-  覆盖目录）。只放非敏感覆盖项：
+  覆盖目录）。`[ai]` 下的 `base_url` / `model` / `cache` / `api_key` 均可选；
+  `api_key` 是明文秘密，写文件后建议 `chmod 600`（`slimcode config` 会自动收紧）：
 
   ```toml
   [ai]
   base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
   model = "qwen-plus"
   cache = false   # 可选：显式关闭上下文缓存（默认开启）
+  api_key = "sk-..."   # 可选：明文 key；权限过宽时启动会提示 chmod 600
   ```
+
+  不想手写 TOML？`slimcode config` 交互式补填 model / base_url / api_key：
+  已有值显示为默认，回车保留、填入覆盖；写入 api_key 后（Unix）自动 `chmod 600`
+  并打印文件路径。需要终端（非 TTY 报错）；不处理 cache。
 
 - **环境变量覆盖**：
 
   | 变量 | 作用 | 默认 |
   | --- | --- | --- |
-  | `DASHSCOPE_API_KEY` | 百炼 API key（必填） | — |
+  | `DASHSCOPE_API_KEY` | 百炼 API key（必填；`--api-key` > env > `[ai] api_key`） | — |
   | `SLIMCODE_AI_BASE_URL` | 端点 base URL | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
   | `SLIMCODE_AI_MODEL` | 模型 id | `qwen-plus` |
   | `SLIMCODE_AI_CACHE` | 显式上下文缓存开关（`true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`，非法值启动报错） | `true` |

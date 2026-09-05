@@ -40,33 +40,38 @@ cargo build --release
 
 配置分四层，优先级从高到低：命令行参数 > 环境变量 > `config.toml` > 默认值。
 
-- **API key（必填）**：只从环境变量 `DASHSCOPE_API_KEY` 读取，绝不落盘：
+- **API key（必填）**：来源优先级 `--api-key` > `DASHSCOPE_API_KEY` > `[ai] api_key`。
+  可用 `slimcode config` 交互式写进 `~/.slimcode/config.toml`（明文 key，写入后自动
+  chmod 600；权限过宽时启动会提示 `chmod 600`）：
 
   ```bash
-  export DASHSCOPE_API_KEY=sk-...
+  export DASHSCOPE_API_KEY=sk-...   # 或
+  slimcode config                   # 交互式把 model / base_url / api_key 写进 config.toml
   ```
 
 - **命令行参数（可选，临时生效）**：`--model <model>` 覆盖模型 id，
-  `--base-url <url>` 覆盖端点 base URL：
+  `--base-url <url>` 覆盖端点 base URL，`--api-key <key>` 临时覆盖 API key：
 
   ```bash
   slimcode --model qwen-max "为 README 补一段简介"
   ```
 
 - **config.toml（可选）**：位于 `~/.slimcode/config.toml`（可用 `SLIMCODE_HOME`
-  覆盖目录），只放非敏感覆盖项：
+  覆盖目录），`[ai]` 下 `base_url` / `model` / `cache` / `api_key` 均可选（
+  `api_key` 是明文秘密，写入后建议 `chmod 600`）：
 
   ```toml
   [ai]
   base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
   model = "qwen-plus"
+  api_key = "sk-..."   # 可选：明文 key；权限过宽时启动会提示 chmod 600
   ```
 
 - **环境变量覆盖**：
 
   | 变量 | 作用 | 默认 |
   | --- | --- | --- |
-  | `DASHSCOPE_API_KEY` | 百炼 API key（必填） | — |
+  | `DASHSCOPE_API_KEY` | 百炼 API key（必填；`--api-key` > env > `[ai] api_key`） | — |
   | `SLIMCODE_AI_BASE_URL` | 端点 base URL | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
   | `SLIMCODE_AI_MODEL` | 模型 id | `qwen-plus` |
   | `SLIMCODE_HOME` | slimcode 家目录（含 `config.toml` 与 `sessions/`） | `~/.slimcode` |

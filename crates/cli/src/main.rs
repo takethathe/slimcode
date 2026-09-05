@@ -9,11 +9,12 @@
 //!   and ↑/↓ input-history recall. On a non-TTY (pipe/CI) it fails with a
 //!   clear error.
 //!
-//! Config (Q9): CLI (`--base-url` / `--model`) overrides env
-//! (`SLIMCODE_AI_BASE_URL` / `SLIMCODE_AI_MODEL`), which overrides the file
-//! (`~/.slimcode/config.toml`), which overrides defaults; the API key comes
-//! only from `DASHSCOPE_API_KEY`.
+//! Config: CLI (`--base-url` / `--model` / `--api-key`) overrides env
+//! (`SLIMCODE_AI_BASE_URL` / `SLIMCODE_AI_MODEL` / `DASHSCOPE_API_KEY`), which
+//! overrides the file (`~/.slimcode/config.toml`, including `[ai] api_key`),
+//! which overrides defaults. `slimcode config` interactively edits the file.
 
+mod config_cmd;
 mod render;
 
 use std::env;
@@ -36,15 +37,17 @@ fn usage() -> String {
          slimcode \"<prompt>\"             run one prompt, then exit\n  \
          slimcode --cwd <dir> \"<prompt>\"  run one prompt in <dir>\n  \
          slimcode                       start the interactive TUI (on a TTY)\n  \
+         slimcode config                interactively edit ~/.slimcode/config.toml\n  \
          slimcode --help                show this help\n\n\
          OPTIONS:\n  \
          --cwd <dir>         working directory for the agent\n  \
          --model <model>     override model id (default: {})\n  \
          --base-url <url>    override endpoint (default: {})\n  \
+         --api-key <key>     override API key for this run\n  \
          --cache             enable explicit context caching (default: on)\n  \
          --no-cache          disable explicit context caching\n\n\
          ENV:\n  \
-         DASHSCOPE_API_KEY       API key (required)\n  \
+         DASHSCOPE_API_KEY       API key (precedence: --api-key > env > config.toml)\n  \
          SLIMCODE_AI_BASE_URL    override endpoint\n  \
          SLIMCODE_AI_MODEL       override model\n  \
          SLIMCODE_AI_CACHE       override context caching (true/false/1/0/yes/no/on/off)\n  \
@@ -121,12 +124,53 @@ fn main() {
     }
 }
 
+/// Build the `chmod 600` stderr hint when the API key came from `config.toml`
+/// and (Unix) the file is readable by group/other (`mode & 0o077 != 0`).
+/// Non-Unix platforms skip the check and never warn.
+#[cfg(unix)]
+fn chmod_warning(path: &Path, source: config::ApiKeySource) -> Option<String> {
+    if source != config::ApiKeySource::File {
+        return None;
+    }
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    let mode = meta.mode();
+    if mode & 0o077 != 0 {
+        Some(format!(
+            "API key read from {} (mode {:#o}) — run `chmod 600 {}` to keep it private",
+            path.display(),
+            mode & 0o777,
+            path.display()
+        ))
+    } else {
+        None
+    }
+}
+
+#[cfg(not(unix))]
+fn chmod_warning(_path: &Path, _source: config::ApiKeySource) -> Option<String> {
+    None
+}
+
 /// Argument parsing + mode dispatch (I/O separated from main for testability).
 /// `tty` is whether stdout is a terminal (launch rule uses
 /// `std::io::IsTerminal`), injected so the dispatch is unit-testable.
 fn run(args: &[String], out: &mut dyn Write, tty: bool) -> Result<i32, String> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         writeln!(out, "{}", usage()).map_err(|e| e.to_string())?;
+        return Ok(0);
+    }
+
+    // `slimcode config` subcommand: interactive config-file editing, entered
+    // before prompt parsing (`config` is a subcommand, not a prompt).
+    if args.first().map(String::as_str) == Some("config") {
+        config_cmd::entry(
+            args,
+            tty,
+            std::io::stdin().is_terminal(),
+            &mut std::io::stdin().lock(),
+            out,
+        )?;
         return Ok(0);
     }
 
@@ -146,13 +190,20 @@ fn run(args: &[String], out: &mut dyn Write, tty: bool) -> Result<i32, String> {
         None => env::current_dir().map_err(|e| format!("cwd: {e}"))?,
     };
 
-    let app_config = config::load_with_overrides(Overrides {
+    let (app_config, api_key_source) = config::load_with_overrides(Overrides {
         base_url: parsed.base_url,
         model: parsed.model,
         cache: parsed.cache,
+        api_key: parsed.api_key,
     })?;
     let home =
         config::slimcode_home().ok_or_else(|| "cannot determine home directory".to_string())?;
+    // Print the `chmod 600` hint right after loading — before any turn or, for
+    // the TUI, before the alternate screen opens — so it lands on the normal
+    // terminal (one-shot and TUI share this print point).
+    if let Some(w) = chmod_warning(&home.join("config.toml"), api_key_source) {
+        eprintln!("slimcode: {w}");
+    }
     let store = SessionStore::new(home.join("sessions"));
     let history = HistoryStore::new(home.join("history.json"));
     let skills_store = SkillStore::new(&home, &cwd);
@@ -174,6 +225,8 @@ struct CliArgs {
     model: Option<String>,
     /// `--cache` / `--no-cache` on the command line; `None` = not given.
     cache: Option<bool>,
+    /// `--api-key` on the command line; `None` = not given.
+    api_key: Option<String>,
 }
 
 /// Pure flag/positional parsing, separated from I/O for unit testing. The first
@@ -184,6 +237,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
     let mut base_url = None;
     let mut model = None;
     let mut cache = None;
+    let mut api_key = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -208,6 +262,13 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
                     .ok_or_else(|| "--base-url needs a value".to_string())?;
                 base_url = Some(value.to_string());
             }
+            "--api-key" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "--api-key needs a value".to_string())?;
+                api_key = Some(value.to_string());
+            }
             "--cache" => {
                 cache = Some(true);
             }
@@ -231,6 +292,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
         base_url,
         model,
         cache,
+        api_key,
     })
 }
 
@@ -349,6 +411,49 @@ mod tests {
     }
 
     #[test]
+    fn parse_args_reads_api_key_flag() {
+        let args = vec![
+            "--api-key".to_string(),
+            "sk-cli".to_string(),
+            "hello".to_string(),
+        ];
+        let parsed = parse_args(&args).unwrap();
+        assert_eq!(parsed.api_key.as_deref(), Some("sk-cli"));
+        assert_eq!(parsed.prompt.as_deref(), Some("hello"));
+        // Works without a prompt and mixed with other flags.
+        let parsed = parse_args(&[
+            "--model".to_string(),
+            "m".to_string(),
+            "--api-key".to_string(),
+            "sk-2".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(parsed.api_key.as_deref(), Some("sk-2"));
+        assert_eq!(parsed.prompt, None);
+    }
+
+    #[test]
+    fn parse_args_missing_api_key_value_errors() {
+        let args = vec!["--api-key".to_string()];
+        let err = parse_args(&args).unwrap_err();
+        assert!(err.contains("--api-key"), "err: {err}");
+    }
+
+    #[test]
+    fn help_lists_api_key_flag_and_env_precedence() {
+        let mut buf = Vec::new();
+        let code = run(&["--help".to_string()], &mut buf, false).unwrap();
+        assert_eq!(code, 0);
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("--api-key"), "help must list --api-key");
+        assert!(s.contains("config"), "help must list slimcode config");
+        assert!(
+            s.contains("--api-key > env > config.toml"),
+            "help must state api key precedence"
+        );
+    }
+
+    #[test]
     fn help_lists_cache_flags() {
         let mut buf = Vec::new();
         let code = run(&["--help".to_string()], &mut buf, false).unwrap();
@@ -382,5 +487,81 @@ mod tests {
         let args = vec!["--base-url".to_string()];
         let err = parse_args(&args).unwrap_err();
         assert!(err.contains("--base-url"), "err: {err}");
+    }
+
+    // --- config-file ticket 02: --api-key + chmod hint --------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn chmod_warning_fires_for_loose_file_with_file_key() {
+        let dir = slimcode_common::testutil::unique_temp_dir("chmod-loose");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[ai]\napi_key = \"sk-x\"\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let w = chmod_warning(&path, config::ApiKeySource::File).unwrap();
+        assert!(w.contains("chmod 600"), "warning: {w}");
+        assert!(w.contains("config.toml"), "warning: {w}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chmod_warning_silent_for_tight_file() {
+        let dir = slimcode_common::testutil::unique_temp_dir("chmod-tight");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[ai]\napi_key = \"sk-x\"\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(chmod_warning(&path, config::ApiKeySource::File), None);
+    }
+
+    #[test]
+    fn chmod_warning_silent_when_key_not_from_file() {
+        let dir = slimcode_common::testutil::unique_temp_dir("chmod-env");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[ai]\napi_key = \"sk-x\"\n").unwrap();
+        assert_eq!(chmod_warning(&path, config::ApiKeySource::Env), None);
+        assert_eq!(chmod_warning(&path, config::ApiKeySource::Cli), None);
+    }
+
+    #[test]
+    fn chmod_warning_silent_when_config_missing() {
+        let dir = slimcode_common::testutil::unique_temp_dir("chmod-missing");
+        let path = dir.join("config.toml");
+        assert_eq!(chmod_warning(&path, config::ApiKeySource::File), None);
+    }
+
+    // --- config-file ticket 03: `slimcode config` dispatch -----------------
+
+    #[test]
+    fn config_subcommand_non_tty_errors() {
+        // `slimcode config` is interactive: on a non-TTY it must fail before
+        // touching any config (mirrors the launch rule).
+        let err = run(&["config".to_string()], &mut Vec::new(), false).unwrap_err();
+        assert!(err.contains("terminal"), "err: {err}");
+    }
+
+    #[test]
+    fn config_subcommand_rejects_extra_arguments() {
+        // Dispatched by args.first() == "config", then the subcommand itself
+        // rejects extra positional args.
+        let err = run(
+            &["config".to_string(), "extra".to_string()],
+            &mut Vec::new(),
+            true,
+        )
+        .unwrap_err();
+        assert!(err.contains("no arguments"), "err: {err}");
+    }
+
+    #[test]
+    fn config_as_prompt_when_not_first_argument() {
+        // `config` only dispatches as a subcommand when it is the first arg;
+        // as a later positional it is an ordinary prompt.
+        let parsed = parse_args(&["hello".to_string(), "config".to_string()]).unwrap();
+        assert_eq!(parsed.prompt.as_deref(), Some("hello"));
     }
 }

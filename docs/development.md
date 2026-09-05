@@ -137,9 +137,16 @@ cargo workspace，六个 crate：
   `SLIMCODE_AI_CACHE`（`true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`，大小写不敏感，非法值启动报错
   指明变量名）> `config.toml [ai] cache` > 默认 `true`（默认开启）；与 `base_url`/`model`
   逐项独立回落；
-  `resolve(file_toml, env, overrides)` 纯解析核心 + `load_from(path, overrides)` /
-  `load_with_overrides(overrides)` I/O 包装，产出 `slimcode_ai::BailianConfig`；API key 只
-  来自 `DASHSCOPE_API_KEY`；`slimcode_home()` 解析 `$SLIMCODE_HOME` / `~/.slimcode`；
+  `resolve(file_toml, env, overrides)` 纯解析核心（改返回 `(BailianConfig, ApiKeySource)`）
+  + `load_from(path, overrides)` / `load_with_overrides(overrides)` I/O 包装，产出
+  `slimcode_ai::BailianConfig` 并携带 `ApiKeySource`（Cli | Env | File）标记；API key 三来源
+  优先级 `--api-key`（`Overrides.api_key`）> `DASHSCOPE_API_KEY` > `[ai] api_key`
+  （`FileAi.api_key`，serde optional），三者皆缺报错且措辞同时指向 env 与 config.toml；
+  `slimcode config` 的纯函数核心也在此：`read_ai_fields(existing)`（读当前 `[ai]` 值作
+  交互默认）+ `merge_config_toml(existing, answers)`（基于 `toml::Value` 的整文档合并：
+  只覆盖非空填写项、空回答保留现有值、不碰 cache，未触碰的表/键保留，仅注释在
+  TOML 重写中丢失），供 CLI 子命令消费；`slimcode_home()` 解析 `$SLIMCODE_HOME` /
+  `~/.slimcode`；
 - `session`：`SessionStore`（`~/.slimcode/sessions/<id>.json`），id
   `slimcode-<unix>-<pid>-<n>`、created_at RFC3339 UTC（无 chrono 依赖）、标题取首条
   用户消息截断 48 字符；
@@ -277,11 +284,19 @@ reducer + draw）、`terminal`（薄壳 + worker-thread runner）。分层：
 按启动规则分派（`std::io::IsTerminal` 判定 stdout 是否 TTY）：
 
 - `--help` / `-h`：打印用法后退出；
+- `slimcode config`：第一个参数为 `config` 时特判为子命令（先于 prompt 解析）→
+  `config_cmd` 模块（交互壳 + 写回）：stdin/stdout 行输入逐项询问缺失的
+  model / base_url / api_key（已有值显示为默认、回车保留），合并核心是
+  `common::config::merge_config_toml` 纯函数，写回后（Unix）若含 api_key 则
+  chmod 600 并打印文件路径；非 TTY / 多余参数报错；不处理 cache（保持手动编辑）；
 - **one-shot**：`slimcode "<prompt>"`（可 `--cwd <dir>`、`--model <model>`、
-  `--base-url <url>`）经共享 `ContextBuilder` 组装消息列表（新会话首轮前置系统
+  `--base-url <url>`、`--api-key <key>`）经共享 `ContextBuilder` 组装消息列表（新会话首轮前置系统
   提示并广告可自动调用 skill；开头的 `/skill:name` 会先被 `normalize_skill_trigger`
   改写为 `/{name}`，因为 one-shot 没有命令解析器），经共享 `run_turn` 跑一轮七工具循环、流式渲染事件、
   打印 token 用量并保存会话；
+- **chmod 提示**：`load_with_overrides` 之后，若 `ApiKeySource::File` 且（Unix）
+  `config.toml` 权限 `mode & 0o077 != 0`，stderr 打印 `chmod 600 <path>` 提示（one-shot
+  与 TUI 共用此打印点，TUI 进 alternate screen 前已打过）；非 Unix 跳过；
 - **无 prompt + TTY**：交给 `slimcode_tui::terminal::run` 启动全屏 TUI（见上节）；
 - **无 prompt + 非 TTY**：在配置解析前就以明确错误退出（非零退出码）。
 
