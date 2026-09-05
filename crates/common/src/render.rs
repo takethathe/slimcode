@@ -293,6 +293,12 @@ mod tests {
             map_event(&stop(StopReason::MaxIterations)),
             Some(DisplayItem::Stop(StopReason::MaxIterations))
         );
+        // A cancelled stop maps like any other stop; rendering it as nothing
+        // is a frontend decision.
+        assert_eq!(
+            map_event(&stop(StopReason::Cancelled)),
+            Some(DisplayItem::Stop(StopReason::Cancelled))
+        );
     }
 
     #[test]

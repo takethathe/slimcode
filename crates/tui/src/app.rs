@@ -22,7 +22,13 @@ use slimcode_common::skills::{
     CompletionItem, Skill, SkillScope, combined_suggestions, complete, find_skill,
 };
 use tui_textarea::{CursorMove, TextArea};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthChar;
+
+use crate::footer::FooterUsage;
+use crate::markdown::render_markdown;
+use crate::text::{display_width, wrap_to_width};
+use crate::theme::{BgToken, Token, bg, fg};
+use crate::toolcall::{CallPart, tool_call_title};
 
 /// Resting height in rows of the input box (including its border): one content
 /// row. The box grows with its (wrapped) content up to [`MAX_INPUT_RATIO`] of
@@ -39,8 +45,30 @@ const COMPLETION_VISIBLE: usize = 5;
 /// Number of lines a PageUp / PageDown key scrolls the transcript by.
 const PAGE_LINES: usize = 10;
 
-/// Rows available to the status line at the bottom of the layout.
+/// Rows available to the status indicator row (spinner) above the editor;
+/// collapses to 0 when idle (the indicator hides completely, pi-style).
 const STATUS_HEIGHT: u16 = 1;
+
+/// Rows available to the footer (pi's two-line footer).
+const FOOTER_HEIGHT: u16 = 2;
+
+/// pi's braille spinner frames (`DEFAULT_FRAMES` in pi's `loader.ts`), shown
+/// in the status indicator row while a turn runs.
+const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// The message next to the spinner (pi's `defaultWorkingMessage`).
+const WORKING_MESSAGE: &str = "Working...";
+
+/// Number of output lines a collapsed tool block shows before the expand hint.
+const TOOL_PREVIEW_LINES: usize = 10;
+
+/// Spinner/spacer frames before the transcript scrollbar fades out (auto
+/// mode): 12 ticks ≈ 1s at the loop's 80ms frame interval.
+const SCROLLBAR_FADE_TICKS: u8 = 12;
+
+/// The startup header's single compact hint line (`·`-separated); full help
+/// stays under `/help`.
+const HEADER_HINTS: &str = "/help for commands · /skills to run · ↑ history · Ctrl+O expand";
 
 /// Immutable status-line state shown at the bottom of the screen.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,20 +81,54 @@ pub struct StatusLine {
     pub model: String,
     /// Whether a turn is currently running.
     pub running: bool,
+    /// Best-effort git branch of the cwd (`None` outside a repository), fed
+    /// from the shell at startup and on session changes.
+    pub branch: Option<String>,
+    /// Session-total token usage for the footer stats line. The shell feeds
+    /// the provider's cumulative usage after each turn (and `/usage` keeps
+    /// its own dim detail line).
+    pub usage: FooterUsage,
+}
+
+/// Lifecycle state of a paired tool block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolStatus {
+    /// The tool started; awaiting its result.
+    Pending,
+    /// The tool finished successfully.
+    Success,
+    /// The tool failed.
+    Error,
 }
 
 /// One row-group in the transcript.
 ///
-/// [`Entry::Agent`] carries a streamed [`DisplayItem`] from the shared runner;
-/// [`Entry::Notice`] and [`Entry::Error`] are frontend-owned output appended by
-/// the terminal loop (command results, inline failures, ...).
+/// Blocks are pi-style display units: boxed user prompts, merged assistant
+/// and thinking streams, paired tool blocks (start/result), and flat
+/// frontend-owned notices/errors. The old flat glyph lines (turn markers,
+/// `▶`/`✔`/`✖`, `✓ done`) are gone; everything renders through the Theme
+/// tokens.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Entry {
-    /// A display item streamed from the shared runner.
-    Agent(DisplayItem),
-    /// Frontend-owned output (command results, notices).
+    /// The startup header block (name + version + hints).
+    Header,
+    /// A boxed user prompt rendered as markdown (`userMessageBg`).
+    UserPrompt { text: String },
+    /// Merged streamed assistant text, rendered as markdown.
+    Assistant { text: String },
+    /// Merged streamed reasoning (thinking) text, italic gray markdown.
+    Thinking { text: String },
+    /// A paired tool start/result block: state-colored background, bold title,
+    /// pretty args, gray output, collapsed to [`TOOL_PREVIEW_LINES`].
+    Tool {
+        name: String,
+        args: String,
+        output: String,
+        status: ToolStatus,
+    },
+    /// Frontend-owned output (command results, notices): dim.
     Notice(String),
-    /// An inline error (failed turn, failed command).
+    /// An inline error (failed turn, failed command, abnormal stop): red.
     Error(String),
 }
 
@@ -75,6 +137,14 @@ pub enum Entry {
 pub enum Effect {
     /// Quit the TUI (Ctrl+C / Ctrl+D / `/exit`).
     Quit,
+    /// Quit after the currently running turn finishes (Ctrl+C / Ctrl+D while
+    /// a turn runs; the worker keeps streaming, keys are otherwise ignored
+    /// until the turn ends, then the TUI exits).
+    QuitAfterTurn,
+    /// Cancel the running turn at the next runner boundary (Esc while a turn
+    /// runs): the worker aborts its in-flight request / tool and returns to
+    /// idle with whatever already streamed/applied kept.
+    CancelRunning,
     /// Submit the given prompt to the model.
     SubmitPrompt(String),
     /// Trigger a skill turn with an optional argument.
@@ -170,14 +240,26 @@ pub struct App {
     /// most recent draw; 0 before the first draw. Used to wrap long lines so
     /// scroll/window row math matches what is rendered.
     content_width: u16,
+    /// Version string shown in the startup header (slimcode's version).
+    version: String,
+    /// Global tool-output expansion flag: Ctrl+O expands every tool block.
+    tool_output_expanded: bool,
+    /// Fade counter for the auto-mode transcript scrollbar; decremented by
+    /// [`App::tick`].
+    scrollbar_ticks: u8,
+    /// Index into [`SPINNER_FRAMES`] for the status indicator; advanced every
+    /// [`App::tick`] while running (~80ms per frame, pi's loader interval).
+    spinner_frame: usize,
 }
 
 impl App {
-    /// Create a fresh app in "ready" state.
+    /// Create a fresh app in "ready" state. `version` feeds the startup
+    /// header block.
     pub fn new(
         cwd: impl Into<String>,
         session_id: impl Into<String>,
         model: impl Into<String>,
+        version: impl Into<String>,
         skills: Vec<Skill>,
     ) -> Self {
         let mut app = App {
@@ -188,6 +270,8 @@ impl App {
                 session_id: session_id.into(),
                 model: model.into(),
                 running: false,
+                branch: None,
+                usage: FooterUsage::default(),
             },
             skills,
             history: Vec::new(),
@@ -196,8 +280,12 @@ impl App {
             scroll: 0,
             follow: true,
             content_width: 0,
+            version: version.into(),
+            tool_output_expanded: false,
+            scrollbar_ticks: 0,
+            spinner_frame: 0,
         };
-        app.push_notice("slimcode — type /help for commands, or just start typing");
+        app.transcript.push(Entry::Header);
         app
     }
 
@@ -209,17 +297,66 @@ impl App {
     /// Mark the app as running (or not) on the status line.
     pub fn set_running(&mut self, running: bool) {
         self.status.running = running;
+        if !running {
+            // Idle: the indicator hides, so the frame index can restart.
+            self.spinner_frame = 0;
+        }
     }
 
-    /// Append frontend-owned output to the transcript.
+    /// Feed the best-effort git branch (shell reads it at startup and on
+    /// session changes). `None` outside a repository.
+    pub fn set_branch(&mut self, branch: Option<String>) {
+        self.status.branch = branch;
+    }
+
+    /// Feed the session-total token usage for the footer stats line (the
+    /// provider's cumulative totals after each turn).
+    pub fn set_usage(&mut self, usage: FooterUsage) {
+        self.status.usage = usage;
+    }
+
+    /// The current spinner frame character (pi braille loader).
+    fn spinner_char(&self) -> char {
+        SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()]
+    }
+
+    /// Key handling while a turn runs on the worker thread (ticket 07 R3):
+    /// bare Esc cancels the running turn ([`Effect::CancelRunning`]);
+    /// Ctrl+C / Ctrl+D set a quit-after-turn flag (the current turn keeps
+    /// streaming to completion); every other key is ignored. Called by the
+    /// shell's running loop instead of [`App::handle_key`].
+    pub fn handle_key_running(&mut self, key: KeyEvent) -> Option<Effect> {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('c') | KeyCode::Char('d') => return Some(Effect::QuitAfterTurn),
+                _ => {}
+            }
+        }
+        // Bare Esc cancels the run; modified variants (Ctrl/Alt/Shift+Esc)
+        // are not cancels.
+        if key.code == KeyCode::Esc && key.modifiers.is_empty() {
+            return Some(Effect::CancelRunning);
+        }
+        None
+    }
+
+    /// Append frontend-owned output to the transcript (dim notice).
     pub fn push_notice(&mut self, text: impl Into<String>) {
         self.transcript.push(Entry::Notice(text.into()));
         self.reset_view();
     }
 
-    /// Append an inline error entry to the transcript.
+    /// Append an inline error entry to the transcript (red).
     pub fn push_error(&mut self, text: impl Into<String>) {
         self.transcript.push(Entry::Error(text.into()));
+        self.reset_view();
+    }
+
+    /// Append a boxed user prompt block (typed, recalled, or `/!!`-replayed
+    /// prompts all render the same way; the `> prompt` notice line is gone).
+    pub fn push_user_prompt(&mut self, text: impl Into<String>) {
+        self.transcript
+            .push(Entry::UserPrompt { text: text.into() });
         self.reset_view();
     }
 
@@ -252,10 +389,15 @@ impl App {
 
     /// On-key reducer: returns the effect (if any) the loop must fulfil.
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Effect> {
-        // Global control keys first: Ctrl+C / Ctrl+D quit from any state.
+        // Global control keys first: Ctrl+C / Ctrl+D quit from any state;
+        // Ctrl+O toggles tool-output expansion (pi `toolOutputExpanded`).
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c') | KeyCode::Char('d') => return Some(Effect::Quit),
+                KeyCode::Char('o') => {
+                    self.tool_output_expanded = !self.tool_output_expanded;
+                    return None;
+                }
                 _ => {}
             }
         }
@@ -456,7 +598,7 @@ impl App {
         if let Some(recall) = self.recall.take() {
             let text = self.history.get(recall.index).cloned()?;
             self.clear_input();
-            self.push_notice(format!("> {text}"));
+            self.push_user_prompt(text.clone());
             return Some(Effect::ReplayPrompt(text));
         }
         if key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -522,14 +664,15 @@ impl App {
     /// Draw the whole screen into `area` of the given frame.
     pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
         // The completion popup (when open) is an extra region between the
-        // input box and the status line: a bordered list of `visible` rows.
-        let visible = self
-            .completion
-            .as_ref()
+        // input box and the footer: a bordered list of `visible` rows plus a
+        // muted `(i/n)` scroll-info row when the list overflows.
+        let completion = self.completion.as_ref();
+        let visible = completion
             .map(|c| c.items.len().min(COMPLETION_VISIBLE))
             .unwrap_or(0);
-        let popup_height = if self.completion.is_some() && visible > 0 {
-            (visible as u16).saturating_add(2)
+        let scroll_info = completion.map(|c| c.items.len() > visible).unwrap_or(false);
+        let popup_height = if completion.is_some() && visible > 0 {
+            ((visible + usize::from(scroll_info)) as u16).saturating_add(2)
         } else {
             0
         };
@@ -540,41 +683,98 @@ impl App {
         let input_content_width = (area.width.saturating_sub(2)).max(1) as usize;
         let (input_rows, cursor) = wrapped_input(&self.input, input_content_width);
         let input_height = input_box_height(area.height, input_rows.len());
+        let running = self.status.running;
 
-        let [transcript_area, input_area, popup_area, status_area] = Layout::vertical([
+        // ADR-0006 D4 dock: transcript | status row | editor | popup | footer.
+        // The status indicator row collapses to 0 height when idle (pi hides
+        // the row completely; the transcript then uses the row).
+        let status_height = if running { STATUS_HEIGHT } else { 0 };
+        let [
+            transcript_area,
+            status_area,
+            input_area,
+            popup_area,
+            footer_area,
+        ] = Layout::vertical([
             Constraint::Min(0),
+            Constraint::Length(status_height),
             Constraint::Length(input_height),
             Constraint::Length(popup_height),
-            Constraint::Length(STATUS_HEIGHT),
+            Constraint::Length(FOOTER_HEIGHT),
         ])
         .areas(area);
 
-        // Transcript pane (windowed to the pane height/width minus its border;
-        // long lines are wrapped to the content width so nothing is truncated).
-        let content_height = transcript_area.height.saturating_sub(2);
-        let content_width = transcript_area.width.saturating_sub(2);
+        // Transcript pane: full-bleed, windowed to the pane height; block
+        // rows are already width-fitted (user/tool boxes pad to the width,
+        // markdown wraps), so nothing is truncated.
+        let content_width = transcript_area.width;
         self.content_width = content_width;
-        let lines = self.visible_lines(content_height, content_width);
-        let transcript = Paragraph::new(lines).block(Block::bordered().title(" transcript "));
-        frame.render_widget(transcript, transcript_area);
+        let lines = self.visible_lines(transcript_area.height, content_width);
+        frame.render_widget(Paragraph::new(lines), transcript_area);
+        self.render_scrollbar(frame, transcript_area, self.total_lines());
 
         // Input box: word-wrapped rows, dynamic height, cursor kept visible.
-        render_input(frame, input_area, &self.input, &input_rows, cursor);
+        render_input(frame, input_area, &self.input, &input_rows, cursor, running);
 
-        // Completion popup, when active.
+        // Completion popup, when active (SelectList tokens, bordered form
+        // per ADR-0005).
         if let Some(comp) = &self.completion
             && popup_height > 0
         {
             self.render_completion(frame, popup_area, comp);
         }
 
-        // Status line.
-        let status = Paragraph::new(self.status_line_text());
-        frame.render_widget(status, status_area);
+        // Status indicator while running: accent spinner + muted message.
+        // (Footer below is drawn unconditionally.)
+        if running && !status_area.is_empty() {
+            self.render_status_indicator(frame, status_area);
+        }
+        self.render_footer(frame, footer_area);
+    }
+
+    /// Render the running status indicator row: accent braille spinner frame
+    /// plus muted `Working...` (pi's `Loader` default working message). The
+    /// row collapses to 0 height when idle, hiding the indicator entirely.
+    fn render_status_indicator(&self, frame: &mut Frame, area: Rect) {
+        let line = Line::from(vec![
+            Span::styled(self.spinner_char().to_string(), fg(Token::Accent)),
+            Span::styled(format!(" {}", WORKING_MESSAGE), fg(Token::Muted)),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+    }
+
+    /// Render the pi-style two-line dock footer (ADR-0006 D5): line 1 = dim
+    /// `~/path (branch) • session`, line 2 = dim stats with the model
+    /// right-aligned; both truncated to the pane width. Composed from pure
+    /// footer-formatting functions so the layout is unit-testable.
+    fn render_footer(&self, frame: &mut Frame, area: Rect) {
+        if area.is_empty() || area.width < 2 {
+            return;
+        }
+        let width = area.width as usize;
+        let home = std::env::var("HOME").ok();
+        let pwd = crate::footer::format_cwd_for_footer(&self.status.cwd, home.as_deref());
+        let mut pwd = pwd;
+        if let Some(branch) = &self.status.branch {
+            pwd = format!("{pwd} ({branch})");
+        }
+        pwd = format!("{} • {}", pwd, self.status.session_id);
+        let line1 = crate::footer::truncate_width_str(&pwd, width);
+
+        let stats = crate::footer::stats_parts(&self.status.usage);
+        let line2 = crate::footer::stats_line(&stats, &self.status.model, width);
+
+        let rows = vec![
+            Line::styled(line1, fg(Token::Dim)),
+            Line::styled(line2, fg(Token::Dim)),
+        ];
+        frame.render_widget(Paragraph::new(rows), area);
     }
 
     /// Render the `/` completion popup into `area`: a bordered list of the
-    /// visible candidates with the selection highlighted and marked `→`.
+    /// visible candidates styled with pi SelectList tokens — selected row in
+    /// `accent` with a `→ ` cursor, descriptions `muted`, and a muted
+    /// `(i/n)` overflow indicator (ADR-0006 D4).
     fn render_completion(&self, frame: &mut Frame, area: Rect, comp: &Completion) {
         let visible = comp.items.len().min(COMPLETION_VISIBLE);
         let start = comp.offset;
@@ -587,14 +787,25 @@ impl App {
             .max()
             .unwrap_or(0);
         let mut rows: Vec<ListItem> = Vec::with_capacity(window.len());
-        for item in window {
-            let name = format!("{:<width$}", item.value, width = name_width);
-            let line = Line::from(vec![
-                Span::styled(name, Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw("  "),
-                Span::styled(item.description.clone(), Style::default().fg(Color::Gray)),
-            ]);
-            rows.push(ListItem::new(line));
+        for (i, item) in window.iter().enumerate() {
+            let selected = (start + i) == comp.selected;
+            let prefix = if selected { "→ " } else { "  " };
+            let name = format!("{prefix}{:<width$}", item.value, width = name_width);
+            // pi SelectList: selected prefix + text are `accent`, no bold, no
+            // background inversion.
+            let name_style = if selected {
+                fg(Token::Accent)
+            } else {
+                Style::default()
+            };
+            let mut spans = vec![Span::styled(name, name_style)];
+            if !item.description.is_empty() {
+                spans.push(Span::styled(
+                    format!("  {}", item.description),
+                    fg(Token::Muted),
+                ));
+            }
+            rows.push(ListItem::new(Line::from(spans)));
         }
 
         let total = comp.items.len();
@@ -603,10 +814,15 @@ impl App {
         } else {
             " completion ".to_string()
         };
-        let list = List::new(rows)
-            .block(Block::bordered().title(title))
-            .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
-            .highlight_symbol("→ ");
+        if total > visible {
+            // SelectList scroll info `(i/n)`, muted (its own row inside the
+            // bordered popup, last).
+            rows.push(ListItem::new(Line::styled(
+                format!("  ({}/{total})", comp.selected + 1),
+                fg(Token::Muted),
+            )));
+        }
+        let list = List::new(rows).block(Block::bordered().title(title));
         let mut state = ListState::default();
         state.select(Some(comp.selected.saturating_sub(start)));
         frame.render_stateful_widget(list, area, &mut state);
@@ -614,34 +830,102 @@ impl App {
 
     /// Push a streamed display item into the transcript and re-follow.
     ///
-    /// Consecutive streamed `DisplayItem::Text` (and `DisplayItem::Reasoning`)
-    /// fragments merge into a single entry, so a multi-delta text stream
-    /// renders as one flowing block instead of one line per delta.
+    /// Consecutive streamed text (and reasoning) fragments merge into a
+    /// single assistant/thinking block, so a multi-delta stream renders as one
+    /// flowing block. Tool start/result pair into one block (sequential per
+    /// the shared runner); turn markers and the `✓ done` stop line are gone.
     fn push_display_item(&mut self, item: DisplayItem) {
-        let merged = match &item {
+        match item {
+            // Turn markers were removed in the pi alignment (no `── turn N ──`).
+            DisplayItem::Turn { .. } => return,
             DisplayItem::Text(fragment) => {
-                if let Some(Entry::Agent(DisplayItem::Text(prev))) = self.transcript.last_mut() {
-                    prev.push_str(fragment);
-                    true
+                if let Some(Entry::Assistant { text }) = self.transcript.last_mut() {
+                    text.push_str(&fragment);
                 } else {
-                    false
+                    self.transcript.push(Entry::Assistant { text: fragment });
                 }
             }
             DisplayItem::Reasoning(fragment) => {
-                if let Some(Entry::Agent(DisplayItem::Reasoning(prev))) = self.transcript.last_mut()
-                {
-                    prev.push_str(fragment);
-                    true
+                if let Some(Entry::Thinking { text }) = self.transcript.last_mut() {
+                    text.push_str(&fragment);
                 } else {
-                    false
+                    self.transcript.push(Entry::Thinking { text: fragment });
                 }
             }
-            _ => false,
-        };
-        if !merged {
-            self.transcript.push(Entry::Agent(item));
+            DisplayItem::ToolStart { name, arguments } => {
+                self.transcript.push(Entry::Tool {
+                    name,
+                    args: arguments,
+                    output: String::new(),
+                    status: ToolStatus::Pending,
+                });
+            }
+            DisplayItem::ToolResult { name, ok, result } => {
+                let status = if ok {
+                    ToolStatus::Success
+                } else {
+                    ToolStatus::Error
+                };
+                // Pair with the last pending block for the same tool (the
+                // shared runner emits start/result sequentially per tool).
+                let pending = self.transcript.iter().rposition(|entry| {
+                    matches!(
+                        entry,
+                        Entry::Tool {
+                            name: n,
+                            status: ToolStatus::Pending,
+                            ..
+                        } if *n == name
+                    )
+                });
+                if let Some(idx) = pending {
+                    if let Entry::Tool {
+                        output, status: st, ..
+                    } = &mut self.transcript[idx]
+                    {
+                        output.push_str(&result);
+                        *st = status;
+                    }
+                } else {
+                    self.transcript.push(Entry::Tool {
+                        name,
+                        args: String::new(),
+                        output: result,
+                        status,
+                    });
+                }
+            }
+            // A completed run renders nothing (no `✓ done` line); a cancelled
+            // run (Esc) also renders nothing — the partial transcript is the
+            // feedback and no error line appears. An abnormal stop renders as
+            // red error text.
+            DisplayItem::Stop(StopReason::Completed) => return,
+            DisplayItem::Stop(StopReason::Cancelled) => return,
+            DisplayItem::Stop(StopReason::MaxIterations) => {
+                self.transcript
+                    .push(Entry::Error("stopped: max iterations reached".to_string()));
+            }
+            // `/usage` and the CLI summary share the dim notice line; the
+            // per-turn usage line is gone (the footer shows totals, ticket 03).
+            DisplayItem::Usage(u) => {
+                self.transcript.push(Entry::Notice(usage_summary(&u)));
+            }
         }
         self.reset_view();
+    }
+
+    /// One loop frame (~80ms): decrement the scrollbar fade counter (auto
+    /// mode) and advance the spinner frame while a turn runs (pi's loader
+    /// ticks at 80ms). The terminal loop calls this every frame, so the
+    /// transcript scrollbar fades out ~1s after the last scroll gesture and
+    /// the status spinner animates while running.
+    pub fn tick(&mut self) {
+        if self.scrollbar_ticks > 0 {
+            self.scrollbar_ticks -= 1;
+        }
+        if self.status.running {
+            self.spinner_frame = self.spinner_frame.wrapping_add(1);
+        }
     }
 
     /// Re-anchor the view at the bottom (follow mode): used after new content
@@ -649,11 +933,13 @@ impl App {
     fn reset_view(&mut self) {
         self.scroll = 0;
         self.follow = true;
+        self.scrollbar_ticks = 0;
     }
 
     /// Scroll the transcript up `lines` and stop following.
     fn scroll_up(&mut self, lines: usize) {
         self.follow = false;
+        self.scrollbar_ticks = SCROLLBAR_FADE_TICKS;
         let total = self.total_lines();
         let max_scroll = total.saturating_sub(1);
         self.scroll = (self.scroll + lines).min(max_scroll);
@@ -662,37 +948,26 @@ impl App {
     /// Scroll the transcript down `lines`; reaching the bottom re-follows.
     fn scroll_down(&mut self, lines: usize) {
         self.follow = false;
+        self.scrollbar_ticks = SCROLLBAR_FADE_TICKS;
         self.scroll = self.scroll.saturating_sub(lines);
         if self.scroll == 0 {
             self.follow = true;
         }
     }
 
-    /// Number of transcript rows across all entries, counting wrapped rows at
-    /// the current content width (falling back to logical lines before the
-    /// first draw).
+    /// Number of transcript rows across all entries at the current content
+    /// width (falling back to a small width estimate before the first draw).
     fn total_lines(&self) -> usize {
-        let width = self.content_width as usize;
-        if width == 0 {
-            return self.transcript.iter().map(|e| entry_lines(e).len()).sum();
-        }
-        self.transcript
-            .iter()
-            .map(|e| {
-                entry_lines(e)
-                    .iter()
-                    .map(|l| wrap_to_width(l, width).len())
-                    .sum::<usize>()
-            })
-            .sum()
+        let width = self.content_width.max(1) as usize;
+        self.all_rows(width).len()
     }
 
     /// The window of transcript rows visible in a pane of `height` rows and
-    /// `width` columns. Each entry line is wrapped to the content width first,
-    /// so every returned row fits the pane and no content is truncated.
+    /// `width` columns. Block rows are already width-fitted (user/tool boxes
+    /// pad to the full width, markdown wraps), so every returned row fits the
+    /// pane and no content is truncated.
     fn visible_lines(&self, height: u16, width: u16) -> Vec<Line<'static>> {
         let height = height as usize;
-        let width = width as usize;
         let total = self.total_lines();
         if total == 0 || height == 0 {
             return Vec::new();
@@ -702,32 +977,68 @@ impl App {
         let end = total.saturating_sub(scroll);
         let start = end.saturating_sub(height);
 
-        let mut all: Vec<Line> = Vec::with_capacity(total);
-        for entry in &self.transcript {
-            let style = entry_style(entry);
-            if width == 0 {
-                for line in entry_lines(entry) {
-                    all.push(Line::styled(line, style));
-                }
-            } else {
-                for line in entry_lines(entry) {
-                    for row in wrap_to_width(&line, width) {
-                        all.push(Line::styled(row, style));
-                    }
-                }
-            }
-        }
+        let all = self.all_rows(width as usize);
         all[start..end].to_vec()
     }
 
-    /// The styled status line.
-    fn status_line_text(&self) -> Line<'static> {
-        let s = &self.status;
-        let indicator = if s.running { "RUNNING" } else { "ready" };
-        Line::from(format!(
-            "{} | session {} | {} | {}",
-            s.cwd, s.session_id, s.model, indicator
-        ))
+    /// Build every transcript row once (used by both the window and the
+    /// scrollbar thumb math), including the leading spacer row before user
+    /// and tool blocks.
+    fn all_rows(&self, width: usize) -> Vec<Line<'static>> {
+        let mut rows: Vec<Line<'static>> = Vec::new();
+        for entry in &self.transcript {
+            let block = entry_rows(entry, width, self.tool_output_expanded, &self.version);
+            if !block.is_empty()
+                && !rows.is_empty()
+                && matches!(entry, Entry::UserPrompt { .. } | Entry::Tool { .. })
+            {
+                rows.push(Line::default());
+            }
+            rows.extend(block);
+        }
+        rows
+    }
+
+    /// Whether the transcript scrollbar should render: pi ScrollView auto
+    /// mode — the thumb appears after a scroll gesture and fades out after
+    /// [`SCROLLBAR_FADE_TICKS`] frames (even while the view stays scrolled).
+    fn scrollbar_showing(&self) -> bool {
+        self.scrollbar_ticks > 0
+    }
+
+    /// Draw the auto-mode right-edge scrollbar thumb (`selectedBg`), over the
+    /// rightmost content column (pi ScrollView overlay).
+    fn render_scrollbar(&self, frame: &mut Frame, area: Rect, total: usize) {
+        if !self.scrollbar_showing() || total <= area.height as usize {
+            return;
+        }
+        let view = area.height as usize;
+        let max_offset = total - view;
+        let (start, _) = self.viewport(total, view);
+        let thumb = (view * view / total).max(1).min(view);
+        let band = view - thumb;
+        // band == 0 exactly when max_offset == 0, so `max(1)` makes the
+        // division safe without an explicit zero-check (clippy: avoid manual
+        // checked division).
+        let top = start * band / max_offset.max(1);
+        for y in top..(top + thumb).min(view) {
+            let cell = frame
+                .buffer_mut()
+                .cell_mut((area.right().saturating_sub(1), area.top() + y as u16));
+            if let Some(cell) = cell {
+                cell.set_symbol(" ");
+                cell.set_style(bg(BgToken::SelectedBg));
+            }
+        }
+    }
+
+    /// The (start, end) row window for the current scroll position.
+    fn viewport(&self, total: usize, view: usize) -> (usize, usize) {
+        let max_scroll = total.saturating_sub(1);
+        let scroll = self.scroll.min(max_scroll);
+        let end = total.saturating_sub(scroll);
+        let start = end.saturating_sub(view);
+        (start, end)
     }
 
     /// Take the current input as a prompt: echo it, clear the box, and resolve
@@ -742,7 +1053,7 @@ impl App {
         if trimmed.starts_with('/') {
             self.handle_command(trimmed)
         } else {
-            self.push_notice(format!("> {trimmed}"));
+            self.push_user_prompt(trimmed.to_string());
             self.record_prompt(trimmed.to_string());
             Some(Effect::SubmitPrompt(trimmed.to_string()))
         }
@@ -921,10 +1232,11 @@ fn input_with_text(text: &str) -> TextArea<'static> {
     textarea
 }
 
-/// Shared input-box decoration: placeholder and bordered title.
+/// Shared input-box decoration: placeholder only. The block (border style)
+/// is rebuilt per frame in [`render_input`], so the border color can reflect
+/// the running state (ADR-0006 D4); the ` input ` title is gone.
 fn decorate_input(textarea: &mut TextArea<'static>) {
     textarea.set_placeholder_text("prompt… Enter submits, Shift+Enter newline, ↑ history");
-    textarea.set_block(Block::bordered().title(" input "));
 }
 
 /// Height of the input box (including its border): the wrapped content height
@@ -933,9 +1245,10 @@ fn decorate_input(textarea: &mut TextArea<'static>) {
 /// so tall that the status line is pushed off screen.
 fn input_box_height(area_height: u16, wrapped_rows: usize) -> u16 {
     let desired = (wrapped_rows as u16).saturating_add(2); // + border
+    let dock = STATUS_HEIGHT + FOOTER_HEIGHT;
     let max = (area_height.saturating_mul(MAX_INPUT_RATIO) / 100)
         .max(INPUT_HEIGHT)
-        .min(area_height.saturating_sub(STATUS_HEIGHT));
+        .min(area_height.saturating_sub(dock));
     desired.clamp(INPUT_HEIGHT, max.max(INPUT_HEIGHT))
 }
 
@@ -981,6 +1294,7 @@ fn render_input(
     input: &TextArea<'static>,
     rows: &[String],
     cursor: Option<(usize, usize)>,
+    running: bool,
 ) {
     let inner_h = area.height.saturating_sub(2) as usize;
     // Keep the cursor row visible when the content is taller than the box.
@@ -1008,17 +1322,21 @@ fn render_input(
                 .collect::<Vec<Line>>(),
         )
     };
-    let block = input
-        .block()
-        .cloned()
-        .unwrap_or_else(|| Block::bordered().title(" input "));
+    // Semantic border color: `border` blue at rest, `borderAccent` cyan while
+    // a turn runs (ADR-0006 D4).
+    let border_color = if running {
+        Token::BorderAccent.color()
+    } else {
+        Token::Border.color()
+    };
+    let block = Block::bordered().border_style(Style::default().fg(border_color));
     frame.render_widget(Paragraph::new(text).block(block), area);
 
     // Place the terminal cursor at the input cursor's visual position.
     if let Some((row, col)) = cursor {
         let visual_row = row.saturating_sub(top);
         let prefix: String = rows[row].chars().take(col).collect();
-        let x = area.x + 1 + UnicodeWidthStr::width(prefix.as_str()) as u16;
+        let x = area.x + 1 + display_width(prefix.as_str()) as u16;
         let y = area.y + 1 + visual_row as u16;
         if y < area.y + area.height && x < area.x + area.width {
             frame.set_cursor_position(Position { x, y });
@@ -1035,88 +1353,296 @@ fn split_name_arg(line: &str) -> (&str, Option<&str>) {
     (name, arg)
 }
 
-/// The plain text lines an entry contributes to the transcript.
-fn entry_lines(entry: &Entry) -> Vec<String> {
+/// The styled rows an entry contributes to the transcript (block-aware,
+/// already width-fitted; see ADR-0006 D2/D4).
+#[allow(clippy::too_many_arguments)]
+fn entry_rows(
+    entry: &Entry,
+    width: usize,
+    tool_expanded: bool,
+    version: &str,
+) -> Vec<Line<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
     match entry {
-        Entry::Agent(item) => item_lines(item),
-        Entry::Notice(text) => text.lines().map(str::to_string).collect(),
-        Entry::Error(text) => text.lines().map(str::to_string).collect(),
+        Entry::Header => header_rows(version),
+        Entry::UserPrompt { text } => user_box_rows(text, width),
+        Entry::Assistant { text } => render_markdown(text, width),
+        Entry::Thinking { text } => render_markdown(text, width)
+            .into_iter()
+            .map(|line| italicize(line, Token::ThinkingText.color()))
+            .collect(),
+        Entry::Tool {
+            name,
+            args,
+            output,
+            status,
+        } => tool_rows(name, args, output, *status, width, tool_expanded),
+        Entry::Notice(text) => text
+            .lines()
+            .map(|l| Line::styled(l.to_string(), fg(Token::Dim)))
+            .collect(),
+        Entry::Error(text) => text
+            .lines()
+            .map(|l| Line::styled(l.to_string(), fg(Token::Error)))
+            .collect(),
     }
 }
 
-/// Wrap `line` so it fits `width` display columns, splitting at character
-/// boundaries when it would overflow. CJK and other wide characters count as
-/// two columns (via `unicode-width`), matching the terminal. Returns at least
-/// one row (empty input yields a single empty row) so layout stays stable.
-fn wrap_to_width(line: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return vec![String::new()];
+/// The startup header block: bold accent `slimcode` + dim ` v<version>` + one
+/// compact hint line.
+fn header_rows(version: &str) -> Vec<Line<'static>> {
+    vec![
+        Line::from(vec![
+            Span::styled("slimcode", fg(Token::Accent).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!(" v{version}"),
+                fg(Token::Dim).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::styled(HEADER_HINTS, fg(Token::Dim)),
+    ]
+}
+
+/// A boxed user prompt: `userMessageBg`-filled full-width rows with the
+/// markdown text padded one column each side (pi Box paddingX=1).
+fn user_box_rows(text: &str, width: usize) -> Vec<Line<'static>> {
+    let inner = width.saturating_sub(2).max(1);
+    let md = render_markdown(text, inner);
+    let bg = BgToken::UserMessageBg.color();
+    let bg_style = Style::default().bg(bg);
+    let mut rows = vec![Line::styled(" ".repeat(width), bg_style)];
+    for line in md {
+        let mut spans: Vec<Span> = line
+            .spans
+            .into_iter()
+            .map(|s| Span::styled(s.content.clone(), s.style.bg(bg)))
+            .collect();
+        let content_w: usize = spans.iter().map(|s| display_width(&s.content)).sum();
+        let pad = inner.saturating_sub(content_w);
+        spans.insert(0, Span::styled(" ", bg_style));
+        spans.push(Span::styled(" ".repeat(pad + 1), bg_style));
+        rows.push(Line::from(spans));
     }
-    let mut rows = Vec::new();
-    let mut current = String::new();
-    let mut current_width = 0usize;
-    for c in line.chars() {
-        let cw = c.width().unwrap_or(0);
-        if current_width > 0 && current_width + cw > width {
-            rows.push(std::mem::take(&mut current));
-            current_width = 0;
+    rows.push(Line::styled(" ".repeat(width), bg_style));
+    rows
+}
+
+/// A tool block: state-colored full-width background, compact per-tool call
+/// title for built-ins (pi `format*Call`; ticket 06), gray output collapsed to
+/// [`TOOL_PREVIEW_LINES`] with an expand hint unless the global Ctrl+O
+/// expansion flag is on.
+///
+/// Every non-spacer row is padded to the pane width so the state background
+/// reads as one solid full-width band (ticket 05; pi Box paints the whole
+/// padded rect). Spacer rows stay `" ".repeat(width)`. Unknown tools (no
+/// compact shape) keep pi's fallback header: bold bare name + pretty JSON
+/// args.
+fn tool_rows(
+    name: &str,
+    args: &str,
+    output: &str,
+    status: ToolStatus,
+    width: usize,
+    expanded: bool,
+) -> Vec<Line<'static>> {
+    let bg = match status {
+        ToolStatus::Pending => BgToken::ToolPendingBg.color(),
+        ToolStatus::Success => BgToken::ToolSuccessBg.color(),
+        ToolStatus::Error => BgToken::ToolErrorBg.color(),
+    };
+    let bg_style = Style::default().bg(bg);
+    let inner = width.saturating_sub(2).max(1);
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    rows.push(Line::styled(" ".repeat(width), bg_style));
+
+    match tool_call_title(name, args) {
+        // Built-in tool with a compact call-title shape: wrapped title rows
+        // (no separate JSON args section).
+        Some(parts) => {
+            for spans in wrap_call_title(&parts, bg_style, inner) {
+                let mut row = vec![Span::styled(" ", bg_style)];
+                row.extend(spans);
+                rows.push(pad_line_to_width(row, width, bg_style));
+            }
         }
-        current.push(c);
-        current_width += cw;
+        // Unknown tool / unusable args → pi fallback: bold bare name, blank
+        // line, pretty JSON args (unchanged layout).
+        None => {
+            let title = vec![
+                Span::styled(" ", bg_style),
+                Span::styled(
+                    name.to_string(),
+                    bg_style
+                        .fg(Token::ToolTitle.color())
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ];
+            rows.push(pad_line_to_width(title, width, bg_style));
+            let pretty = pretty_args(args);
+            if !pretty.is_empty() {
+                rows.push(Line::styled(" ".repeat(width), bg_style));
+                for line in pretty {
+                    let style = bg_style.fg(Token::Dim.color());
+                    rows.push(pad_line_to_width(
+                        vec![Span::styled(
+                            format!(" {}", wrap_to_width_join(&line, inner)),
+                            style,
+                        )],
+                        width,
+                        bg_style,
+                    ));
+                }
+            }
+        }
     }
-    if !current.is_empty() || rows.is_empty() {
-        rows.push(current);
+
+    // Output: gray (toolOutput), collapsed to the first N lines.
+    let out_lines: Vec<String> = output
+        .lines()
+        .flat_map(|l| wrap_to_width(l, inner))
+        .collect();
+    let remaining = out_lines.len().saturating_sub(TOOL_PREVIEW_LINES);
+    let visible_lines = if expanded || remaining == 0 {
+        &out_lines[..]
+    } else {
+        &out_lines[..TOOL_PREVIEW_LINES]
+    };
+    for line in visible_lines {
+        let style = bg_style.fg(Token::ToolOutput.color());
+        rows.push(pad_line_to_width(
+            vec![Span::styled(format!(" {line}"), style)],
+            width,
+            bg_style,
+        ));
+    }
+    if remaining > 0 && !expanded {
+        // pi tool-execution collapse hint: muted prefix + dim key hint +
+        // muted suffix (the same text parts as keyHint renders).
+        let hint_bg = bg_style.fg(Token::Muted.color());
+        let hint = vec![
+            Span::styled(format!(" ... ({} more lines,", remaining), hint_bg),
+            Span::styled(" Ctrl+O", bg_style.fg(Token::Dim.color())),
+            Span::styled(" to expand)", hint_bg),
+        ];
+        rows.push(pad_line_to_width(hint, width, bg_style));
+    }
+    rows.push(Line::styled(" ".repeat(width), bg_style));
+    rows
+}
+
+/// Wrap a tool-call title's styled runs to `width` display cells on the block
+/// background `bg`. Breaks at spaces when possible (words stay whole) and at
+/// character boundaries otherwise, so no title text is dropped and wide CJK
+/// characters count double (pi's Text component wraps the same way). Each
+/// returned row is the styled title spans without the leading padding column.
+fn wrap_call_title(parts: &[CallPart], bg: Style, width: usize) -> Vec<Vec<Span<'static>>> {
+    let style_for = |part: &CallPart| {
+        let mut style = bg.fg(part.fg.color());
+        if part.bold {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        style
+    };
+    let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let mut row_widths = vec![0usize];
+    for part in parts {
+        let style = style_for(part);
+        let mut rest = part.text.as_str();
+        while !rest.is_empty() {
+            let used = *row_widths.last().unwrap();
+            if used > 0 && used >= width {
+                rows.push(Vec::new());
+                row_widths.push(0);
+                continue;
+            }
+            let mut chunk = String::new();
+            let mut chunk_w = 0usize;
+            let mut consumed = 0usize;
+            let mut word_break = false;
+            for (i, c) in rest.char_indices() {
+                let cw = c.width().unwrap_or(0);
+                consumed = i + c.len_utf8();
+                if !chunk.is_empty() && chunk_w + cw > width {
+                    // Prefer a word boundary: cut at the last space so words
+                    // stay whole; overlong words fall back to a character
+                    // break (no text is dropped).
+                    if let Some(pos) = chunk.rfind(' ') {
+                        consumed = pos + 1;
+                        chunk.truncate(pos);
+                        chunk_w = display_width(&chunk);
+                        word_break = true;
+                    }
+                    break;
+                }
+                chunk.push(c);
+                chunk_w += cw;
+            }
+            if !chunk.is_empty() {
+                let row = rows.last_mut().unwrap();
+                if let Some(prev) = row.last_mut()
+                    && prev.style == style
+                {
+                    prev.content.to_mut().push_str(&chunk);
+                } else {
+                    row.push(Span::styled(chunk, style));
+                }
+                *row_widths.last_mut().unwrap() += chunk_w;
+            }
+            rest = &rest[consumed..];
+            if word_break {
+                rows.push(Vec::new());
+                row_widths.push(0);
+            }
+        }
     }
     rows
 }
 
-/// The plain text lines a display item contributes to the transcript.
-fn item_lines(item: &DisplayItem) -> Vec<String> {
-    match item {
-        DisplayItem::Turn { turn } => vec![format!("── turn {turn} ──")],
-        DisplayItem::Reasoning(text) => text
-            .lines()
-            .map(|line| format!("> {line}"))
+/// Pad styled spans to exactly `width` display cells, appending trailing
+/// `bg`-styled spaces so a background box reads as one continuous band (pi's
+/// Box paints the whole padded rect). Padding is measured with
+/// [`display_width`] so double-width (CJK) content stays exact; content
+/// already at or past `width` passes through untouched.
+fn pad_line_to_width(spans: Vec<Span<'static>>, width: usize, bg: Style) -> Line<'static> {
+    let used: usize = spans.iter().map(|s| display_width(&s.content)).sum();
+    let pad = width.saturating_sub(used);
+    let mut spans = spans;
+    if pad > 0 {
+        spans.push(Span::styled(" ".repeat(pad), bg));
+    }
+    Line::from(spans)
+}
+
+/// Pretty-print a tool arguments JSON string with two-space indentation;
+/// falls back to the raw string when it is not valid JSON (or is empty).
+fn pretty_args(raw: &str) -> Vec<String> {
+    if raw.trim().is_empty() {
+        return Vec::new();
+    }
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(value) => serde_json::to_string_pretty(&value)
+            .map(|s| s.lines().map(str::to_string).collect())
+            .unwrap_or_else(|_| vec![raw.to_string()]),
+        Err(_) => vec![raw.to_string()],
+    }
+}
+
+/// Wrap one already-single-line string via `wrap_to_width`, re-joining to a
+/// single string (used by the tool block's `  `-prefixed rows).
+fn wrap_to_width_join(line: &str, width: usize) -> String {
+    wrap_to_width(line, width).join(" ")
+}
+
+/// Restyle a markdown line to italic gray (thinking text).
+fn italicize(line: Line<'static>, color: Color) -> Line<'static> {
+    Line::from(
+        line.spans
+            .into_iter()
+            .map(|s| Span::styled(s.content, s.style.fg(color).add_modifier(Modifier::ITALIC)))
             .collect::<Vec<_>>(),
-        DisplayItem::Text(text) => text.lines().map(str::to_string).collect(),
-        DisplayItem::ToolStart { name, arguments } => {
-            vec![format!("  ▶ {name} {arguments}")]
-        }
-        DisplayItem::ToolResult { name, ok, result } => {
-            let icon = if *ok { "✔" } else { "✖" };
-            vec![format!("  {icon} {name}: {result}")]
-        }
-        DisplayItem::Stop(StopReason::Completed) => vec!["✓ done".to_string()],
-        DisplayItem::Stop(StopReason::MaxIterations) => {
-            vec!["⚠ stopped: max iterations reached".to_string()]
-        }
-        DisplayItem::Usage(usage) => vec![usage_summary(usage)],
-    }
-}
-
-/// The style a whole entry is rendered with.
-fn entry_style(entry: &Entry) -> Style {
-    match entry {
-        Entry::Agent(item) => item_style(item),
-        Entry::Notice(_) => Style::default()
-            .fg(Color::Gray)
-            .add_modifier(Modifier::BOLD),
-        Entry::Error(_) => Style::default().fg(Color::Red),
-    }
-}
-
-/// The style a display item is rendered with.
-fn item_style(item: &DisplayItem) -> Style {
-    match item {
-        DisplayItem::Turn { .. } => Style::default().fg(Color::Gray),
-        DisplayItem::Reasoning(_) => Style::default().fg(Color::Yellow),
-        DisplayItem::Text(_) => Style::default(),
-        DisplayItem::ToolStart { .. } => Style::default().fg(Color::Cyan),
-        DisplayItem::ToolResult { ok: true, .. } => Style::default().fg(Color::Green),
-        DisplayItem::ToolResult { ok: false, .. } => Style::default().fg(Color::Red),
-        DisplayItem::Stop(_) => Style::default().fg(Color::Green),
-        DisplayItem::Usage(_) => Style::default().fg(Color::Magenta),
-    }
+    )
 }
 
 #[cfg(test)]
@@ -1162,6 +1688,42 @@ mod tests {
             .collect()
     }
 
+    /// The style of one buffer cell.
+    fn cell_style(buffer: &Buffer, x: u16, y: u16) -> Style {
+        buffer.cell((x, y)).unwrap().style()
+    }
+
+    /// Whether the whole row is filled with `bg` (`None` = some cell differs).
+    fn row_bg_equals(buffer: &Buffer, y: u16, bg: Color) -> bool {
+        cell_at_row(buffer, y).iter().all(|s| s.bg == Some(bg))
+    }
+
+    /// The styles of every cell in one row, skipping trailing fully-reset
+    /// cells (the buffer's default blank tail).
+    fn cell_at_row(buffer: &Buffer, y: u16) -> Vec<Style> {
+        (0..buffer.area.width)
+            .map(|x| cell_style(buffer, x, y))
+            .collect()
+    }
+
+    /// Whether the row has `bg` at column `x` (used for scrollbar thumb
+    /// cells, which sit in the rightmost column).
+    fn cell_bg_at(buffer: &Buffer, x: u16, y: u16) -> Option<Color> {
+        buffer.cell((x, y)).and_then(|c| c.style().bg)
+    }
+
+    /// The y of the first row containing `needle`.
+    fn row_containing(buffer: &Buffer, needle: &str) -> Option<u16> {
+        (0..buffer.area.height).find(|&y| line_at(buffer, y).contains(needle))
+    }
+
+    /// Whether any row has a `selectedBg` thumb cell in the rightmost column.
+    fn has_thumb(buffer: &Buffer) -> bool {
+        let x = buffer.area.width.saturating_sub(1);
+        (0..buffer.area.height)
+            .any(|y| cell_bg_at(buffer, x, y) == Some(BgToken::SelectedBg.color()))
+    }
+
     /// Whether any buffer row contains `needle`.
     fn buffer_contains(buffer: &Buffer, needle: &str) -> bool {
         (0..buffer.area.height).any(|y| line_at(buffer, y).contains(needle))
@@ -1184,21 +1746,19 @@ mod tests {
 
     /// A test app with a couple of entries already in the transcript.
     fn seeded_app() -> App {
-        App::new("~/proj", "sess-1", "model-x", vec![])
+        App::new("~/proj", "sess-1", "model-x", "9.9.9", vec![])
     }
 
     /// Render the transcript pane rows (content only, border excluded) of a
     /// seeded app at a fixed size, returning the visible content rows.
     fn transcript_window(app: &mut App, h: u16) -> Vec<String> {
         let buffer = render_buffer(app, 60, h);
-        // The transcript pane is the top region: total height minus input box
-        // and status line. Rows 0 and (pane_h - 1) are the pane's borders.
-        let pane_h = h - INPUT_HEIGHT - STATUS_HEIGHT;
-        let mut rows = Vec::new();
-        for y in 1..(pane_h - 1) {
-            rows.push(line_at(&buffer, y));
-        }
-        rows
+        // The transcript pane is the top region: total height minus the input
+        // box and footer. The pane is borderless now (pi-style full-bleed),
+        // so rows map 1:1 from the top. The status indicator row exists only
+        // while running (0 height when idle in these test apps).
+        let pane_h = h - INPUT_HEIGHT - FOOTER_HEIGHT;
+        (0..pane_h).map(|y| line_at(&buffer, y)).collect()
     }
 
     // --- tests -------------------------------------------------------------
@@ -1232,8 +1792,9 @@ mod tests {
             .unwrap();
 
         let buffer = render_buffer(&mut app, 60, 12);
-        // Consecutive reasoning deltas merge onto one prefixed line.
-        assert!(buffer_contains(&buffer, "> The user said"));
+        // Consecutive reasoning deltas merge into one italic thinking block
+        // (no `> ` glyph prefix any more).
+        assert!(buffer_contains(&buffer, "The user said"));
     }
 
     #[test]
@@ -1259,11 +1820,11 @@ mod tests {
     }
 
     #[test]
-    fn tool_and_stop_markers_render_distinct() {
+    fn tool_start_pairs_with_result_into_one_block() {
         let mut app = seeded_app();
         app.render(&DisplayItem::ToolStart {
             name: "read".to_string(),
-            arguments: "a.txt".to_string(),
+            arguments: r#"{"path": "a.txt"}"#.to_string(),
         })
         .unwrap();
         app.render(&DisplayItem::ToolResult {
@@ -1272,20 +1833,77 @@ mod tests {
             result: "ok".to_string(),
         })
         .unwrap();
+
+        let buffer = render_buffer(&mut app, 60, 14);
+        // Compact per-tool title + gray output, all inside one state-colored
+        // block; the old `▶`/`✔` glyph lines are gone.
+        assert!(buffer_contains(&buffer, "read a.txt"));
+        assert!(buffer_contains(&buffer, "ok"));
+        assert!(!buffer_contains(&buffer, "▶"));
+        assert!(!buffer_contains(&buffer, "✔"));
+    }
+
+    #[test]
+    fn failed_tool_result_sets_error_block() {
+        let mut app = seeded_app();
+        app.render(&DisplayItem::ToolStart {
+            name: "write".to_string(),
+            arguments: "x".to_string(),
+        })
+        .unwrap();
         app.render(&DisplayItem::ToolResult {
             name: "write".to_string(),
             ok: false,
             result: "denied".to_string(),
         })
         .unwrap();
+
+        // The failed result lands in the same block (no separate `✖` line).
+        let buffer = render_buffer(&mut app, 60, 14);
+        assert!(buffer_contains(&buffer, "denied"));
+        assert!(!buffer_contains(&buffer, "✖"));
+        assert!(!buffer_contains(&buffer, "⚠ stopped"));
+    }
+
+    #[test]
+    fn completed_stop_renders_nothing_and_turn_marker_is_ignored() {
+        let mut app = seeded_app();
+        app.render(&DisplayItem::Turn { turn: 1 }).unwrap();
         app.render(&DisplayItem::Stop(StopReason::Completed))
+            .unwrap();
+        app.render(&DisplayItem::Text("answer\n".to_string()))
             .unwrap();
 
         let buffer = render_buffer(&mut app, 60, 14);
-        assert!(buffer_contains(&buffer, "▶ read a.txt"));
-        assert!(buffer_contains(&buffer, "✔ read: ok"));
-        assert!(buffer_contains(&buffer, "✖ write: denied"));
-        assert!(buffer_contains(&buffer, "✓ done"));
+        assert!(buffer_contains(&buffer, "answer"));
+        assert!(!buffer_contains(&buffer, "── turn"));
+        assert!(!buffer_contains(&buffer, "✓ done"));
+    }
+
+    #[test]
+    fn cancelled_stop_renders_nothing_like_completed() {
+        // Esc ends the turn silently: Stop(Cancelled) draws no marker and no
+        // red error line — the partial transcript is the feedback (ticket 07).
+        let mut app = seeded_app();
+        app.render(&DisplayItem::Text("partial answer\n".to_string()))
+            .unwrap();
+        app.render(&DisplayItem::Stop(StopReason::Cancelled))
+            .unwrap();
+        let buffer = render_buffer(&mut app, 60, 12);
+        assert!(buffer_contains(&buffer, "partial answer"));
+        assert!(!buffer_contains(&buffer, "⚠"));
+        assert!(!buffer_contains(&buffer, "cancelled"));
+        assert!(!buffer_contains(&buffer, "stopped"));
+    }
+
+    #[test]
+    fn abnormal_stop_renders_red_error_text() {
+        let mut app = seeded_app();
+        app.render(&DisplayItem::Stop(StopReason::MaxIterations))
+            .unwrap();
+        let buffer = render_buffer(&mut app, 60, 12);
+        assert!(buffer_contains(&buffer, "stopped: max iterations reached"));
+        assert!(!buffer_contains(&buffer, "⚠ stopped"));
     }
 
     #[test]
@@ -1298,9 +1916,11 @@ mod tests {
             Some(Effect::SubmitPrompt("explain tests".to_string()))
         );
         assert!(app.input_text().is_empty());
-        // The prompt is echoed into the transcript.
+        // The prompt is echoed into the transcript as a boxed user block
+        // (no `> ` notice line).
         let buffer = render_buffer(&mut app, 60, 12);
-        assert!(buffer_contains(&buffer, "> explain tests"));
+        assert!(buffer_contains(&buffer, "explain tests"));
+        assert!(!buffer_contains(&buffer, "> explain tests"));
     }
 
     #[test]
@@ -1379,11 +1999,12 @@ mod tests {
 
         let small = render_buffer(&mut app, 60, 10);
         assert!(buffer_contains(&small, "resize me"));
-        assert!(buffer_contains(&small, "ready"));
+        // The footer is reserved (ticket 03); no `ready` word any more.
+        assert!(!buffer_contains(&small, "ready"));
 
         let wide = render_buffer(&mut app, 100, 16);
         assert!(buffer_contains(&wide, "resize me"));
-        assert!(buffer_contains(&wide, "ready"));
+        assert!(!buffer_contains(&wide, "ready"));
     }
 
     #[test]
@@ -1472,6 +2093,7 @@ mod tests {
             "~/proj",
             "sess-1",
             "model-x",
+            "9.9.9",
             vec![skill("grill", "stress-test a plan")],
         );
         type_text(&mut app, "/skills");
@@ -1532,6 +2154,7 @@ mod tests {
             "~/proj",
             "sess-1",
             "model-x",
+            "9.9.9",
             vec![skill("grill", "stress-test a plan")],
         );
         type_text(&mut app, "/grill my plan");
@@ -1944,6 +2567,7 @@ mod tests {
             "~/proj",
             "sess-1",
             "model-x",
+            "9.9.9",
             vec![skill("grill", "stress-test a plan")],
         );
         type_text(&mut app, "/gr");
@@ -1987,5 +2611,643 @@ mod tests {
         let mut app = seeded_app();
         type_text(&mut app, "/sav");
         assert_eq!(app.handle_key(ctrl_key('c')), Some(Effect::Quit));
+    }
+
+    // --- pi display alignment features (ticket 02) -------------------------
+
+    #[test]
+    fn header_renders_at_startup_and_new_clears_it() {
+        let mut app = seeded_app();
+        let buffer = render_buffer(&mut app, 60, 12);
+        assert!(buffer_contains(&buffer, "slimcode"));
+        assert!(buffer_contains(&buffer, "v9.9.9"));
+        assert!(buffer_contains(&buffer, "/help for commands"));
+        // Brand line: bold accent `slimcode`.
+        let y = row_containing(&buffer, "slimcode").unwrap();
+        assert_eq!(cell_style(&buffer, 0, y).fg, Some(Token::Accent.color()));
+        assert!(
+            cell_style(&buffer, 0, y)
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+
+        // `/new` clears the header together with the transcript.
+        app.clear_for_new_session("sess-2");
+        let buffer = render_buffer(&mut app, 60, 12);
+        assert!(!buffer_contains(&buffer, "slimcode"));
+        assert!(buffer_contains(&buffer, "new session: sess-2"));
+    }
+
+    #[test]
+    fn user_prompt_renders_as_boxed_message_with_bg() {
+        let mut app = seeded_app();
+        type_text(&mut app, "explain tests");
+        app.handle_key(key(KeyCode::Enter));
+        let buffer = render_buffer(&mut app, 60, 14);
+        assert!(buffer_contains(&buffer, "explain tests"));
+        // The prompt rows are full-width `userMessageBg`; no `> ` notice.
+        let y = row_containing(&buffer, "explain tests").unwrap();
+        assert!(row_bg_equals(&buffer, y, BgToken::UserMessageBg.color()));
+        // Padding rows above and below are also bg-filled.
+        assert_eq!(
+            cell_bg_at(&buffer, 0, y.saturating_sub(1)),
+            Some(BgToken::UserMessageBg.color())
+        );
+        assert_eq!(
+            cell_bg_at(&buffer, 0, y.saturating_add(1)),
+            Some(BgToken::UserMessageBg.color())
+        );
+        assert!(!buffer_contains(&buffer, "> explain"));
+    }
+
+    #[test]
+    fn thinking_renders_italic_gray() {
+        let mut app = seeded_app();
+        app.render(&DisplayItem::Reasoning("let me think".to_string()))
+            .unwrap();
+        let buffer = render_buffer(&mut app, 60, 12);
+        assert!(buffer_contains(&buffer, "let me think"));
+        let y = row_containing(&buffer, "let me think").unwrap();
+        let x = line_at(&buffer, y).find("let me think").unwrap() as u16;
+        let style = cell_style(&buffer, x, y);
+        assert_eq!(style.fg, Some(Token::ThinkingText.color()));
+        assert!(style.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn tool_block_pending_then_success_backgrounds() {
+        let mut app = seeded_app();
+        app.render(&DisplayItem::ToolStart {
+            name: "read".to_string(),
+            arguments: r#"{"path": "a.txt"}"#.to_string(),
+        })
+        .unwrap();
+        let buffer = render_buffer(&mut app, 60, 14);
+        // Pending: the title row sits on `toolPendingBg`.
+        let y = row_containing(&buffer, "read a.txt").unwrap();
+        assert_eq!(
+            cell_bg_at(&buffer, 1, y),
+            Some(BgToken::ToolPendingBg.color())
+        );
+
+        app.render(&DisplayItem::ToolResult {
+            name: "read".to_string(),
+            ok: true,
+            result: "ok".to_string(),
+        })
+        .unwrap();
+        let buffer = render_buffer(&mut app, 60, 14);
+        let y = row_containing(&buffer, "read a.txt").unwrap();
+        assert_eq!(
+            cell_bg_at(&buffer, 1, y),
+            Some(BgToken::ToolSuccessBg.color())
+        );
+    }
+
+    /// Render one completed tool block (15-line output so the expand hint row
+    /// exists) and return its frame buffer at 60x18.
+    fn completed_tool_block_buffer(ok: bool) -> Buffer {
+        let mut app = seeded_app();
+        app.render(&DisplayItem::ToolStart {
+            name: "read".to_string(),
+            arguments: r#"{"path": "a.txt"}"#.to_string(),
+        })
+        .unwrap();
+        let output: String = (0..15).map(|i| format!("out line {i}\n")).collect();
+        app.render(&DisplayItem::ToolResult {
+            name: "read".to_string(),
+            ok,
+            result: output,
+        })
+        .unwrap();
+        render_buffer(&mut app, 60, 30)
+    }
+
+    /// Every row kind of a tool block — title, an output row, and the expand
+    /// hint row — must carry the state background through the pane's rightmost
+    /// column (ticket 05: pi Box paints the whole padded rect, not just the
+    /// cells under the glyphs).
+    #[test]
+    fn tool_block_background_reaches_rightmost_column_for_every_row_kind() {
+        let w = 60u16;
+        let rightmost = w - 1;
+
+        // Pending: the block is open and only the title row exists yet.
+        let mut app = seeded_app();
+        app.render(&DisplayItem::ToolStart {
+            name: "read".to_string(),
+            arguments: r#"{"path": "a.txt"}"#.to_string(),
+        })
+        .unwrap();
+        let buffer = render_buffer(&mut app, w, 18);
+        let y = row_containing(&buffer, "read").unwrap();
+        assert_eq!(
+            cell_bg_at(&buffer, rightmost, y),
+            Some(BgToken::ToolPendingBg.color()),
+            "pending title row must reach the rightmost column"
+        );
+        assert!(
+            row_bg_equals(&buffer, y, BgToken::ToolPendingBg.color()),
+            "pending title row is a solid full-width band"
+        );
+
+        // Success: title, output, and hint rows all span the full width.
+        let buffer = completed_tool_block_buffer(true);
+        let expected = BgToken::ToolSuccessBg.color();
+        let y = row_containing(&buffer, "read").unwrap();
+        assert_eq!(
+            cell_bg_at(&buffer, rightmost, y),
+            Some(expected),
+            "success title row reaches the rightmost column"
+        );
+        let y = row_containing(&buffer, "out line 0").unwrap();
+        assert_eq!(
+            cell_bg_at(&buffer, rightmost, y),
+            Some(expected),
+            "success output row reaches the rightmost column"
+        );
+        assert!(
+            row_bg_equals(&buffer, y, expected),
+            "success output row is a solid full-width band"
+        );
+        let y = row_containing(&buffer, "more lines").unwrap();
+        assert_eq!(
+            cell_bg_at(&buffer, rightmost, y),
+            Some(expected),
+            "success expand-hint row reaches the rightmost column"
+        );
+
+        // Error: same three row kinds on `toolErrorBg`.
+        let buffer = completed_tool_block_buffer(false);
+        let expected = BgToken::ToolErrorBg.color();
+        let y = row_containing(&buffer, "read").unwrap();
+        assert_eq!(
+            cell_bg_at(&buffer, rightmost, y),
+            Some(expected),
+            "error title row reaches the rightmost column"
+        );
+        let y = row_containing(&buffer, "out line 0").unwrap();
+        assert_eq!(
+            cell_bg_at(&buffer, rightmost, y),
+            Some(expected),
+            "error output row reaches the rightmost column"
+        );
+        let y = row_containing(&buffer, "more lines").unwrap();
+        assert_eq!(
+            cell_bg_at(&buffer, rightmost, y),
+            Some(expected),
+            "error expand-hint row reaches the rightmost column"
+        );
+    }
+
+    /// A tool output row ending in wide CJK glyphs still pads exactly to the
+    /// pane width: padding is measured in display columns, never in chars.
+    #[test]
+    fn tool_block_padding_is_display_width_exact_for_wide_chars() {
+        let mut app = seeded_app();
+        app.render(&DisplayItem::ToolStart {
+            name: "read".to_string(),
+            arguments: r#"{"path": "a.txt"}"#.to_string(),
+        })
+        .unwrap();
+        // 30 CJK chars = 60 display columns — wider than the 58-col content
+        // area, so wrapping plus width-exact padding must still end at column
+        // 59 with the state background (nothing truncated, nothing short).
+        let output: String = (0..12).map(|i| format!("\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}line {i}\n")).collect();
+        app.render(&DisplayItem::ToolResult {
+            name: "read".to_string(),
+            ok: true,
+            result: output,
+        })
+        .unwrap();
+        let buffer = render_buffer(&mut app, 60, 18);
+        let bg = BgToken::ToolSuccessBg.color();
+        // Every row between the first output row and the bottom spacer must be
+        // full-width (a short visual band would end before the last column).
+        let first = row_containing(&buffer, "好").unwrap();
+        let hint_y = row_containing(&buffer, "more lines").unwrap();
+        for y in first..=hint_y {
+            assert_eq!(
+                cell_bg_at(&buffer, 59, y),
+                Some(bg),
+                "row {y} must carry the state bg to the rightmost column"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_block_error_background_and_compact_title() {
+        let mut app = seeded_app();
+        app.render(&DisplayItem::ToolStart {
+            name: "edit".to_string(),
+            arguments: r#"{"path":"a.txt","old":"x"}"#.to_string(),
+        })
+        .unwrap();
+        app.render(&DisplayItem::ToolResult {
+            name: "edit".to_string(),
+            ok: false,
+            result: "no match".to_string(),
+        })
+        .unwrap();
+        let buffer = render_buffer(&mut app, 60, 16);
+        let y = row_containing(&buffer, "edit a.txt").unwrap();
+        assert_eq!(
+            cell_bg_at(&buffer, 1, y),
+            Some(BgToken::ToolErrorBg.color())
+        );
+        // Built-in tools show a compact `edit <path>` title — no raw JSON args
+        // section (ticket 06).
+        assert!(!buffer_contains(&buffer, "\"path\":"));
+        assert!(buffer_contains(&buffer, "no match"));
+    }
+
+    #[test]
+    fn builtin_tool_blocks_never_show_json_args_section() {
+        // read with a 1-indexed offset/limit range: the compact title carries
+        // the range; the raw JSON never appears.
+        let mut app = seeded_app();
+        app.render(&DisplayItem::ToolStart {
+            name: "read".to_string(),
+            arguments: r#"{"path":"a.txt","offset":2,"limit":3}"#.to_string(),
+        })
+        .unwrap();
+        app.render(&DisplayItem::ToolResult {
+            name: "read".to_string(),
+            ok: true,
+            result: "line2\nline3\nline4".to_string(),
+        })
+        .unwrap();
+        let buffer = render_buffer(&mut app, 60, 16);
+        assert!(buffer_contains(&buffer, "read a.txt:2-4"));
+        assert!(!buffer_contains(&buffer, "\"path\":"));
+        assert!(!buffer_contains(&buffer, "\"offset\":"));
+
+        // bash renders the whole call line as `$ command` (bold), and grep
+        // its `/pattern/ in <scope>` shape — again without a JSON dump.
+        let mut app = seeded_app();
+        app.render(&DisplayItem::ToolStart {
+            name: "bash".to_string(),
+            arguments: r#"{"command":"ls -la"}"#.to_string(),
+        })
+        .unwrap();
+        app.render(&DisplayItem::ToolResult {
+            name: "bash".to_string(),
+            ok: true,
+            result: "total 8".to_string(),
+        })
+        .unwrap();
+        app.render(&DisplayItem::ToolStart {
+            name: "grep".to_string(),
+            arguments: r#"{"pattern":"TODO","path":"src"}"#.to_string(),
+        })
+        .unwrap();
+        app.render(&DisplayItem::ToolResult {
+            name: "grep".to_string(),
+            ok: true,
+            result: "src/main.rs:1: TODO".to_string(),
+        })
+        .unwrap();
+        let buffer = render_buffer(&mut app, 60, 22);
+        assert!(buffer_contains(&buffer, "$ ls -la"));
+        assert!(buffer_contains(&buffer, "grep /TODO/ in src"));
+        assert!(!buffer_contains(&buffer, "\"command\":"));
+        assert!(!buffer_contains(&buffer, "\"pattern\":"));
+    }
+
+    #[test]
+    fn unknown_tool_block_keeps_pretty_json_args_fallback() {
+        let mut app = seeded_app();
+        app.render(&DisplayItem::ToolStart {
+            name: "fetch_web".to_string(),
+            arguments: r#"{"url":"https://x","depth":2}"#.to_string(),
+        })
+        .unwrap();
+        app.render(&DisplayItem::ToolResult {
+            name: "fetch_web".to_string(),
+            ok: true,
+            result: "<html>".to_string(),
+        })
+        .unwrap();
+        let buffer = render_buffer(&mut app, 60, 16);
+        // Unknown tools have no compact shape: pi's fallback (bold name + the
+        // args as pretty JSON) is what the user sees.
+        assert!(buffer_contains(&buffer, "fetch_web"));
+        assert!(buffer_contains(&buffer, "\"url\": \"https://x\""));
+        assert!(buffer_contains(&buffer, "<html>"));
+    }
+
+    #[test]
+    fn tool_call_title_wraps_at_pane_width_without_losing_text() {
+        let mut app = seeded_app();
+        let long_command = format!(
+            "echo {}",
+            (0..40)
+                .map(|i| format!("word{i:02}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        app.render(&DisplayItem::ToolStart {
+            name: "bash".to_string(),
+            arguments: serde_json::json!({"command": long_command}).to_string(),
+        })
+        .unwrap();
+        app.render(&DisplayItem::ToolResult {
+            name: "bash".to_string(),
+            ok: true,
+            result: "done".to_string(),
+        })
+        .unwrap();
+        let buffer = render_buffer(&mut app, 60, 16);
+        // The wrapped title keeps every word (the last one only appears on a
+        // wrapped row) and the block stays a padded full-width band.
+        assert!(buffer_contains(&buffer, "$ echo"));
+        assert!(buffer_contains(&buffer, "word39"));
+        let y = row_containing(&buffer, "done").unwrap();
+        assert_eq!(
+            cell_bg_at(&buffer, 59, y),
+            Some(BgToken::ToolSuccessBg.color())
+        );
+    }
+
+    #[test]
+    fn tool_output_collapses_to_ten_lines_and_ctrl_o_expands() {
+        let mut app = seeded_app();
+        app.render(&DisplayItem::ToolStart {
+            name: "grep".to_string(),
+            arguments: "{\"pattern\":\"x\"}".to_string(),
+        })
+        .unwrap();
+        let output: String = (0..15).map(|i| format!("line{i}\n")).collect();
+        app.render(&DisplayItem::ToolResult {
+            name: "grep".to_string(),
+            ok: true,
+            result: output.clone(),
+        })
+        .unwrap();
+
+        let buffer = render_buffer(&mut app, 60, 30);
+        let collapsed = line_at(&buffer, row_containing(&buffer, "line0").unwrap());
+        // Collapsed: first 10 lines + the expand hint; `line10` hidden.
+        assert!(buffer_contains(&buffer, "line0"));
+        assert!(buffer_contains(&buffer, "line9"));
+        assert!(!buffer_contains(&buffer, "line10"));
+        assert!(buffer_contains(&buffer, "5 more lines, Ctrl+O to expand"));
+        let _ = collapsed;
+
+        // Ctrl+O expands globally: all 15 lines, hint gone.
+        app.handle_key(ctrl_key('o'));
+        let buffer = render_buffer(&mut app, 60, 30);
+        assert!(buffer_contains(&buffer, "line10"));
+        assert!(buffer_contains(&buffer, "line14"));
+        assert!(!buffer_contains(&buffer, "more lines"));
+
+        // Ctrl+O again collapses.
+        app.handle_key(ctrl_key('o'));
+        let buffer = render_buffer(&mut app, 60, 30);
+        assert!(!buffer_contains(&buffer, "line10"));
+        assert!(buffer_contains(&buffer, "5 more lines, Ctrl+O to expand"));
+        assert!(!app.tool_output_expanded);
+        assert!(!app.status.running); // untouched by Ctrl+O
+    }
+
+    #[test]
+    fn tool_output_under_ten_lines_has_no_hint() {
+        let mut app = seeded_app();
+        app.render(&DisplayItem::ToolStart {
+            name: "ls".to_string(),
+            arguments: "{\"path\":\".\"}".to_string(),
+        })
+        .unwrap();
+        app.render(&DisplayItem::ToolResult {
+            name: "ls".to_string(),
+            ok: true,
+            result: "a\nb".to_string(),
+        })
+        .unwrap();
+        let buffer = render_buffer(&mut app, 60, 14);
+        assert!(buffer_contains(&buffer, "ls ."));
+        assert!(buffer_contains(&buffer, "a"));
+        assert!(buffer_contains(&buffer, "b"));
+        assert!(!buffer_contains(&buffer, "more lines"));
+    }
+
+    #[test]
+    fn scrollbar_appears_on_scroll_and_fades_on_ticks() {
+        let mut app = seeded_app();
+        for i in 0..12 {
+            app.render(&DisplayItem::Text(format!("line {i}\n")))
+                .unwrap();
+        }
+        // At the bottom (follow), no thumb.
+        let buffer = render_buffer(&mut app, 60, 8);
+        assert!(!has_thumb(&buffer));
+
+        app.handle_key(key(KeyCode::PageUp));
+        let buffer = render_buffer(&mut app, 60, 8);
+        assert!(has_thumb(&buffer), "thumb should appear after scrolling");
+        let thumb_fg = cell_bg_at(&buffer, 59, 0).is_some();
+        let _ = thumb_fg;
+
+        // Auto fade: after SCROLLBAR_FADE_TICKS frames the thumb is gone.
+        for _ in 0..SCROLLBAR_FADE_TICKS {
+            app.tick();
+        }
+        let buffer = render_buffer(&mut app, 60, 8);
+        assert!(!has_thumb(&buffer), "thumb should fade after ticks");
+    }
+
+    #[test]
+    fn editor_border_color_reflects_running_state() {
+        let mut app = seeded_app();
+        // Input top-border row: y = h - FOOTER_HEIGHT - INPUT_HEIGHT.
+        let h: u16 = 12;
+        let border_y = h - FOOTER_HEIGHT - INPUT_HEIGHT;
+        let buffer = render_buffer(&mut app, 60, h);
+        assert_eq!(
+            cell_style(&buffer, 5, border_y).fg,
+            Some(Token::Border.color())
+        );
+
+        app.set_running(true);
+        let buffer = render_buffer(&mut app, 60, h);
+        assert_eq!(
+            cell_style(&buffer, 5, border_y).fg,
+            Some(Token::BorderAccent.color())
+        );
+    }
+
+    #[test]
+    fn completion_popup_uses_select_list_tokens() {
+        let mut app = seeded_app();
+        type_text(&mut app, "/save");
+        let buffer = render_buffer(&mut app, 80, 16);
+        // Selected row: `→ ` cursor + accent name (no bold, no bg
+        // inversion — pi select-list `selectedText`).
+        assert!(buffer_contains(&buffer, "→ /save"));
+        let y = row_containing(&buffer, "→ /save").unwrap();
+        let x = line_at(&buffer, y).find('/').unwrap() as u16;
+        assert_eq!(cell_style(&buffer, x, y).fg, Some(Token::Accent.color()));
+        // Description is `muted` (pi select-list `description` token).
+        let desc_y = row_containing(&buffer, "save the current session").unwrap();
+        let desc_x = line_at(&buffer, desc_y)
+            .find("save the current session")
+            .unwrap() as u16;
+        assert_eq!(
+            cell_style(&buffer, desc_x, desc_y).fg,
+            Some(Token::Muted.color())
+        );
+        assert!(buffer_contains(&buffer, "completion"));
+    }
+
+    #[test]
+    fn completion_popup_shows_scroll_info_when_overflowing() {
+        let mut app = seeded_app();
+        type_text(&mut app, "/");
+        let buffer = render_buffer(&mut app, 80, 20);
+        // Many candidates: the muted `(i/n)` scroll info renders.
+        assert!(buffer_contains(&buffer, "(1/"));
+        let y = row_containing(&buffer, "(1/").unwrap();
+        assert_eq!(cell_style(&buffer, 2, y).fg, Some(Token::Muted.color()));
+    }
+
+    #[test]
+    fn notice_renders_dim() {
+        let mut app = seeded_app();
+        app.push_notice("hello notice");
+        let buffer = render_buffer(&mut app, 60, 12);
+        let y = row_containing(&buffer, "hello notice").unwrap();
+        assert_eq!(cell_style(&buffer, 0, y).fg, Some(Token::Dim.color()));
+    }
+
+    #[test]
+    fn error_renders_red() {
+        let mut app = seeded_app();
+        app.push_error("boom");
+        let buffer = render_buffer(&mut app, 60, 12);
+        let y = row_containing(&buffer, "boom").unwrap();
+        assert_eq!(cell_style(&buffer, 0, y).fg, Some(Token::Error.color()));
+    }
+
+    // --- footer + status indicator (ticket 03) -----------------------------
+
+    #[test]
+    fn footer_renders_two_dim_lines() {
+        let mut app = seeded_app();
+        app.set_branch(Some("main".to_string()));
+        app.set_usage(crate::footer::FooterUsage {
+            input: 1500,
+            output: 500,
+            cache_read: 0,
+            cache_write: 0,
+        });
+        let h: u16 = 12;
+        let buffer = render_buffer(&mut app, 60, h);
+        // Footer occupies the bottom two rows.
+        let line1 = line_at(&buffer, h - 2);
+        assert!(line1.contains("~/proj (main) • sess-1"), "{line1:?}");
+        assert_eq!(cell_style(&buffer, 0, h - 2).fg, Some(Token::Dim.color()));
+        let line2 = line_at(&buffer, h - 1);
+        assert!(line2.contains("↑1.5k ↓500"), "{line2:?}");
+        assert!(line2.ends_with("model-x"), "{line2:?}");
+        assert_eq!(cell_style(&buffer, 0, h - 1).fg, Some(Token::Dim.color()));
+    }
+
+    #[test]
+    fn footer_omits_branch_and_usage_when_absent() {
+        let mut app = seeded_app();
+        let h: u16 = 12;
+        let buffer = render_buffer(&mut app, 60, h);
+        let line1 = line_at(&buffer, h - 2);
+        assert!(line1.contains("~/proj • sess-1"), "{line1:?}");
+        assert!(!line1.contains("("), "branch should be omitted");
+        // No usage yet: stats line has no stats, just the model right-aligned.
+        let line2 = line_at(&buffer, h - 1);
+        assert!(line2.trim_end().ends_with("model-x"), "{line2:?}");
+    }
+
+    #[test]
+    fn status_indicator_only_while_running_and_animates() {
+        let mut app = seeded_app();
+        let h: u16 = 12;
+        // Idle: no status row (the row above the input is transcript space).
+        let idle = render_buffer(&mut app, 60, h);
+        let status_y = h - FOOTER_HEIGHT - INPUT_HEIGHT - STATUS_HEIGHT;
+        assert!(!line_at(&idle, status_y).contains("Working..."));
+
+        app.set_running(true);
+        let buffer = render_buffer(&mut app, 60, h);
+        let line = line_at(&buffer, status_y);
+        assert!(line.contains("Working..."), "{line:?}");
+        // Spinner cell is accent, message cell is muted.
+        assert_eq!(
+            cell_style(&buffer, 0, status_y).fg,
+            Some(Token::Accent.color())
+        );
+        assert_eq!(
+            cell_style(&buffer, 2, status_y).fg,
+            Some(Token::Muted.color())
+        );
+
+        // tick() advances the braille frame (each of the 10 frames differs).
+        let frame1 = buffer.cell((0, status_y)).unwrap().symbol().to_string();
+        app.tick();
+        let buffer2 = render_buffer(&mut app, 60, h);
+        let frame2 = buffer2.cell((0, status_y)).unwrap().symbol().to_string();
+        assert_ne!(frame1, frame2);
+
+        // Idle again: row hidden, frame restarts.
+        app.set_running(false);
+        let idle2 = render_buffer(&mut app, 60, h);
+        assert!(!line_at(&idle2, status_y).contains("Working..."));
+    }
+
+    #[test]
+    fn running_keys_ignore_all_except_ctrl_c_d() {
+        let mut app = seeded_app();
+        // Ordinary keys are ignored while a turn runs.
+        assert_eq!(app.handle_key_running(key(KeyCode::Char('a'))), None);
+        assert_eq!(app.handle_key_running(key(KeyCode::Enter)), None);
+        assert_eq!(app.handle_key_running(ctrl_key('o')), None);
+        // Ctrl+C / Ctrl+D arm quit-after-turn.
+        assert_eq!(
+            app.handle_key_running(ctrl_key('c')),
+            Some(Effect::QuitAfterTurn)
+        );
+        assert_eq!(
+            app.handle_key_running(ctrl_key('d')),
+            Some(Effect::QuitAfterTurn)
+        );
+        // Idle state untouched by running keys.
+        assert!(!app.status.running);
+    }
+
+    #[test]
+    fn bare_escape_cancels_the_running_turn() {
+        let mut app = seeded_app();
+        // Esc while a turn runs → CancelRunning (ticket 07); Ctrl+C/Ctrl+D
+        // semantics are unchanged (quit after the turn).
+        assert_eq!(
+            app.handle_key_running(key(KeyCode::Esc)),
+            Some(Effect::CancelRunning)
+        );
+        // Modified Esc (shift/ctrl/alt) is not a cancel — ticket 07 says bare
+        // Esc.
+        assert_eq!(
+            app.handle_key_running(KeyEvent::new(KeyCode::Esc, KeyModifiers::SHIFT)),
+            None,
+            "shift+Esc is not a cancel"
+        );
+        assert_eq!(
+            app.handle_key_running(KeyEvent::new(KeyCode::Esc, KeyModifiers::CONTROL)),
+            None,
+            "ctrl+Esc is not a cancel"
+        );
+        assert_eq!(
+            app.handle_key_running(KeyEvent::new(KeyCode::Esc, KeyModifiers::ALT)),
+            None,
+            "alt+Esc is not a cancel"
+        );
+        // A cancel never touches the quit-after-turn flag or running state.
+        assert!(!app.status.running);
     }
 }

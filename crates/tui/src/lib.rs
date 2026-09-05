@@ -9,4 +9,13 @@
 //! `slimcode-common`.
 
 pub mod app;
+pub mod footer;
+pub mod git;
+pub mod markdown;
 pub mod terminal;
+pub mod text;
+pub mod theme;
+pub mod toolcall;
+
+/// slimcode's version, shown in the TUI startup header block.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");

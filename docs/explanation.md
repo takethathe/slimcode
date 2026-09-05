@@ -80,9 +80,12 @@ API 的 Session 缓存（`x-dashscope-session-cache` header）不在范围内。
 参与缓存计算」的约定。关闭缓存时请求字节与未开启缓存的客户端完全一致，缓存是纯
 增量功能。
 
-缓存命中的 token 数随 `total_usage` 跨轮累计，显示在运行结束与 TUI `/usage` 的
-汇总行 `tokens: {prompt} prompt ({cached} cached, {pct}%) + {completion} completion =
-{total} total` 中；`{pct}` 为缓存命中百分比（`cached / prompt`，保留一位小数）；端点未回传
+缓存命中的 token 数随 `total_usage` 跨轮累计。CLI 在运行结束时打印汇总行
+`tokens: {prompt} prompt ({cached} cached, {pct}%) + {completion} completion =
+{total} total`；TUI 不打印每轮用量行（ADR-0006 移除），改为 footer 的紧凑统计
+（`↑in ↓out Rcache WcacheWrite CH{pct}%`，随每轮累计值更新）与 `/usage` 的 dim
+notice 行（措辞与 CLI 共用 `usage_summary`，含同样式汇总）。`{pct}` 为缓存命中百分比
+（`cached / prompt`，保留一位小数）；端点未回传
 `prompt_tokens_details`（未命中、模型不支持或缓存已关闭）时显示 0 / 0%，任何配置都不报错。创建缓存 token 数保留在 `TokenUsage` 模型上
 供未来细粒度展示。注意创建缓存按 125% 输入价计费一次、命中按低价计费，且被缓存
 前缀需 ≥ 1024 token 才会实际命中（默认 system 提示较短时可能不触发，属运行时
@@ -104,8 +107,9 @@ API 的 Session 缓存（`x-dashscope-session-cache` header）不在范围内。
 **为什么 TUI 替代 REPL**（ADR-0003）：行式 REPL 无法区分 Shift+Enter 与 Enter，
 多行输入只能靠 `\` 续行（ADR-0001 的取舍）；raw mode 一旦开启（TUI 的必然），
 Shift+Enter 与 Enter 可区分，Enter 提交、Shift+Enter 换行，交互自然得多。同时
-TUI 提供滚动 transcript、`PgUp`/`PgDn` 翻页、输入历史 recall（`↑`/`↓`）与状态行，
-可维护性也更好——ratatui 的 widget 模型 + `TestBackend` 让 UI 逻辑可做帧缓冲
+TUI 提供滚动 transcript、`PgUp`/`PgDn` 翻页、输入历史 recall（`↑`/`↓`）、pi 风格
+的 dock footer 与状态指示器（运行中 spinner 行），可维护性也更好——ratatui 的
+widget 模型 + `TestBackend` 让 UI 逻辑可做帧缓冲
 测试（spec：好的测试断言帧缓冲，而非内部状态）。代价是交互式前端引入
 crossterm/ratatui 依赖（仅交互式前端，ADR-0001 的无依赖立场对交互前端让位）；
 不带 prompt 且非 TTY 时打印明确错误并以非零码退出。

@@ -7,12 +7,15 @@
 //! `edit_tool` which binds the pure `edit` engine (ticket 03) to disk.
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::agent::Tool;
+use crate::agent::{CancelToken, Tool};
 use crate::tools::edit::{Edit, apply_edits};
 
 /// Cap on bytes returned by `bash_tool` (stdout + stderr combined).
@@ -22,6 +25,22 @@ const GREP_MATCH_CAP: usize = 200;
 /// Cap on entries returned by `find_tool`.
 const FIND_ENTRY_CAP: usize = 1000;
 
+/// Shared `bash` tool description (plain and cancellable factories describe
+/// the same tool).
+const BASH_TOOL_DESC: &str =
+    "Run a shell command in the working directory and return its combined stdout/stderr.";
+
+/// Shared `bash` tool parameter schema.
+fn bash_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "command": {"type": "string", "description": "Shell command to run"}
+        },
+        "required": ["command"]
+    })
+}
+
 /// Resolve a tool-provided path (or ".") against the working directory.
 fn resolve(cwd: &Path, path: Option<&str>) -> PathBuf {
     match path {
@@ -30,16 +49,63 @@ fn resolve(cwd: &Path, path: Option<&str>) -> PathBuf {
     }
 }
 
-/// Read a file and return its contents.
+/// Slice file content to a 1-indexed `offset`-`offset+limit-1` line window
+/// (pi `read` offset/limit semantics, ticket 06).
+///
+/// - no range args (or an offset of 1 with no limit) → the content unchanged;
+/// - `offset` is 1-indexed and clamps below 1 to the first line;
+/// - `offset` without `limit` reads to the end;
+/// - `limit` without `offset` reads from line 1;
+/// - an offset past the end (or a zero limit) yields an empty slice.
+///
+/// Trailing-newline and CRLF content stay exact within the window (the slice
+/// joins the file's raw `\n`-separated lines, dropping only the empty element
+/// a trailing newline would produce).
+pub fn slice_lines(content: &str, offset: Option<usize>, limit: Option<usize>) -> String {
+    let offset = offset.unwrap_or(1);
+    // No effective window → the raw content is returned byte-identical.
+    if offset <= 1 && limit.is_none() {
+        return content.to_string();
+    }
+    let Some(limit) = limit else {
+        // offset only: skip to the (1-indexed) line, read to the end.
+        let skip = offset.saturating_sub(1);
+        return slice(content, skip, usize::MAX);
+    };
+    if limit == 0 {
+        return String::new();
+    }
+    slice(content, offset.saturating_sub(1), limit)
+}
+
+/// Join the `\n`-separated lines of `content` from `skip` onward, taking at
+/// most `take` of them, dropping the empty element a trailing newline leaves.
+fn slice(content: &str, skip: usize, take: usize) -> String {
+    let mut lines: Vec<&str> = content.split('\n').collect();
+    if content.ends_with('\n') {
+        lines.pop();
+    }
+    lines
+        .into_iter()
+        .skip(skip)
+        .take(take)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Read a file and return its contents (or a 1-indexed line window when the
+/// model supplies `offset`/`limit`).
 pub fn read_tool(cwd: impl Into<PathBuf>) -> Tool {
     let cwd = cwd.into();
     Tool::new(
         "read",
-        "Read the full contents of a file at `path` (relative to the working directory).",
+        "Read the contents of a file at `path` (relative to the working directory). `offset` (optional, 1-indexed) starts reading at that line; `limit` (optional) caps the number of lines returned. Omit both to read the whole file.",
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "File path, relative to cwd"}
+                "path": {"type": "string", "description": "File path, relative to cwd"},
+                "offset": {"type": "integer", "description": "1-indexed line to start reading from"},
+                "limit": {"type": "integer", "description": "Maximum number of lines to read"}
             },
             "required": ["path"]
         }),
@@ -49,7 +115,29 @@ pub fn read_tool(cwd: impl Into<PathBuf>) -> Tool {
             if meta.is_dir() {
                 return Err(format!("read {}: is a directory", path.display()));
             }
-            fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))
+            let content =
+                fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+            // Negative/fractional numbers are not valid 1-indexed line args:
+            // an `offset`/`limit` that is present but not a non-negative
+            // integer makes the whole range unusable, so fall back to a
+            // plain full read (the model can re-request with valid args).
+            let offset_arg = args.get("offset");
+            let limit_arg = args.get("limit");
+            let offset = offset_arg
+                .and_then(Value::as_u64)
+                .map(|o| usize::try_from(o).unwrap_or(usize::MAX));
+            let limit = limit_arg
+                .and_then(Value::as_u64)
+                .map(|l| usize::try_from(l).unwrap_or(usize::MAX));
+            if (offset_arg.is_some() && offset.is_none())
+                || (limit_arg.is_some() && limit.is_none())
+            {
+                return Ok(content);
+            }
+            if offset.is_none() && limit.is_none() {
+                return Ok(content);
+            }
+            Ok(slice_lines(&content, offset, limit))
         },
     )
 }
@@ -90,47 +178,151 @@ pub fn write_tool(cwd: impl Into<PathBuf>) -> Tool {
 /// Run a shell command in the working directory, returning combined output.
 pub fn bash_tool(cwd: impl Into<PathBuf>) -> Tool {
     let cwd = cwd.into();
-    Tool::new(
-        "bash",
-        "Run a shell command in the working directory and return its combined stdout/stderr.",
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "command": {"type": "string", "description": "Shell command to run"}
-            },
-            "required": ["command"]
-        }),
-        move |args| {
-            let command = args
-                .get("command")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "bash: missing string `command`".to_string())?;
-            let out = Command::new("sh")
-                .arg("-c")
-                .arg(command)
-                .current_dir(&cwd)
-                .output()
-                .map_err(|e| format!("bash: failed to spawn: {e}"))?;
-            let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
-            combined.push_str(&String::from_utf8_lossy(&out.stderr));
-            if combined.len() > BASH_OUTPUT_CAP {
-                combined.truncate(BASH_OUTPUT_CAP);
-                combined.push_str("\n...[output truncated]");
+    Tool::new("bash", BASH_TOOL_DESC, bash_schema(), move |args| {
+        let command = args
+            .get("command")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "bash: missing string `command`".to_string())?;
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(&cwd)
+            .output()
+            .map_err(|e| format!("bash: failed to spawn: {e}"))?;
+        bash_result(&out.status, &out.stdout, &out.stderr)
+    })
+}
+
+/// Cancellable `bash` tool factory (ticket 07): identical schema and output
+/// semantics to [`bash_tool`], but the `sh -c` child runs in its own process
+/// group and is polled every ~50ms while checking `cancel`; as soon as a
+/// cancel is requested the whole group is killed, so an unbounded command
+/// (e.g. `sleep 30`) returns promptly instead of swallowing Esc. Output is
+/// drained on reader threads so a chatty command cannot deadlock on a full
+/// pipe while the poll loop waits. The runner drops this tool's aborted
+/// result (the token is set), so its `Err("bash: cancelled")` marker never
+/// reaches history or the transcript.
+pub fn bash_tool_with_cancel(cwd: impl Into<PathBuf>, cancel: CancelToken) -> Tool {
+    let cwd = cwd.into();
+    Tool::new("bash", BASH_TOOL_DESC, bash_schema(), move |args| {
+        let command = args
+            .get("command")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "bash: missing string `command`".to_string())?;
+        run_shell_cancellable(&cwd, command, &cancel)
+    })
+}
+
+/// Compose a bash tool result from a status and captured stdout/stderr: both
+/// streams combined (stdout first, matching `sh` semantics), truncated to
+/// [`BASH_OUTPUT_CAP`], `Ok` on success and `Err` (with the output) on a
+/// non-zero exit.
+fn bash_result(status: &ExitStatus, stdout: &[u8], stderr: &[u8]) -> Result<String, String> {
+    let mut combined = String::from_utf8_lossy(stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(stderr));
+    if combined.len() > BASH_OUTPUT_CAP {
+        combined.truncate(BASH_OUTPUT_CAP);
+        combined.push_str("\n...[output truncated]");
+    }
+    if status.success() {
+        Ok(combined)
+    } else {
+        Err(format!(
+            "bash exited with {}:\n{combined}",
+            status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".to_string())
+        ))
+    }
+}
+
+/// Build the cancellable `sh -c` command: piped stdio, and (on unix) the
+/// child made a process-group leader so a cancel can kill the whole job tree.
+fn cancellable_shell_command(cwd: &Path, command: &str) -> Command {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg(command)
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    cmd
+}
+
+/// Kill the child and, on unix, its whole process group (pgid == child pid):
+/// SIGKILL to the group so no orphaned grandchild (e.g. `sleep` forked by
+/// `sh`) outlives the cancel. Best-effort — every failure is swallowed.
+fn kill_child_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("/bin/kill")
+            .arg("-KILL")
+            .arg(format!("-{}", child.id()))
+            .status();
+    }
+    let _ = child.kill();
+}
+
+/// Run `sh -c command` under the poll loop: every ~50ms the child is polled
+/// and the token checked. On cancel the process group is killed and reaped
+/// and `Err("bash: cancelled")` returns immediately (no waiting for the
+/// command). Output is drained on scoped reader threads so a chatty command
+/// cannot deadlock on a full pipe; normal completion composes the result
+/// exactly like [`bash_tool`].
+fn run_shell_cancellable(
+    cwd: &Path,
+    command: &str,
+    cancel: &CancelToken,
+) -> Result<String, String> {
+    let mut child = cancellable_shell_command(cwd, command)
+        .spawn()
+        .map_err(|e| format!("bash: failed to spawn: {e}"))?;
+    let (status, stdout_buf, stderr_buf) = thread::scope(|scope| -> Result<_, String> {
+        // Drain both pipes on reader threads while the poll loop runs below.
+        let stdout_buf = child.stdout.take().map(|mut stream| {
+            scope.spawn(move || {
+                let mut buf = Vec::new();
+                let _ = stream.read_to_end(&mut buf);
+                buf
+            })
+        });
+        let stderr_buf = child.stderr.take().map(|mut stream| {
+            scope.spawn(move || {
+                let mut buf = Vec::new();
+                let _ = stream.read_to_end(&mut buf);
+                buf
+            })
+        });
+        let status = loop {
+            if cancel.is_cancelled() {
+                kill_child_group(&mut child);
+                // Reap the killed child before returning (no 30s wait).
+                let _ = child.wait();
+                break None;
             }
-            if out.status.success() {
-                Ok(combined)
-            } else {
-                Err(format!(
-                    "bash exited with {}:\n{}",
-                    out.status
-                        .code()
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| "signal".to_string()),
-                    combined
-                ))
+            match child.try_wait().map_err(|e| format!("bash: wait: {e}"))? {
+                Some(status) => break Some(status),
+                None => thread::sleep(Duration::from_millis(50)),
             }
-        },
-    )
+        };
+        let stdout = stdout_buf
+            .map(|h| h.join().unwrap_or_default())
+            .unwrap_or_default();
+        let stderr = stderr_buf
+            .map(|h| h.join().unwrap_or_default())
+            .unwrap_or_default();
+        Ok((status, stdout, stderr))
+    })
+    .map_err(|e| e.to_string())?;
+    match status {
+        None => Err("bash: cancelled".to_string()),
+        Some(status) => bash_result(&status, &stdout_buf, &stderr_buf),
+    }
 }
 
 /// Grep a file, or walk a directory grepping every file, returning matches as
@@ -389,6 +581,89 @@ mod tests {
         let t = read_tool(&cwd);
         let err = run(&t, serde_json::json!({"path": "."})).unwrap_err();
         assert!(err.contains("directory"), "err: {err}");
+    }
+
+    // --- read offset/limit slicing (ticket 06) ----------------------------
+
+    #[test]
+    fn slice_lines_without_range_returns_content_unchanged() {
+        let content = "line1\nline2\nline3\n";
+        // No args at all, or an offset of 1 (start at the first line) with no
+        // limit: the raw content comes back byte-identical.
+        assert_eq!(slice_lines(content, None, None), content);
+        assert_eq!(slice_lines(content, Some(1), None), content);
+        assert_eq!(slice_lines(content, Some(0), None), content);
+    }
+
+    #[test]
+    fn slice_lines_applies_1_indexed_offset_and_limit() {
+        let content = "line1\nline2\nline3\nline4\nline5\n";
+        // offset 2 + limit 2 → the second and third lines.
+        assert_eq!(slice_lines(content, Some(2), Some(2)), "line2\nline3");
+        // offset without limit reads to the end.
+        assert_eq!(slice_lines(content, Some(4), None), "line4\nline5");
+        // limit without offset reads from line 1.
+        assert_eq!(slice_lines(content, None, Some(2)), "line1\nline2");
+    }
+
+    #[test]
+    fn slice_lines_clamps_at_eof_and_zero_limit() {
+        let content = "line1\nline2\nline3\n";
+        // Offset past the last line → empty.
+        assert_eq!(slice_lines(content, Some(10), Some(5)), "");
+        // A zero limit yields nothing.
+        assert_eq!(slice_lines(content, Some(1), Some(0)), "");
+        // A limit larger than the file just returns what is left.
+        assert_eq!(slice_lines(content, Some(2), Some(99)), "line2\nline3");
+        // Empty content slices to empty.
+        assert_eq!(slice_lines("", Some(1), Some(3)), "");
+    }
+
+    #[test]
+    fn slice_lines_keeps_no_trailing_newline_content_exact() {
+        // Content without a final newline keeps its lines whole when sliced.
+        assert_eq!(slice_lines("a\nb", None, Some(1)), "a");
+        assert_eq!(slice_lines("a\nb", Some(2), Some(5)), "b");
+    }
+
+    #[test]
+    fn read_tool_slices_by_offset_and_limit() {
+        let cwd = temp_cwd();
+        let content: String = (1..=5).map(|i| format!("line {i}\n")).collect();
+        fs::write(cwd.join("a.txt"), &content).unwrap();
+        let t = read_tool(&cwd);
+        // Full read unchanged (no range args).
+        let out = run(&t, serde_json::json!({"path": "a.txt"})).unwrap();
+        assert_eq!(out, content);
+        // Sliced read returns exactly the requested 1-indexed window.
+        let out = run(
+            &t,
+            serde_json::json!({"path": "a.txt", "offset": 3, "limit": 2}),
+        )
+        .unwrap();
+        assert_eq!(out, "line 3\nline 4");
+    }
+
+    #[test]
+    fn read_tool_ignores_non_positive_offset_args() {
+        let cwd = temp_cwd();
+        let content = "line1\nline2\nline3\n";
+        fs::write(cwd.join("a.txt"), content).unwrap();
+        let t = read_tool(&cwd);
+        // Negative / fractional offsets are not valid 1-indexed lines: the
+        // arg is ignored and the whole file is returned.
+        let out = run(
+            &t,
+            serde_json::json!({"path": "a.txt", "offset": -3, "limit": 2}),
+        )
+        .unwrap();
+        assert_eq!(out, content);
+        let out = run(
+            &t,
+            serde_json::json!({"path": "a.txt", "offset": 2.5, "limit": 1}),
+        )
+        .unwrap();
+        assert_eq!(out, content);
     }
 
     #[test]

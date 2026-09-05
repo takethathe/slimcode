@@ -10,12 +10,17 @@
 //! [`DisplayItem::Usage`] to its renderer itself (spec §Implementation
 //! Decisions).
 
-use slimcode_agent::agent::{Message, Provider, RunConfig, Tool};
+use slimcode_agent::agent::{CancelToken, Message, Provider, RunConfig, Tool};
 
 use crate::render::{Renderer, map_event};
 
 /// Drive one agent turn over `messages`, streaming every event to `renderer`
 /// live as the loop runs, and return the updated message history.
+///
+/// `cancel` is threaded into the agent loop untouched: while it stays clear
+/// the run behaves exactly as before; the moment it is set the run stops at
+/// the next runner boundary with [`StopReason::Cancelled`] (the CLI one-shot
+/// passes a token it never sets).
 ///
 /// A provider error propagates as `Err(String)`; no partial history is
 /// fabricated.
@@ -24,14 +29,22 @@ pub fn run_turn<P: Provider>(
     tools: &[Tool],
     messages: Vec<Message>,
     cfg: &RunConfig,
+    cancel: &CancelToken,
     renderer: &mut dyn Renderer,
 ) -> Result<Vec<Message>, String> {
-    slimcode_agent::agent::run_agent_from_messages_sink(provider, tools, messages, cfg, &mut |e| {
-        if let Some(item) = map_event(&e) {
-            renderer.render(&item)?;
-        }
-        Ok(())
-    })
+    slimcode_agent::agent::run_agent_from_messages_sink(
+        provider,
+        tools,
+        messages,
+        cfg,
+        cancel,
+        &mut |e| {
+            if let Some(item) = map_event(&e) {
+                renderer.render(&item)?;
+            }
+            Ok(())
+        },
+    )
 }
 
 #[cfg(test)]
@@ -84,7 +97,12 @@ mod tests {
     }
 
     impl Provider for FakeProvider {
-        fn chat(&mut self, _messages: &[Message], _tools: &[Tool]) -> Result<Vec<Delta>, String> {
+        fn chat(
+            &mut self,
+            _messages: &[Message],
+            _tools: &[Tool],
+            _cancel: &CancelToken,
+        ) -> Result<Vec<Delta>, String> {
             let d = self.script.get(self.calls).cloned().unwrap_or_default();
             self.calls += 1;
             Ok(d)
@@ -150,11 +168,13 @@ mod tests {
             Message::text(Role::System, "be helpful"),
             Message::text(Role::User, "weather?"),
         ];
+        let cancel = CancelToken::new();
         let updated = run_turn(
             &mut provider,
             &[weather_tool()],
             messages,
             &RunConfig::default(),
+            &cancel,
             &mut renderer,
         )
         .unwrap();
@@ -240,11 +260,13 @@ mod tests {
             Message::text(Role::System, "be helpful"),
             Message::text(Role::User, "weather?"),
         ];
+        let cancel = CancelToken::new();
         let updated = run_turn(
             &mut provider,
             &[weather_tool()],
             messages.clone(),
             &RunConfig::default(),
+            &cancel,
             &mut renderer,
         )
         .unwrap();
@@ -255,6 +277,7 @@ mod tests {
             &[weather_tool()],
             messages,
             &RunConfig::default(),
+            &CancelToken::new(),
         )
         .unwrap();
         assert_eq!(updated, result.messages);
@@ -270,11 +293,13 @@ mod tests {
         let mut provider = FakeProvider::new(script);
         let mut renderer = RecordingRenderer::new();
         let messages = vec![Message::text(Role::User, "go")];
+        let cancel = CancelToken::new();
         run_turn(
             &mut provider,
             &[weather_tool()],
             messages,
             &RunConfig::default(),
+            &cancel,
             &mut renderer,
         )
         .unwrap();
@@ -292,17 +317,24 @@ mod tests {
     fn provider_error_propagates() {
         struct ErrProvider;
         impl Provider for ErrProvider {
-            fn chat(&mut self, _m: &[Message], _t: &[Tool]) -> Result<Vec<Delta>, String> {
+            fn chat(
+                &mut self,
+                _m: &[Message],
+                _t: &[Tool],
+                _c: &CancelToken,
+            ) -> Result<Vec<Delta>, String> {
                 Err("provider exploded".to_string())
             }
         }
         let mut provider = ErrProvider;
         let mut renderer = RecordingRenderer::new();
+        let cancel = CancelToken::new();
         let err = run_turn(
             &mut provider,
             &[],
             vec![Message::text(Role::User, "hi")],
             &RunConfig::default(),
+            &cancel,
             &mut renderer,
         )
         .unwrap_err();
@@ -315,14 +347,94 @@ mod tests {
         let mut provider = FakeProvider::new(script);
         let mut renderer = RecordingRenderer::new();
         renderer.fail_on = Some("boom".to_string());
+        let cancel = CancelToken::new();
         let err = run_turn(
             &mut provider,
             &[],
             vec![Message::text(Role::User, "hi")],
             &RunConfig::default(),
+            &cancel,
             &mut renderer,
         )
         .unwrap_err();
         assert!(err.contains("renderer exploded"), "err: {err}");
+    }
+
+    #[test]
+    fn cancel_flip_mid_run_stops_the_stream_with_cancelled() {
+        // A provider whose first chat cancels the token (Esc while the request
+        // is in flight) before returning its batch: the shared runner streams
+        // the deltas that arrived, then stops with Stop(Cancelled); the
+        // cancel token itself is passed through untouched otherwise.
+        let cancel = CancelToken::new();
+        let mut provider = FakeProvider::new(vec![vec![text("partial"), done_stop()]]);
+        let mut wrapped = CancelFirstProvider {
+            inner: &mut provider,
+            calls: 0,
+            cancel: cancel.clone(),
+        };
+        let mut renderer = RecordingRenderer::new();
+        let updated = run_turn(
+            &mut wrapped,
+            &[],
+            vec![Message::text(Role::User, "hi")],
+            &RunConfig::default(),
+            &cancel,
+            &mut renderer,
+        )
+        .unwrap();
+        // The stream ends with Stop(Cancelled); the partial text of the
+        // aborted request was still streamed live.
+        assert!(
+            renderer
+                .items
+                .iter()
+                .any(|i| matches!(i, DisplayItem::Stop(StopReason::Cancelled)))
+        );
+        assert!(
+            renderer
+                .items
+                .iter()
+                .any(|i| matches!(i, DisplayItem::Text(t) if t == "partial"))
+        );
+        let stop_at = renderer
+            .items
+            .iter()
+            .position(|i| matches!(i, DisplayItem::Stop(_)))
+            .unwrap();
+        assert_eq!(
+            &renderer.items[stop_at..],
+            [DisplayItem::Stop(StopReason::Cancelled)]
+        );
+        // History rule: no assistant message from the cancelled request enters
+        // the returned message list.
+        assert!(
+            updated
+                .iter()
+                .all(|m| !m.text_content().contains("partial"))
+        );
+        assert_eq!(updated.len(), 1);
+    }
+
+    /// Cancels the shared token on its first chat call, then delegates.
+    struct CancelFirstProvider<'a> {
+        inner: &'a mut FakeProvider,
+        calls: usize,
+        cancel: CancelToken,
+    }
+
+    impl Provider for CancelFirstProvider<'_> {
+        fn chat(
+            &mut self,
+            m: &[Message],
+            t: &[Tool],
+            _c: &CancelToken,
+        ) -> Result<Vec<Delta>, String> {
+            self.calls += 1;
+            if self.calls == 1 {
+                self.cancel.cancel();
+            }
+            self.inner.chat(m, t, &self.cancel)
+        }
     }
 }

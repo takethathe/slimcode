@@ -78,9 +78,16 @@ fn run_once(
         .with_user_prompt(prompt)
         .build()?;
     let cfg = slimcode_agent::agent::RunConfig::default();
+    let cancel = slimcode_agent::agent::CancelToken::new();
     let mut renderer = render::TextRenderer::new(out);
-    let updated =
-        slimcode_common::runner::run_turn(&mut provider, &tools, messages, &cfg, &mut renderer)?;
+    let updated = slimcode_common::runner::run_turn(
+        &mut provider,
+        &tools,
+        messages,
+        &cfg,
+        &cancel,
+        &mut renderer,
+    )?;
     session.messages = updated;
     let path = store.save(&session)?;
     let usage = provider.total_usage;

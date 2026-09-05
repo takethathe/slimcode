@@ -33,7 +33,7 @@ cargo workspace，六个 crate：
 | `crates/agent` | `slimcode-agent` | agent 运行时、工具、会话状态 | 起步（edit 引擎 + 运行时循环 + 消息模型） |
 | `crates/commands` | `slimcode-commands` | 前端无关的 `/` 命令注册表与预测提示 | v1 新增（registry + suggest/find） |
 | `crates/common` | `slimcode-common` | 前端无关的应用模块（配置解析 / 会话与输入历史持久化 / skills 发现与安装 / 上下文组装 / 七工具绑定 / 共享渲染模型与 turn runner / setup seam） | v1 新增（自 cli 抽出 + TUI 共享 seam） |
-| `crates/tui` | `slimcode-tui` | 交互式全屏 TUI（纯 App core + crossterm/ratatui 终端循环） | v1 完成（app/terminal） |
+| `crates/tui` | `slimcode-tui` | 交互式全屏 TUI（纯 App core + crossterm/ratatui 终端循环；theme/markdown/toolcall/footer/git 纯函数模块） | v1 完成（pi 对齐：header/blocks/layout/footer/status） |
 | `crates/cli` | `slimcode` | 二进制入口 + 非交互 one-shot 前端（共享 runner + TextRenderer） | v1 完成（render/main） |
 
 ### crates/ai Bailian provider
@@ -42,7 +42,9 @@ cargo workspace，六个 crate：
 
 - **HTTP**：`reqwest 0.13` blocking（features `json` + `blocking` + `rustls`，`default-features=false`）。
   `Provider` trait 是同步 seam，真实阻塞边界收在 provider 内部，不引入 tokio；ticket 02 文档中 `stream` feature
-  仅 async 路径需要，blocking 下用 `resp.text()` 一次取回整段 SSE 再解析；
+  仅 async 路径需要。body 按 chunk 可中断读取（ticket 07：`read_body_interruptibly` 每块检查 `CancelToken`，
+  中途取消返回 `Cancelled(partial)`，provider 对已收到的完整 SSE 事件做 salvage 解析，把已流式内容交回 runner；
+  阻塞 reqwest 没有 per-read 超时——静默服务器仍由客户端 300s 整体超时兜底）；
 - **请求**：`stream: true` + `stream_options.include_usage: true`（ticket 05 实测 usage 只在带 `choices: []` 的最终 chunk 出现）；
   工具用 `role: tool` 消息回传结果；
 - **显式上下文缓存**（llm-cache）：`BailianConfig.cache`（默认 `true`，`with_cache(bool)` 建造式 setter）。
@@ -94,7 +96,11 @@ cargo workspace，六个 crate：
 折入自 ticket 04 原型，决策：
 
 - 循环：模型带 `tool_calls` 的响应 → 执行工具 → 追加 `role: tool` 结果 → 循环，直到模型不再调工具；
-- 停止：无 tool_calls → `Completed`；`max_iterations` → `MaxIterations`（运行时唯一硬保险；运行中用户中断不在范围内，见 crates/tui 一节）；
+- 停止：无 tool_calls → `Completed`；`max_iterations` → `MaxIterations`（运行时唯一硬保险）；
+  取消（ticket 07）→ `StopReason::Cancelled`——`CancelToken`（`Arc<AtomicBool>`，`new`/`cancel`/
+  `reset`/`is_cancelled`/`Clone`）由每个 run 入口携带，在每个 runner 边界检查：provider chat 之前、
+  chat 返回 Err 时若 flag 置位视为静默 Cancelled 而非错误、已流出的 deltas 之后（半段文本不落 history）、
+  每个工具派发前后（串行/并行）。已 push 的工具结果保留；
 - 工具执行默认**串行**（本地工具引擎安全），`RunConfig.parallel_tools` 开关留给未来 IO 工具；
 - 工具报错以 `Error: …` 前缀作 `role: tool` 内容进 history，模型自然恢复；
 - `Provider` trait 是 crates/ai 已实现的 seam（当前同步、无 async 依赖，真实 provider 内部处理阻塞边界）；
@@ -188,43 +194,79 @@ cargo workspace，六个 crate：
 
 ### crates/tui 交互式 TUI（`slimcode-tui`）
 
-`crates/tui` 提供交互式全屏 TUI（ADR-0003），替代行式 REPL。分两层：
+`crates/tui` 提供交互式全屏 TUI（ADR-0003），替代行式 REPL。模块：
+`theme`（pi dark.json 词法转的只读 token 表：`Token::color()` 前景 / `BgToken::color()`
+背景）、`text`（折行/截断/宽度，CJK 双宽）、`markdown`（pulldown-cmark → 样式
+span，代码围栏行映射等）、`toolcall`（内置工具紧凑调用标题 composer，pi `format*Call`
+移植：`CallPart` 纯函数 + 逐工具单测）、`footer`（pi `footer.ts` 的 `formatTokens` /
+`formatCwdForFooter` /
+stats 纯函数移植）、`git`（`terminal_title` / `current_branch` 纯包装）、`app`（纯
+reducer + draw）、`terminal`（薄壳 + worker-thread runner）。分层：
 
-- **纯 App core（`app`）**：前端无关、无 I/O 的 reducer。持有 `transcript`
-  （`DisplayItem` 序列）、输入框、`history`（input history 快照，最旧在前）、
-  `recall` 态、`status`（当前会话 id / notice / error）。`handle_key(KeyEvent) ->
-  Option<Effect>` 是纯 reducer，把按键映射为副作用声明；`Effect` 枚举
-  （Submit / ReplayPrompt / ReplayHistory / NewSession / LoadSession / Quit / …）
-  由终端循环兑现（session / history / skills / quit）。`draw(Frame)` 经 `Renderer`
-  实现把状态渲染到 ratatui `Frame`，用 `TestBackend` 做帧缓冲测试（spec：好的测试
-  断言**帧缓冲**，而非内部状态）；长行在纯 core 里按面板宽度预折行（`wrap_to_width`，
-  CJK 双宽字符按 2 列计），滚动/跟随的行数数学因此与渲染一致、内容不截断。命令解析经
-  `slimcode_commands::find` + skill
-  触发 + 编号重跑（`/!N`），未知 `/` 命令给出 `did you mean` 提示；`/new` / `/load`
-  会清空 transcript 再重建会话视图。输入历史 recall：输入框为空时按 `↑`/`↓` 进入
-  （从最新一条开始），`Enter` 把选中的历史 prompt 作为新一轮重跑（不再写入历史）；
-  记录在每轮提交时追加（不查重，同 `HistoryStore::append`）。
-- **`/` 补全弹框（ADR-0005）**：`App::completion: Option<Completion>`（`items` /
-  `selected` / `offset`，`Completion::clamp_offset` 让选中项始终落在滚动窗口内）。
-  条件：整条输入为单行、以 `/` 开头且 `/` 后无空白（输入空格进入参数段即关闭弹框）；
-  每次按键后 `refresh_completion` 重算候选（`common::skills::complete`），已选中值仍是
-  候选时保留选择，否则回落到最佳匹配（index 0）。按键：`↑`/`↓` 循环导航、`PgUp`/`PgDn`
-  翻页（弹框打开时优先于 transcript 滚动）、`Tab` 上屏（写入裸拼写 + 尾部空格、光标
-  落空格后、不提交）、`Enter` 展开选中项后直接提交执行、`Esc` 取消并保留文本。弹框在
-  input 与 status 之间动态扩展高度渲染（`render_completion`，ratatui `List`，选中行
-  `→` + 反色，最多 `COMPLETION_VISIBLE=5` 行，超出显示滚动窗口标记）。
-- **终端循环（`terminal`）**：薄壳。`run(cwd, config, store, history, skills)` 先经
-  `common::setup::setup` 构造 provider + 工具（**在**进入 raw mode / alternate
-  screen 之前，API-key/配置错误在普通终端上浮现），再 `enable_raw_mode` +
-  `EnterAlternateScreen`，泵 crossterm 事件、喂给 App reducer、兑现 `Effect`，
-  每事件 `draw`（ratatui 自动 autoresize），退出路径统一 `restore_terminal()`。
-
-**同步 provider 的运行时行为**：provider 当前是同步 seam（真实阻塞边界收在
-provider 内部）。一轮提交后循环**不再轮询按键**，同步阻塞在共享 `run_turn` 内；
-`LiveRenderer` 把每个流式 `DisplayItem` 追加进 transcript（相邻的流式文本/思考片段合并为同一条目）并立即重绘，实现边跑边
-显示。turn 结束自动保存会话；turn 报错内联进 transcript 并回到输入框。运行中的
-Ctrl+C 字节被缓冲，turn 结束后退出。中断运行中的 turn 明确不在范围内（见 spec
-Further Notes）。
+- **主题（ADR-0006 D1）**：唯一风格来源是 pi `dark.json` 的逐字十六进制；TUI 渲染只
+  引用 token（`Token` 前景 / `BgToken` 背景），不出现裸颜色。现有测试把每个 token
+  的 hex 钉死，换肤只需改一处表。
+- **块感知 transcript（ADR-0006 D2）**：App 持有 `Vec<Entry>`（`Header` /
+  `UserPrompt` / `Assistant` / `Thinking` / `Tool` / `Notice` / `Error`），不再是
+  扁平的逐 kind 行；流式文本/思考相邻片段仍按“同 kind 合并”规则拼进同一条目。
+  用户消息是 `userMessageBg` 整块背景的 boxed markdown；assistant 文本/思考按
+  pi markdown token 渲染（thinking italic 灰）；工具调用由 start/result 配成单个
+  状态色块（pending 深灰 / success 暗绿 / error 暗红背景，色带横贯整行宽度；内置工具的
+  头部是 `toolcall` 模块产出的紧凑调用标题 —— `read <path>:<range>` / `ls <path>` /
+  `grep /pattern/ in <scope>` / `$ command` 等，不再显示 JSON 参数区；未知工具保留
+  bold 名 + pretty JSON 兜底；标题下方灰色输出，超过 `TOOL_PREVIEW_LINES=10` 折叠为
+  `… (N more lines, Ctrl+O to expand)`，`Ctrl+O` 全局展开）；启动头部是 transcript 顶部的
+  `Header` 条目（bold accent `slimcode` + dim ` v<version>` + 一行 dim 快捷键提示）；
+  错误红字、notice dim；**不**渲染 turn 标记 / `done` 行 / 每轮用量行。`/new`、
+  `/load` 清空后重建会话视图。`/` 补全弹框是 SelectList 样式（选中行 `→` + accent、
+  无反色，描述 muted，滚动标记 muted）。
+- **纯 App core（`app`）**：前端无关、无 I/O 的 reducer。持有 transcript、输入框、
+  `history`（input history 快照）、`recall` 态、`completion`、`scroll` /
+  `scrollbar_ticks`（auto 模式滚动条：出现后 ~1s 淡出，与 scroll 位置无关）、
+  `status`（`cwd` / `session_id` / `branch` / `usage: FooterUsage` / `running` /
+  `spinner_frame`）、全局 `tool_output_expanded`、`version`。`handle_key` /
+  `handle_key_running` / `tick()`（推进 spinner 帧、递减滚动条淡出计数）是纯
+  reducer；`Effect` 枚举（Submit / ReplayPrompt / ReplayHistory / NewSession /
+  LoadSession / ShowUsage / Quit / QuitAfterTurn / …）由终端循环兑现。`draw` 用
+  ratatui `TestBackend` 做帧缓冲测试（spec：好测试断言**帧缓冲**而非内部状态）。
+  布局是 ADR-0006 D4 五区 dock：`[transcript(Min0) | status(Length 0|1) | input |
+  popup | footer(2)]`；status 行运行中 1 行、空闲 0 行（收起），编辑器边框蓝色
+  （`border`）闲置 / 青色（`borderAccent`）运行中，右缘滚动条 thumb。命令解析经
+  `slimcode_commands::find` + skill 触发 + 编号重跑（`/!N`）。输入历史 recall：输入框
+  为空时 `↑`/`↓` 进入（最新一条开始），`Enter` 把选中的历史 prompt 作为新一轮重跑
+  （不再写入历史）；每轮提交时追加（不查重，同 `HistoryStore::append`）。
+- **Footer / 状态指示器（ADR-0006 D5/D6）**：两行 dim footer 由纯函数拼装——第一行
+  `~/cwd (branch) • session`（`footer::format_cwd_for_footer`：只在词法上位于 `$HOME`
+  内时缩写为 `~` / `~/rel`），第二行 `stats_line`（`↑in ↓out Rcache WcacheWrite
+  CH{pct}%`，零值省略；`format_tokens` 与 pi 同表：<1000 原样、<10k `x.xk`、<1M 取整
+  `xk`、<10M `x.xM`、否则取整 `M`），模型名右对齐，宽度不足时右侧截断。运行中在输入框
+  上方渲染一行 spinner（braille 帧、80ms 一帧）+ muted `Working...`，空闲收起。
+- **worker-thread turn runner（ADR-0006 D6/D6a）**：`terminal::run` 先 `setup_with_cancel`
+  构造 provider + 可取消工具集（再进 raw mode / alternate screen），设终端标题（OSC 0
+  `slimcode - <session> - <cwd 目录名>`，`/new` `/load` 时更新），并尽力
+  `git branch --show-current` 喂 footer。提交后把 `BailianProvider`（`Option`
+  take/restore）+ `Vec<Tool>`（`mem::take`，`Tool::run` 已加宽为 `Box<dyn Fn(...) +
+  Send>`）移入 worker `thread::spawn` 跑共享 `run_turn`，经 mpsc `ChannelRenderer`
+  把 `DisplayItem` 流回 UI；UI 循环 `event::poll(80ms)` 同时当帧定时器，poll 事件 + 排空
+  通道 + `draw` + `app.tick()`，spinner 因此边 HTTP 等待边动画。运行中：裸 `Esc` →
+  `Effect::CancelRunning`（`Tui` 持有每轮 `CancelToken`，`drive_turn` 开头 `reset()`，
+  Esc 时 `cancel()`；worker 在下一 runner 边界 / 下个 socket chunk 中止在途请求，并杀掉
+  bash 子进程组；以 `StopReason::Cancelled` 静默结束、已流式内容保留、不进历史）；
+  Ctrl+C / Ctrl+D → `Effect::QuitAfterTurn`，其它按键忽略。`handle.is_finished()` 门控
+  join，任何路径都先 join 再 restore provider/工具（不变量：provider 总被归还）。turn
+  结束自动保存会话；turn 报错内联进 transcript 并回到输入框。TUI 用 `setup_with_cancel`
+  （bash 为可取消变体，进程组 SIGKILL、~50ms 轮询）；CLI one-shot 用普通 `setup` +
+  从不置位的 token。
+- **测试 seam**：决定逻辑都在 `app` 纯 core 与 `footer`/`git` 纯函数里（帧缓冲测试、
+  纯单测）；`terminal` 只有原始 I/O + 通道搬移。worker 通道有端到端测试（脚本化
+  provider + 通道录制渲染器断言有序 `DisplayItem` 流与最终结果）；tmux 冒烟在
+  `crates/cli/tests/tui_smoke.rs`（无 tmux 自动跳过）：对本地 mock SSE 服务器起真终端，
+  capture-pane 断言头部/色块 prompt/markdown 思考/工具块/spinner 动画/footer 两行/补全
+  弹框/滚动/改尺寸 dock 固定/OSC 0 标题/Ctrl+C 退出/Esc 中途取消（spinner 消失、已流式
+  partial 文本保留、无错误文本、下一 prompt 正常运行）。
+- **CLI 并行不变**：one-shot 前端字节不变地复用 `common`（`render::map_event` 共享；
+  TUI 的 `DisplayItem::Usage` 在前端侧消费、绝不出自 `map_event`，/usage 汇总措辞与
+  CLI 共用 `usage_summary`）。
 
 ### crates/cli 二进制（`slimcode`）
 

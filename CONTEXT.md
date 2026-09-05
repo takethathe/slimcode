@@ -78,3 +78,23 @@ _Avoid_: printer, formatter
 **DisplayItem**:
 The frontend-agnostic unit a Renderer consumes (turn marker, streamed text fragment, reasoning line, tool start/result, stop marker, or token usage), produced from an AgentEvent by a shared mapping function.
 _Avoid_: RenderText, view model
+
+**Theme**:
+A semantic color-token system (accent, border, borderAccent, muted, dim, userMessageBg, toolPendingBg, toolSuccessBg, toolErrorBg, markdown tokens, ...) whose names and hex values mirror pi's `dark.json`; the TUI resolves tokens to terminal colors at render time. Dark only.
+_Avoid_: palette, colors, style sheet
+
+**Transcript**:
+The scrollable top region of the TUI holding the startup header, user/assistant messages, and tool blocks; it scrolls, the dock below it never does.
+_Avoid_: chat area, message list
+
+**Dock**:
+The fixed bottom region of the TUI (status indicator row, editor, completion popup, footer) that never scrolls; the transcript scrolls above it.
+_Avoid_: footer bar, bottom bar
+
+**Footer**:
+The bottom two lines: a dim cwd/branch/session line plus a dim token-stats line with the model name right-aligned. Distinct from the status indicator row above the editor.
+_Avoid_: status bar, statusline, status line
+
+**Status indicator**:
+The spinner row above the editor shown while a turn runs (braille frames, "Working..."); hidden when idle. Distinct from the Footer and from the old single-line StatusLine.
+_Avoid_: loading bar, RUNNING flag, spinner line

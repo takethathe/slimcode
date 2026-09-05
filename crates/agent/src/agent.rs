@@ -23,6 +23,41 @@
 pub use crate::session::{Message, Role, ToolCall};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// A shared cancellation handle threaded through a run (ticket 07, spec R3):
+/// one `Arc<AtomicBool>` observed by the runner boundaries, the provider's
+/// interruptible body read, and cancellable tool executions (bash). Cloning
+/// shares the same flag; the TUI `reset()`s it at the start of every turn and
+/// `cancel()`s it when the user presses Esc.
+#[derive(Clone, Debug, Default)]
+pub struct CancelToken {
+    flag: Arc<AtomicBool>,
+}
+
+impl CancelToken {
+    /// A fresh, uncancelled token.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the flag: every boundary and interruptible read notices on its
+    /// next check.
+    pub fn cancel(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+    }
+
+    /// Clear the flag (the TUI does this before each new turn).
+    pub fn reset(&self) {
+        self.flag.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether a cancel has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+}
 
 /// Why a turn of generation ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,8 +92,9 @@ pub struct Tool {
     pub description: String,
     pub parameters: Value,
     /// Runs the tool against parsed JSON arguments. `Err` becomes an
-    /// `Error: …` tool message in history.
-    pub run: Box<dyn Fn(Value) -> Result<String, String>>,
+    /// `Error: …` tool message in history. `Send` so a `Vec<Tool>` can move
+    /// into the TUI's worker thread (all tool closures capture owned data).
+    pub run: Box<dyn Fn(Value) -> Result<String, String> + Send>,
 }
 
 impl Tool {
@@ -66,7 +102,7 @@ impl Tool {
         name: impl Into<String>,
         description: impl Into<String>,
         parameters: Value,
-        run: impl Fn(Value) -> Result<String, String> + 'static,
+        run: impl Fn(Value) -> Result<String, String> + Send + 'static,
     ) -> Self {
         Self {
             name: name.into(),
@@ -81,7 +117,17 @@ impl Tool {
 pub trait Provider {
     /// One turn of generation over `messages` with `tools` available.
     /// Returns the raw delta stream for this turn.
-    fn chat(&mut self, messages: &[Message], tools: &[Tool]) -> Result<Vec<Delta>, String>;
+    ///
+    /// `cancel` lets an in-flight request interrupt itself: the provider
+    /// checks it between body chunks and aborts the read as soon as it is
+    /// set (returning an error the runner maps to a silent
+    /// [`StopReason::Cancelled`]).
+    fn chat(
+        &mut self,
+        messages: &[Message],
+        tools: &[Tool],
+        cancel: &CancelToken,
+    ) -> Result<Vec<Delta>, String>;
 }
 
 /// Reassemble an assistant message from a delta stream (provider-agnostic).
@@ -118,6 +164,10 @@ pub enum StopReason {
     Completed,
     /// Hit the iteration cap before the model finished.
     MaxIterations,
+    /// The caller requested a cancel (Esc in the TUI) at some boundary of the
+    /// run. Whatever already streamed / was already applied stays; no error
+    /// is implied and the stop renders nothing.
+    Cancelled,
 }
 
 /// Every observable thing the runtime emits during a run — the CLI renders this.
@@ -210,28 +260,47 @@ fn push_tool_result(
 /// through the sink. In serial mode each result is appended before the next
 /// call runs (so later tools can observe earlier results in history); in
 /// parallel mode all calls run first and results are appended together.
+///
+/// Checks the cancel token before each dispatch (and after each result, so a
+/// tool that aborted itself mid-run — e.g. a cancelled bash child — does not
+/// push its aborted result). Returns `Ok(true)` when a cancel stopped the
+/// batch before it finished (results already pushed stay; the caller stops
+/// with [`StopReason::Cancelled`]).
 fn execute_tools(
     tools: &[Tool],
     calls: &[ToolCall],
     parallel: bool,
+    cancel: &CancelToken,
     on_event: EventSink<'_>,
     messages: &mut Vec<Message>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     if parallel {
         // Run every call first, then append all results together.
+        if cancel.is_cancelled() {
+            return Ok(true);
+        }
         let results: Vec<(&ToolCall, Result<String, String>)> =
             calls.iter().map(|tc| (tc, dispatch(tools, tc))).collect();
         for (tc, res) in results {
+            if cancel.is_cancelled() {
+                return Ok(true);
+            }
             push_tool_result(tc, res, on_event, messages)?;
         }
     } else {
         // Serial: dispatch and append one call at a time.
         for tc in calls {
+            if cancel.is_cancelled() {
+                return Ok(true);
+            }
             let res = dispatch(tools, tc);
+            if cancel.is_cancelled() {
+                return Ok(true);
+            }
             push_tool_result(tc, res, on_event, messages)?;
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 /// The agent loop over a freshly built `[system, user]` history — the simple
@@ -242,34 +311,69 @@ pub fn run_agent<P: Provider>(
     system: &str,
     user: &str,
     cfg: &RunConfig,
+    cancel: &CancelToken,
 ) -> Result<RunResult, String> {
     let messages = vec![
         Message::text(Role::System, system),
         Message::text(Role::User, user),
     ];
-    run_agent_from_messages(provider, tools, messages, cfg)
+    run_agent_from_messages(provider, tools, messages, cfg, cancel)
 }
 
 /// The shared loop: drives one turn over `messages`, forwarding every event to
 /// `on_event` as it happens, and returns `(updated history, iterations, stop)`.
 /// A sink error (e.g. a renderer failure) aborts the run.
+///
+/// A cancel is honored at every runner boundary (ticket 07): before a
+/// provider call, right after it errors (a provider error that coincides with
+/// a cancel is a silent Cancelled stop, not a propagated error), after its
+/// deltas were streamed (a cancel that landed during the request discards the
+/// half text — no assistant message enters history), and before/after each
+/// tool call. Partial history (already-pushed tool results) is returned
+/// as-is with [`StopReason::Cancelled`].
 fn run_loop<P: Provider>(
     provider: &mut P,
     tools: &[Tool],
     mut messages: Vec<Message>,
     cfg: &RunConfig,
+    cancel: &CancelToken,
     on_event: EventSink<'_>,
 ) -> Result<(Vec<Message>, usize, StopReason), String> {
     let mut stop = StopReason::Completed;
     let mut iterations = 0usize;
 
     for turn in 1..=cfg.max_iterations {
+        // Boundary: a cancel between iterations (or before the first request)
+        // stops before any provider call is made.
+        if cancel.is_cancelled() {
+            stop = StopReason::Cancelled;
+            break;
+        }
         iterations = turn;
         on_event(AgentEvent::Turn { turn })?;
 
-        let deltas = provider.chat(&messages, tools)?;
+        let deltas = match provider.chat(&messages, tools, cancel) {
+            Ok(deltas) => deltas,
+            // A provider error that landed together with a cancel (its
+            // interruptible read aborted) is a silent cancelled stop, not an
+            // error.
+            Err(_) if cancel.is_cancelled() => {
+                stop = StopReason::Cancelled;
+                break;
+            }
+            Err(e) => return Err(e),
+        };
+        // Anything the provider returned was emitted live during the
+        // request; stream it out as it arrived.
         for d in &deltas {
             on_event(AgentEvent::Stream(d.clone()))?;
+        }
+        // A cancel that landed during the request discards the half message:
+        // the streamed deltas stay on the transcript, but no assistant
+        // message enters history.
+        if cancel.is_cancelled() {
+            stop = StopReason::Cancelled;
+            break;
         }
         let (text, tool_calls, reason) = assemble(&deltas);
         let mut asst = Message::text(Role::Assistant, text);
@@ -282,13 +386,18 @@ fn run_loop<P: Provider>(
                 break;
             }
             FinishReason::ToolCalls => {
-                execute_tools(
+                let cancelled = execute_tools(
                     tools,
                     &tool_calls,
                     cfg.parallel_tools,
+                    cancel,
                     on_event,
                     &mut messages,
                 )?;
+                if cancelled {
+                    stop = StopReason::Cancelled;
+                    break;
+                }
                 // fall through to the next turn (tool results are in history)
             }
         }
@@ -310,9 +419,10 @@ pub fn run_agent_from_messages_sink<P: Provider>(
     tools: &[Tool],
     messages: Vec<Message>,
     cfg: &RunConfig,
+    cancel: &CancelToken,
     on_event: EventSink<'_>,
 ) -> Result<Vec<Message>, String> {
-    let (messages, _, _) = run_loop(provider, tools, messages, cfg, on_event)?;
+    let (messages, _, _) = run_loop(provider, tools, messages, cfg, cancel, on_event)?;
     Ok(messages)
 }
 
@@ -326,12 +436,14 @@ pub fn run_agent_from_messages<P: Provider>(
     tools: &[Tool],
     messages: Vec<Message>,
     cfg: &RunConfig,
+    cancel: &CancelToken,
 ) -> Result<RunResult, String> {
     let mut events: Vec<AgentEvent> = Vec::new();
-    let (messages, iterations, stop) = run_loop(provider, tools, messages, cfg, &mut |e| {
-        events.push(e);
-        Ok(())
-    })?;
+    let (messages, iterations, stop) =
+        run_loop(provider, tools, messages, cfg, cancel, &mut |e| {
+            events.push(e);
+            Ok(())
+        })?;
     Ok(RunResult {
         messages,
         iterations,
@@ -376,18 +488,43 @@ mod tests {
     struct FakeProvider {
         script: Vec<Vec<Delta>>,
         calls: usize,
+        /// Optional: cancel the shared token before returning the Nth call's
+        /// batch (1-based), simulating Esc arriving mid-request.
+        cancel_on_call: Option<usize>,
+        cancel: Option<CancelToken>,
     }
 
     impl FakeProvider {
         fn new(script: Vec<Vec<Delta>>) -> Self {
-            Self { script, calls: 0 }
+            Self {
+                script,
+                calls: 0,
+                cancel_on_call: None,
+                cancel: None,
+            }
+        }
+
+        fn cancels_on(mut self, call: usize, token: &CancelToken) -> Self {
+            self.cancel_on_call = Some(call);
+            self.cancel = Some(token.clone());
+            self
         }
     }
 
     impl Provider for FakeProvider {
-        fn chat(&mut self, _messages: &[Message], _tools: &[Tool]) -> Result<Vec<Delta>, String> {
-            let d = self.script.get(self.calls).cloned().unwrap_or_default();
+        fn chat(
+            &mut self,
+            _messages: &[Message],
+            _tools: &[Tool],
+            _cancel: &CancelToken,
+        ) -> Result<Vec<Delta>, String> {
             self.calls += 1;
+            if let (Some(cancel), Some(n)) = (&self.cancel, self.cancel_on_call)
+                && self.calls == n
+            {
+                cancel.cancel();
+            }
+            let d = self.script.get(self.calls - 1).cloned().unwrap_or_default();
             Ok(d)
         }
     }
@@ -426,7 +563,14 @@ mod tests {
         cfg: &RunConfig,
     ) -> Result<RunResult, String> {
         let mut p = FakeProvider::new(script);
-        run_agent(&mut p, &tools, "be helpful", "weather in Beijing?", cfg)
+        run_agent(
+            &mut p,
+            &tools,
+            "be helpful",
+            "weather in Beijing?",
+            cfg,
+            &CancelToken::new(),
+        )
     }
 
     // --- assemble ----------------------------------------------------------
@@ -613,6 +757,7 @@ mod tests {
             &[weather_tool()],
             history.clone(),
             &RunConfig::default(),
+            &CancelToken::new(),
         )
         .unwrap();
         assert_eq!(res.stop, StopReason::Completed);
@@ -629,13 +774,239 @@ mod tests {
     fn provider_error_aborts_the_run() {
         struct ErrProvider;
         impl Provider for ErrProvider {
-            fn chat(&mut self, _m: &[Message], _t: &[Tool]) -> Result<Vec<Delta>, String> {
+            fn chat(
+                &mut self,
+                _m: &[Message],
+                _t: &[Tool],
+                _c: &CancelToken,
+            ) -> Result<Vec<Delta>, String> {
                 Err("provider exploded".to_string())
             }
         }
         let mut p = ErrProvider;
-        let err = run_agent(&mut p, &[], "sys", "user", &RunConfig::default()).unwrap_err();
+        let err = run_agent(
+            &mut p,
+            &[],
+            "sys",
+            "user",
+            &RunConfig::default(),
+            &CancelToken::new(),
+        )
+        .unwrap_err();
         assert!(err.contains("provider exploded"));
+    }
+
+    // --- cancellation (ticket 07) -----------------------------------------
+
+    #[test]
+    fn cancel_token_defaults_false_flips_resets_and_shares() {
+        let t = CancelToken::new();
+        assert!(!t.is_cancelled());
+        t.cancel();
+        assert!(t.is_cancelled());
+        t.reset();
+        assert!(!t.is_cancelled());
+        // Clones observe the same flag.
+        let c = t.clone();
+        t.cancel();
+        assert!(c.is_cancelled());
+        // Default is uncancelled.
+        assert!(!CancelToken::default().is_cancelled());
+    }
+
+    #[test]
+    fn cancel_before_first_chat_stops_without_calling_provider() {
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let mut p = FakeProvider::new(vec![vec![t("never"), done_stop()]]);
+        let res = run_agent(&mut p, &[], "sys", "user", &RunConfig::default(), &cancel).unwrap();
+        assert_eq!(res.stop, StopReason::Cancelled);
+        assert_eq!(p.calls, 0, "no provider call must be made");
+        assert_eq!(res.messages.len(), 2, "history untouched (system + user)");
+        // The cancelled stop is emitted as an event, like every other stop.
+        assert!(
+            res.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Stop(StopReason::Cancelled)))
+        );
+    }
+
+    #[test]
+    fn cancel_during_request_streams_deltas_but_skips_history() {
+        let cancel = CancelToken::new();
+        // One-turn script: the provider arms the cancel before it returns its
+        // batch, simulating Esc landing while the request was streaming.
+        let mut p =
+            FakeProvider::new(vec![vec![t("half text"), done_stop()]]).cancels_on(1, &cancel);
+        let res = run_agent(&mut p, &[], "sys", "user", &RunConfig::default(), &cancel).unwrap();
+        assert_eq!(res.stop, StopReason::Cancelled);
+        // The half text was streamed out live (it stays on the transcript)...
+        assert!(
+            res.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Stream(Delta::Text(t)) if t == "half text"))
+        );
+        // ...but no assistant message enters history (no half-text message).
+        assert_eq!(res.messages.len(), 2);
+    }
+
+    #[test]
+    fn provider_error_while_cancel_set_is_a_silent_cancelled_stop() {
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        struct ErrProvider;
+        impl Provider for ErrProvider {
+            fn chat(
+                &mut self,
+                _m: &[Message],
+                _t: &[Tool],
+                _c: &CancelToken,
+            ) -> Result<Vec<Delta>, String> {
+                Err("request cancelled".to_string())
+            }
+        }
+        let mut p = ErrProvider;
+        let res = run_agent(&mut p, &[], "sys", "user", &RunConfig::default(), &cancel).unwrap();
+        assert_eq!(res.stop, StopReason::Cancelled);
+    }
+
+    #[test]
+    fn cancel_after_turn_one_tools_keeps_pushed_tool_result() {
+        let cancel = CancelToken::new();
+        // Turn 1 calls the weather tool (its result is pushed); the provider
+        // cancels while serving turn 2's request.
+        let mut p = FakeProvider::new(vec![
+            vec![
+                tc_start(0, "call_1", "get_weather"),
+                tc_args(0, "{\"city\": \"Beijing\"}"),
+                done_tools(),
+            ],
+            vec![t("final answer"), done_stop()],
+        ])
+        .cancels_on(2, &cancel);
+        let res = run_agent(
+            &mut p,
+            &[weather_tool()],
+            "sys",
+            "user",
+            &RunConfig::default(),
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(res.stop, StopReason::Cancelled);
+        // The already-pushed tool result stays in history...
+        let tool_msgs: Vec<_> = res
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .collect();
+        assert_eq!(tool_msgs.len(), 1);
+        assert!(tool_msgs[0].text_content().contains("25C"));
+        // ...but the aborted final assistant reply does not (half text rule).
+        assert!(
+            res.messages
+                .iter()
+                .all(|m| !m.text_content().contains("final answer")),
+            "no assistant message from the cancelled turn in history"
+        );
+        // The final text was still streamed live.
+        assert!(
+            res.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Stream(Delta::Text(t)) if t == "final answer"))
+        );
+    }
+
+    #[test]
+    fn cancel_between_serial_tools_keeps_only_completed_results() {
+        let cancel = CancelToken::new();
+        // Tool 2 cancels the run when it executes; tool 3 must never dispatch.
+        let ran: Arc<std::sync::atomic::AtomicUsize> = Default::default();
+        let ran2 = ran.clone();
+        let cancel2 = cancel.clone();
+        let tool = Tool::new("cancel_tool", "cancels", serde_json::json!({}), move |_| {
+            ran2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            cancel2.cancel();
+            Ok("cancelled mid-run".to_string())
+        });
+        let never = Tool::new("never_tool", "never runs", serde_json::json!({}), |_| {
+            Ok("should not run".to_string())
+        });
+        // One turn asks for three tools: weather (completed), cancel_tool
+        // (sets the flag), never_tool (must not dispatch).
+        let script = vec![vec![
+            tc_start(0, "call_1", "get_weather"),
+            tc_args(0, "{}"),
+            tc_start(1, "call_2", "cancel_tool"),
+            tc_args(1, "{}"),
+            tc_start(2, "call_3", "never_tool"),
+            tc_args(2, "{}"),
+            done_tools(),
+        ]];
+        let res = run_agent(
+            &mut FakeProvider::new(script),
+            &[weather_tool(), tool, never],
+            "sys",
+            "user",
+            &RunConfig::default(),
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(res.stop, StopReason::Cancelled);
+        // Tool 2 executed (and cancelled); tool 3 was skipped.
+        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Weather's completed result is in history; the cancelling tool's own
+        // aborted result and the skipped tool's result are not.
+        let tool_msgs: Vec<&Message> = res
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .collect();
+        assert_eq!(tool_msgs.len(), 1);
+        assert!(tool_msgs[0].text_content().contains("25C"));
+    }
+
+    #[test]
+    fn cancel_between_parallel_tools_stops_before_applying_the_batch() {
+        let cancel = CancelToken::new();
+        let ran: Arc<std::sync::atomic::AtomicUsize> = Default::default();
+        let ran2 = ran.clone();
+        let cancel2 = cancel.clone();
+        let flipper = Tool::new(
+            "flip_tool",
+            "flips the token",
+            serde_json::json!({}),
+            move |_| {
+                ran2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                cancel2.cancel();
+                Ok("flipped".to_string())
+            },
+        );
+        let script = vec![vec![
+            tc_start(0, "call_1", "get_weather"),
+            tc_args(0, "{}"),
+            tc_start(1, "call_2", "flip_tool"),
+            tc_args(1, "{}"),
+            done_tools(),
+        ]];
+        let cfg = RunConfig {
+            max_iterations: 5,
+            parallel_tools: true,
+        };
+        let res = run_agent(
+            &mut FakeProvider::new(script),
+            &[weather_tool(), flipper],
+            "sys",
+            "user",
+            &cfg,
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(res.stop, StopReason::Cancelled);
+        // The batch ran in parallel (both dispatched) but the cancel landed
+        // before any result was applied: history has no tool messages.
+        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(res.messages.iter().all(|m| m.role != Role::Tool));
     }
 
     #[test]

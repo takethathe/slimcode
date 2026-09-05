@@ -96,7 +96,35 @@ one-shot 模式没有命令解析器：如果 prompt 以 `/skill:name` 开头，
 slimcode
 ```
 
-**布局**：上部为 transcript（滚动输出区，显示每轮开始标记、流式文本、思考行与工具调用；流式文本与思考行按 delta 逐片段拼接成一行，换行只来自内容本身的 `\n`，不会每个 delta 另起一行；超长行按面板宽度自动折行、不截断；随输出自动滚动到底部），底部为输入框与状态行（当前会话 id、最近的 notice / error）。
+**布局**（pi 对齐，ADR-0006）：顶部启动头部 = bold accent `slimcode` + dim ` v<版本>` + 一行快捷键提示
+（`/help for commands · /skills to run · ↑ history · Ctrl+O expand`）；下方为 transcript
+滚动区；底部 dock = 输入框 + 两行 dim footer。具体显示元素：
+
+- **用户消息**：整段背景色块（`userMessageBg`），内容按 markdown 渲染；
+- **assistant 输出**：流式文本 / 思考分别渲染为 pi 风格的 markdown；思考为
+  italic 灰色（`thinkingText`），与正文区分；流式片段按 delta 合并，换行只来自内容
+  本身的 `\n`，超长行按面板宽度自动折行、不截断，随输出自动滚动到底部；
+- **工具调用**：每个工具为一个状态色块，且**背景色带横贯整行宽度**（从第 1 列到
+  最右列，pad 也带背景色，同 pi `Box` 的 `bgFn`）：状态色 pending 深灰 /
+  success 暗绿 / error 暗红；内置工具头部显示**紧凑调用标题**（pi `format*Call` 风格，
+  `read <path>[:<start[-end]>]`、`ls <path>`、`grep /pattern/ in <scope>`、
+  `find <pattern> in <scope>`、`edit`/`write <path>`、`$ command`），不再铺开 JSON
+  参数；未知工具保留 bold 名 + pretty JSON 兜底。标题下方为灰色输出，超 10 行折叠为
+  `… (N more lines, Ctrl+O to expand)`；`Ctrl+O` 全局展开/折叠所有工具输出；
+- **错误**红字、**notice** dim（`/usage` 汇总行即 dim notice，无独立色块）；
+  不再显示 turn 开始标记、`done` 行或每轮用量行；
+- **滚动**：transcript 滚动超出一屏时，右侧出现滚动条拇指（滚动后约 1 秒自动淡出），
+  `PgUp`/`PgDn` 翻页；
+- **编辑器边框**：语义色——闲置时蓝色（`border`），一轮运行中为青色（`borderAccent`）；
+- **Footer**（dock 底部两行 dim）：第一行 `~/cwd (branch) • session-id`（在 git 仓库内时
+  显示 branch，来自 `git branch --show-current`，尽力而为）；第二行 token 统计
+  `↑in ↓out Rcache WcacheWrite CH{pct}%`（零值省略，pi 紧凑数字格式，如 `↑1.2k`）
+  与右对齐的模型名，超宽时两端截断；每轮结束后更新为累计值；
+- **状态指示器**：一轮运行期间输入框上方出现一行 `⠋ Working...`（braille 旋转帧，
+  约 80ms 一帧，spinner accent、文字 muted），空闲时整行收起不占空间；
+- **终端标题**：进入 TUI 及 `/new` / `/load` 时设为 `slimcode - <session> - <cwd 目录名>`；
+- **补全弹框**：pi SelectList 样式——选中行 `→` 前缀与名称 accent、无反色，描述 muted，
+  超出 5 条时带 muted 滚动窗口标记。
 
 **按键**：
 
@@ -105,10 +133,11 @@ slimcode
 | `Enter` | 提交输入框内容，作为用户消息运行一轮 agent 循环 |
 | `Shift+Enter` | 在输入框中插入换行，支持多行 prompt |
 | `↑` / `↓` | 输入框为空时进入输入历史 recall（从最新一条开始）；recall 中 `↑` 更早、`↓` 更新，`↓` 到最新再按退出到空输入；输入非空时移动光标 |
-| `PgUp` / `PgDn` | transcript 上/下翻页；`/` 补全弹框打开时改为翻页候选列表 |
+| `PgUp` / `PgDn` | transcript 上/下翻页（触发/维持滚动条显示）；`/` 补全弹框打开时改为翻页候选列表 |
 | `Tab` | 输入 `/` 前缀时把补全弹框中选中的候选**上屏**到输入框（尾部自动加空格、光标落在其后，不提交）；无候选时强制打开弹框 |
-| `Esc` | 关闭 `/` 补全弹框（保留已输入文本） |
-| `Ctrl+C` / `Ctrl+D` | 退出 TUI（恢复终端） |
+| `Esc` | 空闲时关闭 `/` 补全弹框（保留已输入文本）；**一轮运行中取消当前 turn**（在途 LLM 请求/工具调用/长 `bash` 都会在下一边界中止，已流式内容保留、不报错、输入框恢复可用） |
+| `Ctrl+O` | 全局展开/折叠所有工具输出（展开时透出折叠截断的剩余行） |
+| `Ctrl+C` / `Ctrl+D` | 空闲时退出 TUI（恢复终端）；一轮运行中则标记为运行结束后退出（本轮不被中断，期间其它按键忽略、输入框不可编辑） |
 
 recall 状态下按 `Enter` 会把选中的历史 prompt 作为**新一轮**运行（不再写入历史）。
 
@@ -257,3 +286,7 @@ messages, title}`。`/load` 恢复会话后，历史消息（含系统提示）�
 agent 在启动目录内可用七种工具：`read`、`write`、`edit`、`bash`、`grep`、
 `find`、`ls`。工具调用默认串行执行；工具失败会以 `Error: …` 反馈给模型供其
 自行纠正。
+
+`read` 除 `path` 外还接受可选参数 `offset`（1 起始的起始行）与 `limit`（最多返回
+行数）：`offset` 不带 `limit` 读到文件末尾，`limit` 不带 `offset` 从第 1 行起读；
+越界/零 `limit` 返回空窗。TUI 中 `read` 块的标题带行窗（如 `read a.txt:10-20`）。

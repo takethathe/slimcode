@@ -119,6 +119,11 @@ fn render_structural(item: &DisplayItem) -> String {
         DisplayItem::Stop(StopReason::MaxIterations) => {
             "⚠ stopped: max iterations reached".to_string()
         }
+        // The one-shot CLI never sets the cancel token, so a Cancelled stop
+        // cannot reach it (Esc cancellation is a TUI-only path).
+        DisplayItem::Stop(StopReason::Cancelled) => {
+            unreachable!("the one-shot CLI never cancels a turn")
+        }
         DisplayItem::Text(_) | DisplayItem::Reasoning(_) | DisplayItem::Usage(_) => {
             unreachable!("Text, Reasoning and Usage are handled by TextRenderer::render")
         }
