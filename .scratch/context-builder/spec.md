@@ -60,7 +60,7 @@ builder 提供默认 system。CLI 的两个入口改为消费同一个 builder�
     组装并返回消息列表。
 - `build()` 语义（与现有 `messages_for_prompt` 对齐）：
   - 组装最终 system 文本 = 基础 system（默认或 `with_system` 覆盖）+ skills 段落
-    （`## Available skills` + 反引号 `/name` bullet 列表，仅含
+    （`## Skills` + 每 skill 一行 `- name: description [Read from <file>]` bullet，仅含
     `disable_model_invocation: false` 的 skill；markdown 结构与现状一致）。
   - `history` 为空 → 前置 `Role::System` 消息；`history` 非空 → 不重复插入 system。
   - 末尾追加 `Role::User` 消息（user prompt 或 skill 触发内容）。

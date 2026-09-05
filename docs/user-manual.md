@@ -83,6 +83,10 @@ slimcode --model qwen-max "为 README 补一段简介"
 `tokens: 3019 prompt (2048 cached, 67.8%) + 104 completion = 3123 total`）与本次会话的
 保存路径。
 
+one-shot 模式没有命令解析器：如果 prompt 以 `/skill:name` 开头，它会被自动改写为
+`/{name}` 引用形式再交给模型（模型从系统提示词的 `## Skills` 索引得知
+`/{name}` 是显式 skill 引用），避免 `/skill:` 前缀原样进入 LLM 消息。
+
 ### 交互式 TUI
 
 不带参数启动（stdout 是终端）即进入全屏 TUI，会话在每一轮后自动保存到
@@ -119,7 +123,8 @@ recall 状态下按 `Enter` 会把选中的历史 prompt 作为**新一轮**运�
   不提交；
 - `Enter` 把选中项展开为完整命令名后**直接提交执行**（而不是提交你正在输入的部分文本）；
 - `Esc` 取消弹框、保留已输入文本；继续输入字符实时过滤，输入空格（进入参数段）时弹框关闭；
-- 候选值始终是裸拼写（如 `/save`、`/resume`、`/skill-name`），不含 `usage` 中的参数占位符；
+- 候选值是命令的裸拼写（如 `/save`、`/resume`）或 skill 的规范触发 `/skill:name`，
+  不含 `usage` 中的参数占位符；
 - 输入 `/` 后无候选时弹框不显示。
 
 弹框只在前端 TUI 出现；命令定义、模糊匹配与候选合并都在前端无关的
@@ -170,14 +175,15 @@ description: What this skill does and when to use it
 disable-model-invocation: true   # 可选；省略 = false
 ---
 
-# 正文（触发 /my-skill 时作为指令交给 agent）
+# 正文（触发 /skill:my-skill 时作为指令交给 agent）
 ```
 
-- `name`：触发名（`/name`），只能是字母、数字、`_`、`-`，不能与内置命令重名；
+- `name`：触发名（`/skill:name`），只能是字母、数字、`_`、`-`，不能与内置命令重名；
 - `description`：一句话说明（用于 `/skills` 列表与系统提示词）；
 - `disable-model-invocation`：可选。设为 `true` 时该 skill 的**描述不会写入系统提示词**
-  （agent 不会自动得知/调用它），只能通过显式 `/name` 触发；省略或 `false` 时描述会
-  进入系统提示词，agent 可按需选用。
+  （agent 不会自动得知/调用它），只能通过显式 `/skill:name` 触发；省略或 `false` 时描述
+  会以 `## Skills` markdown 索引的一行（`- name: description [Read from <file>]`，`file`
+  是该 skill 的 `SKILL.md` 路径）进入系统提示词，agent 可按需用 `read` 工具读取。
 
 #### 作用域（user / project）
 
@@ -203,19 +209,27 @@ frontmatter 的 `name`，与所在深度无关。同一 scope 内同名冲突时
 /install-skill ~/skills/tdd --user
 /install-skill ./my-skill.md --project
 /skills
-/tdd 为这个模块补测试
+/skill:tdd 为这个模块补测试
 ```
 
 - `/install-skill <path> --user|--project`：把目录（含 `SKILL.md`）或单个 markdown
   文件复制到对应 scope，`--user` 与 `--project` 二选一；同名 skill 会被覆盖更新；
   与内置命令重名的 skill 会被拒绝安装；安装成功后立即生效——新 skill 无需重启即可
-  出现在 `/` 补全弹框、未知 `/` 的预测提示中，也可直接 `/name` 触发；
-- `/skills`：列出已安装 skill（触发名、描述、manual-only 标记、scope）；
-- `/name [任务]`：触发一个 skill，把其正文（+ 可选任务，另附 skill 所在目录，
-  供正文里的相对路径解析）作为一轮 agent 指令执行；与其它 `/` 命令一样，skill
-  触发**不**写入输入历史；
+  出现在 `/` 补全弹框、未知 `/` 的预测提示中，也可直接 `/skill:name` 触发；
+- `/skills`：列出已安装 skill（`/skill:name` 触发名、描述、manual-only 标记、scope）；
+- `/skill:name [任务]`：触发一个 skill，把其正文（+ 可选任务）作为一轮 agent 指令
+  执行，以 pi 风格的 `<skill name location>` XML 块注入本轮 user 消息，并附
+  `References are relative to <skill 目录>.` 一行供正文里的相对路径解析；与其它 `/`
+  命令一样，skill 触发**不**写入输入历史；`/skill:` 前缀只出现在命令输入中，注入到
+  LLM 的消息里是 skill 正文本身（而非 `/skill:name` 文本）；
+- 系统提示词：可自动调用的 skill 以 `## Skills` markdown 索引广告给模型（每 skill 一行
+  `- name: description [Read from <file>]`，`file` 是 `SKILL.md` 路径），并说明模型可按
+  名字/描述匹配即用，或按用户显式 `/{name}` 引用触发；
+- 去重：同一会话中若该 skill 已在更早的 message 加载过，则本次注入只保留
+  `<skill name location>` 外壳与 base-dir 说明行，正文替换为一段 “already loaded”
+  提示，让模型去更早的 message 里找指令，避免重复加载；
 - 预测提示：输入未知的 `/` 前缀时，候选同时包含内置命令与 skill（如 `/td` →
-  `did you mean: /tdd`）；裸 `/` 列出全部。
+  `did you mean: /skill:tdd`）；裸 `/` 列出全部。
 
 
 ### 输入历史与多行 prompt
@@ -224,8 +238,10 @@ frontmatter 的 `name`，与所在深度无关。同一 scope 内同名冲突时
 普通 prompt，存于 `~/.slimcode/history.json`（JSON 数组，上限 500 条，超出丢最旧），
 跨运行保留；`/` 命令不记入。`/!N` 编号以 `1` = 最新，重跑沿用当前会话、保留消息历史。
 
-多行 prompt：在 TUI 输入框中按 `Shift+Enter` 插入换行，按 `Enter` 提交整个多行
-prompt 为**一条**用户消息；多行 prompt 中的 `/` 开头行是 prompt 内容而非命令。
+多行 prompt：在 TUI 输入框中按 `Shift+Enter`（或 `Ctrl+J`）插入换行，按 `Enter`
+提交整个多行 prompt 为**一条**用户消息；多行 prompt 中的 `/` 开头行是 prompt 内容
+而非命令。输入框高度随内容（自动折行后）增长，上限为终端高度的 30%，超长内容在
+框内滚动、光标始终可见（pi 风格编辑器）。
 （ADR-0001 的 `\` 续行方案随行式 REPL 一并移除——raw mode 下 Shift+Enter 与 Enter
 可区分，故 Shift+Enter 成为多行换行键，Enter 直接提交。）
 

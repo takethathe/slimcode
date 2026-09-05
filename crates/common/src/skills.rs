@@ -5,13 +5,13 @@
 //! `disable-model-invocation` flag. Skills are discovered from two scopes —
 //! user (`<home>/skills/`) and project (`<cwd>/.slimcode/skills/`) — by
 //! recursively scanning for `SKILL.md` at any depth (category folders such as
-//! `skills/engineering/…` are walked through), and are
-//! triggered from an interactive frontend (the TUI) as `/name` commands, just
-//! like the built-in commands. Only skills whose `disable_model_invocation` is
-//! false have their description advertised to the model (via the system
-//! prompt); a skill marked `disable-model-invocation: true` is available only
-//! through an explicit
-//! `/name` trigger.
+//! `skills/engineering/…` are walked through), and are triggered from an
+//! interactive frontend (the TUI) as `/skill:name` commands. Only skills whose
+//! `disable_model_invocation` is false are advertised to the model (via the
+//! system prompt's `## Skills` markdown index, each bullet carrying the
+//! `SKILL.md` location so the model can `read` it); a skill marked
+//! `disable-model-invocation: true` is available only through an explicit
+//! `/skill:name` trigger.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -34,7 +34,7 @@ pub struct Skill {
     pub name: String,
     pub description: String,
     /// When true the skill is NOT advertised in the system prompt and is only
-    /// reachable through an explicit `/name` trigger.
+    /// reachable through an explicit `/skill:name` trigger.
     pub disable_model_invocation: bool,
     /// The markdown body (everything after the frontmatter block).
     pub body: String,
@@ -43,14 +43,20 @@ pub struct Skill {
     /// paths in the body resolve against this directory; it is injected into
     /// the skill-trigger prompt so the model can find referenced assets.
     pub dir: PathBuf,
+    /// The on-disk skill file (`<dir>/SKILL.md`, or the single-file `.md`
+    /// itself for root-level skills). Advertised as `[Read from <file>]` in
+    /// the system prompt's skills index so the model can `read` it.
+    pub file: PathBuf,
 }
 
 impl Skill {
-    /// Set the on-disk directory and return the skill. Producers that know the
-    /// location (`SkillStore`) call this; `parse_skill` leaves `dir` empty
-    /// because it only sees the markdown text, not where it came from.
-    fn with_dir(mut self, dir: PathBuf) -> Self {
+    /// Set the on-disk location (skill directory + skill file) and return the
+    /// skill. Producers that know the location (`SkillStore`) call this;
+    /// `parse_skill` leaves `dir`/`file` empty because it only sees the
+    /// markdown text, not where it came from.
+    fn at(mut self, dir: PathBuf, file: PathBuf) -> Self {
         self.dir = dir;
+        self.file = file;
         self
     }
 }
@@ -118,7 +124,8 @@ impl SkillStore {
         let (content, _) = read_source(source)?;
         let skill = parse_skill(&content, scope)?;
         let dir = self.skill_dir(scope, &skill.name);
-        Ok(skill.with_dir(dir))
+        let file = dir.join("SKILL.md");
+        Ok(skill.at(dir, file))
     }
 
     /// Install `source` into a scope, returning the parsed skill. `source` is
@@ -138,44 +145,133 @@ impl SkillStore {
         fs::write(target.join("SKILL.md"), content)
             .map_err(|e| format!("{}: {e}", target.join("SKILL.md").display()))?;
 
-        Ok(skill.with_dir(target))
+        let file = target.join("SKILL.md");
+        Ok(skill.at(target, file))
     }
 }
 
-/// Resolve a skill by its canonical or `/`-prefixed name (exact, case-sensitive).
+/// Resolve a skill by its canonical name or `/`-prefixed spelling, in either
+/// the `/skill:name` (canonical) or bare `/name` (legacy) form — exact,
+/// case-sensitive.
 pub fn find_skill<'a>(skills: &'a [Skill], name: &str) -> Option<&'a Skill> {
     let name = name.strip_prefix('/').unwrap_or(name);
+    let name = name.strip_prefix("skill:").unwrap_or(name);
     skills.iter().find(|s| s.name == name)
 }
 
+/// The canonical slash trigger spelling for a skill (`/skill:name`).
+pub fn skill_trigger(name: &str) -> String {
+    format!("/skill:{name}")
+}
+
+/// Rewrite a leading `/skill:{name}` trigger in a raw prompt to the `/{name}`
+/// form the model knows (the CLI one-shot path has no command parser, so a
+/// `/skill:` prefix typed there would otherwise reach the LLM literally).
+/// Only a leading trigger is rewritten; `/skill:` in the middle of a prompt is
+/// ordinary text.
+pub fn normalize_skill_trigger(prompt: &str) -> String {
+    let trimmed = prompt.trim_start();
+    match trimmed.strip_prefix("/skill:") {
+        Some(rest) if !rest.is_empty() && !rest.starts_with(char::is_whitespace) => {
+            let indent = &prompt[..prompt.len() - trimmed.len()];
+            format!("{indent}/{rest}")
+        }
+        _ => prompt.to_string(),
+    }
+}
+
 /// Predict skills matching a partial `/` input. A non-`/` input yields none;
-/// `/` alone yields every skill.
+/// `/` alone yields every skill. The `/skill:` prefix of the canonical trigger
+/// is stripped so `/skill:gr` matches skill `gr…`.
 pub fn suggest_skills<'a>(skills: &'a [Skill], input: &str) -> Vec<&'a Skill> {
     let input = input.trim();
     if !input.starts_with('/') {
         return Vec::new();
     }
     let prefix = input.strip_prefix('/').unwrap_or(input);
+    let prefix = prefix.strip_prefix("skill:").unwrap_or(prefix);
     skills
         .iter()
         .filter(|s| s.name.starts_with(prefix))
         .collect()
 }
 
-/// The markdown content a skill trigger submits as the user message: an
-/// instruction header (plus the skill's directory when known, so the model can
-/// resolve relative paths in the body), the skill body, and an optional task.
-pub fn skill_prompt(skill: &Skill, arg: Option<&str>) -> String {
-    let mut prompt = String::from("Use the following skill instructions to complete the task.");
-    if !skill.dir.as_os_str().is_empty() {
-        prompt.push_str(&format!("\nSkill directory: {}", skill.dir.display()));
+/// The user message a skill trigger submits: an XML `<skill>` block carrying
+/// the skill's name, its `SKILL.md` location, and a base-dir reference line,
+/// followed by the skill body — or, when `already_loaded` is true (the skill
+/// was already injected into an earlier message of this conversation), a short
+/// notice pointing at that earlier message instead of repeating the body — and
+/// then an optional task argument. Mirrors pi's `/skill:name` expansion.
+pub fn skill_prompt(skill: &Skill, arg: Option<&str>, already_loaded: bool) -> String {
+    let mut prompt = format!(
+        "<skill name=\"{}\" location=\"{}\">\nReferences are relative to {}.\n",
+        escape_xml(&skill.name),
+        escape_xml(&skill.file.display().to_string()),
+        escape_xml(&skill.dir.display().to_string()),
+    );
+    if already_loaded {
+        prompt.push_str(&format!(
+            "\nThis skill's instructions were already loaded in a previous message \
+             (search the conversation for `<skill name=\"{}\">`). They are not repeated here; \
+             refer to the earlier message.\n",
+            escape_xml(&skill.name),
+        ));
+    } else {
+        prompt.push_str(&format!("\n{}\n", skill.body.trim()));
     }
-    prompt.push_str(&format!("\n\n# {}\n\n{}", skill.name, skill.body.trim()));
+    prompt.push_str("</skill>");
     if let Some(arg) = arg.filter(|a| !a.is_empty()) {
-        prompt.push_str("\n\nTask: ");
-        prompt.push_str(arg);
+        prompt.push_str(&format!("\n\n{arg}"));
     }
     prompt
+}
+
+/// Escape a string for safe inclusion in an XML element/attribute (Agent
+/// Skills prompt format).
+pub fn escape_xml(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// Format auto-invokable skills (those without `disable-model-invocation:
+/// true`) for the system prompt, as a markdown skill index: a short "when to
+/// use" header plus one bullet per skill (`- name: description [Read from
+/// <file>]`). Each bullet co-locates the trigger (name + description) with
+/// how to reach the full instructions (the `SKILL.md` path), so the model
+/// can `read` a skill on demand. Returns "" when no skill is auto-invokable.
+pub fn format_skills_for_prompt(skills: &[Skill]) -> String {
+    let visible: Vec<&Skill> = skills
+        .iter()
+        .filter(|s| !s.disable_model_invocation)
+        .collect();
+    if visible.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "\n## Skills\n\n\
+         Use a skill when its name or description matches the task, or when the user references it \
+         explicitly as /{name}. Read the file and follow its instructions. When a skill file \
+         references a relative path, resolve it against the skill directory and use the absolute \
+         path in tool commands.\n",
+    );
+    for skill in visible {
+        out.push_str(&format!(
+            "- {name}: {description} [Read from {path}]\n",
+            name = skill.name,
+            description = flatten_whitespace(&skill.description),
+            path = skill.file.display(),
+        ));
+    }
+    out
+}
+
+/// Collapse internal whitespace (including line breaks) so a one-line
+/// markdown bullet stays on one line.
+fn flatten_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Parse a `SKILL.md` file's frontmatter + body.
@@ -198,6 +294,7 @@ fn parse_skill(content: &str, scope: SkillScope) -> Result<Skill, String> {
         body: body.to_string(),
         scope,
         dir: PathBuf::new(),
+        file: PathBuf::new(),
     })
 }
 
@@ -374,7 +471,7 @@ fn walk_skill_dir(
             if skill_md.is_file() {
                 let content = fs::read_to_string(&skill_md)
                     .map_err(|e| format!("{}: {e}", skill_md.display()))?;
-                out.push(parse_skill(&content, scope)?.with_dir(path));
+                out.push(parse_skill(&content, scope)?.at(path, skill_md));
             } else {
                 walk_skill_dir(&path, false, scope, out)?;
             }
@@ -383,7 +480,7 @@ fn walk_skill_dir(
             // root is the closest base for relative references.
             let content =
                 fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-            out.push(parse_skill(&content, scope)?.with_dir(dir.to_path_buf()));
+            out.push(parse_skill(&content, scope)?.at(dir.to_path_buf(), path));
         }
     }
     Ok(())
@@ -451,7 +548,7 @@ fn set_once<T>(slot: &mut Option<T>, value: T, what: &str) -> Result<(), String>
 pub fn combined_suggestions(skills: &[Skill], input: &str) -> Vec<String> {
     let mut out: Vec<String> = suggest(input).iter().map(|c| c.usage.to_string()).collect();
     for s in suggest_skills(skills, input) {
-        out.push(format!("/{}", s.name));
+        out.push(skill_trigger(&s.name));
     }
     out
 }
@@ -461,7 +558,7 @@ pub fn combined_suggestions(skills: &[Skill], input: &str) -> Vec<String> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompletionItem {
     /// The `/`-prefixed spelling to commit (e.g. `/save`, `/resume`, or
-    /// `/skill-name`). Unlike [`combined_suggestions`], this is the bare
+    /// `/skill:name`). Unlike [`combined_suggestions`], this is the bare
     /// spelling — never the usage string with its argument placeholder.
     pub value: String,
     pub description: String,
@@ -471,6 +568,7 @@ pub struct CompletionItem {
 /// spelling (canonical name and aliases) plus every installed skill, fuzzy
 /// matched and sorted best-first. A bare `/` yields every candidate in
 /// registry order (commands first, then skills); a non-`/` input yields none.
+/// Skills are advertised under their canonical `/skill:name` spelling.
 pub fn complete(input: &str, skills: &[Skill]) -> Vec<CompletionItem> {
     let trimmed = input.trim();
     if !trimmed.starts_with('/') {
@@ -479,7 +577,7 @@ pub fn complete(input: &str, skills: &[Skill]) -> Vec<CompletionItem> {
     let query = trimmed.strip_prefix('/').unwrap_or(trimmed);
 
     // Candidate pool: every command spelling (canonical + alias) then every
-    // skill, as `/name`. Commands first keeps the registry order for the
+    // skill, as `skill:name`. Commands first keeps the registry order for the
     // bare-`/` case; aliases are real spellings, so `/res` completes to
     // `/resume` which `find` resolves back to `/load`.
     let mut pool: Vec<(&str, &'static str)> = Vec::new();
@@ -491,9 +589,11 @@ pub fn complete(input: &str, skills: &[Skill]) -> Vec<CompletionItem> {
             pool.push((bare, command.description));
         }
     }
-    let skill_pool: Vec<(&str, String)> = skills
+    // Skills pool under their canonical `/skill:name` spelling (matched with
+    // the `skill:` prefix so `/gr` still finds `/skill:grill`).
+    let skill_pool: Vec<(String, String)> = skills
         .iter()
-        .map(|s| (s.name.as_str(), s.description.clone()))
+        .map(|s| (skill_trigger(&s.name), s.description.clone()))
         .collect();
 
     let mut scored: Vec<(i64, usize, CompletionItem)> = Vec::new();
@@ -507,7 +607,7 @@ pub fn complete(input: &str, skills: &[Skill]) -> Vec<CompletionItem> {
             })
             .collect();
         out.extend(skill_pool.into_iter().map(|(name, desc)| CompletionItem {
-            value: format!("/{name}"),
+            value: name,
             description: desc,
         }));
         return out;
@@ -528,13 +628,13 @@ pub fn complete(input: &str, skills: &[Skill]) -> Vec<CompletionItem> {
         }
     }
     for (name, desc) in skill_pool {
-        if let Some(score) = fuzzy_match(query, name) {
+        if let Some(score) = fuzzy_match(query, &name) {
             let idx = scored.len();
             scored.push((
                 score,
                 idx,
                 CompletionItem {
-                    value: format!("/{name}"),
+                    value: name,
                     description: desc,
                 },
             ));
@@ -611,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn find_skill_matches_exact_and_prefixed() {
+    fn find_skill_matches_exact_prefixed_and_skill_trigger() {
         let s = parse_skill(&skill_md(""), SkillScope::User).unwrap();
         assert_eq!(
             find_skill(std::slice::from_ref(&s), "demo").unwrap().name,
@@ -621,11 +721,48 @@ mod tests {
             find_skill(std::slice::from_ref(&s), "/demo").unwrap().name,
             "demo"
         );
+        assert_eq!(
+            find_skill(std::slice::from_ref(&s), "/skill:demo")
+                .unwrap()
+                .name,
+            "demo"
+        );
+        assert_eq!(
+            find_skill(std::slice::from_ref(&s), "skill:demo")
+                .unwrap()
+                .name,
+            "demo"
+        );
         assert!(find_skill(&[s], "/nope").is_none());
     }
 
     #[test]
-    fn suggest_skills_prefix_matches_and_handles_bare_slash() {
+    fn normalize_skill_trigger_rewrites_leading_trigger_only() {
+        // A leading `/skill:{name}` trigger becomes the `/{name}` form.
+        assert_eq!(normalize_skill_trigger("/skill:grill"), "/grill");
+        assert_eq!(
+            normalize_skill_trigger("/skill:grill do it now"),
+            "/grill do it now"
+        );
+        // Leading whitespace is preserved, only the trigger is rewritten.
+        assert_eq!(normalize_skill_trigger("  /skill:grill hi"), "  /grill hi");
+        // Bare `/{name}` and plain prompts pass through unchanged.
+        assert_eq!(normalize_skill_trigger("/grill"), "/grill");
+        assert_eq!(
+            normalize_skill_trigger("review this diff"),
+            "review this diff"
+        );
+        // `/skill:` in the middle of a prompt is ordinary text, not a trigger.
+        assert_eq!(
+            normalize_skill_trigger("run /skill:grill after this"),
+            "run /skill:grill after this"
+        );
+        // A bare `/skill:` with nothing after it is not a trigger.
+        assert_eq!(normalize_skill_trigger("/skill:"), "/skill:");
+    }
+
+    #[test]
+    fn suggest_skills_prefix_matches_and_handles_bare_slash_and_skill_prefix() {
         let a = parse_skill(
             "---\nname: alpha\ndescription: a\n---\nb\n",
             SkillScope::User,
@@ -640,31 +777,113 @@ mod tests {
         assert_eq!(suggest_skills(&skills, "/").len(), 2);
         assert_eq!(suggest_skills(&skills, "/al").len(), 1);
         assert_eq!(suggest_skills(&skills, "/al")[0].name, "alpha");
+        // The canonical `/skill:` prefix is stripped before matching.
+        assert_eq!(suggest_skills(&skills, "/skill:al").len(), 1);
+        assert_eq!(suggest_skills(&skills, "/skill:al")[0].name, "alpha");
         assert!(suggest_skills(&skills, "al").is_empty());
     }
 
     #[test]
-    fn skill_prompt_embeds_body_and_optional_task() {
-        let s = parse_skill(&skill_md(""), SkillScope::User).unwrap();
-        let p = skill_prompt(&s, None);
-        assert!(p.contains("Do the demo."));
-        assert!(!p.contains("Task:"));
-        assert!(!p.contains("Skill directory"), "got: {p}");
-        let p = skill_prompt(&s, Some("run it now"));
-        assert!(p.ends_with("Task: run it now"));
-    }
-
-    #[test]
-    fn skill_prompt_embeds_directory_when_set() {
-        let s = parse_skill(&skill_md(""), SkillScope::User)
-            .unwrap()
-            .with_dir(PathBuf::from("/home/u/skills/demo"));
-        let p = skill_prompt(&s, None);
+    fn skill_prompt_uses_xml_skill_block_and_optional_task() {
+        let s = parse_skill(&skill_md(""), SkillScope::User).unwrap().at(
+            PathBuf::from("/home/u/skills/demo"),
+            PathBuf::from("/home/u/skills/demo/SKILL.md"),
+        );
+        let p = skill_prompt(&s, None, false);
         assert!(
-            p.contains("Skill directory: /home/u/skills/demo"),
+            p.starts_with(
+                "<skill name=\"demo\" location=\"/home/u/skills/demo/SKILL.md\">\nReferences are relative to /home/u/skills/demo.\n"
+            ),
             "got: {p}"
         );
         assert!(p.contains("Do the demo."));
+        assert!(p.ends_with("</skill>"));
+        assert!(!p.contains("Task:"), "got: {p}");
+
+        let p = skill_prompt(&s, Some("run it now"), false);
+        assert!(p.ends_with("</skill>\n\nrun it now"), "got: {p}");
+    }
+
+    #[test]
+    fn skill_prompt_replaces_body_with_already_loaded_notice() {
+        let s = parse_skill(&skill_md(""), SkillScope::User).unwrap().at(
+            PathBuf::from("/home/u/skills/demo"),
+            PathBuf::from("/home/u/skills/demo/SKILL.md"),
+        );
+        let p = skill_prompt(&s, None, true);
+        // The base-dir reference line is kept.
+        assert!(
+            p.contains("References are relative to /home/u/skills/demo."),
+            "got: {p}"
+        );
+        // The body is replaced by an already-loaded notice.
+        assert!(!p.contains("Do the demo."), "got: {p}");
+        assert!(p.contains("already loaded"), "got: {p}");
+        assert!(p.contains("previous message"), "got: {p}");
+        assert!(p.ends_with("</skill>"));
+    }
+
+    #[test]
+    fn escape_xml_escapes_five_entities() {
+        assert_eq!(
+            escape_xml("a&b<c>d\"e'f"),
+            "a&amp;b&lt;c&gt;d&quot;e&apos;f"
+        );
+    }
+
+    #[test]
+    fn format_skills_for_prompt_filters_and_lists_location() {
+        let auto = parse_skill(
+            "---\nname: tdd\ndescription: test first\n---\nb\n",
+            SkillScope::User,
+        )
+        .unwrap()
+        .at(PathBuf::from("/s/tdd"), PathBuf::from("/s/tdd/SKILL.md"));
+        let manual = parse_skill(
+            "---\nname: grill\ndescription: stress-test a plan\ndisable-model-invocation: true\n---\nb\n",
+            SkillScope::User,
+        )
+        .unwrap()
+        .at(
+            PathBuf::from("/s/grill"),
+            PathBuf::from("/s/grill/SKILL.md"),
+        );
+        let out = format_skills_for_prompt(&[auto, manual]);
+        assert!(out.contains("## Skills"), "got: {out}");
+        assert!(
+            out.contains("- tdd: test first [Read from /s/tdd/SKILL.md]"),
+            "got: {out}"
+        );
+        assert!(!out.contains("grill"), "got: {out}");
+        assert!(
+            out.contains(
+                "Use a skill when its name or description matches the task, or when the user \
+                 references it explicitly as /{name}."
+            ),
+            "got: {out}"
+        );
+        assert!(
+            out.contains("Read the file and follow its instructions."),
+            "got: {out}"
+        );
+        assert!(
+            out.contains(
+                "When a skill file references a relative path, resolve it against the skill directory \
+                 and use the absolute path in tool commands."
+            ),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn format_skills_for_prompt_empty_when_no_auto_skills() {
+        let manual = parse_skill(
+            "---\nname: grill\ndescription: d\ndisable-model-invocation: true\n---\nb\n",
+            SkillScope::User,
+        )
+        .unwrap();
+        assert!(format_skills_for_prompt(&[manual]).is_empty());
+        assert!(format_skills_for_prompt(&[]).is_empty());
     }
 
     #[test]
@@ -776,16 +995,23 @@ mod tests {
         let tdd = find_skill(&skills, "tdd").unwrap();
         assert_eq!(tdd.scope, SkillScope::User);
         assert_eq!(tdd.dir, root.join("engineering").join("tdd"));
+        assert_eq!(
+            tdd.file,
+            root.join("engineering").join("tdd").join("SKILL.md")
+        );
         assert_eq!(tdd.body, "red green refactor\n");
 
-        // Root-level single-file skills keep the skills root as their base.
+        // Root-level single-file skills keep the skills root as their base and
+        // the `.md` file itself as the skill file.
         let plain = find_skill(&skills, "plain").unwrap();
         assert_eq!(plain.dir, root);
+        assert_eq!(plain.file, root.join("plain.md"));
 
-        // The nested skill is triggerable via the `/` completion popup.
+        // The nested skill is triggerable via the `/` completion popup under
+        // its canonical `/skill:name` spelling.
         let items = complete("/tdd", &skills);
         let values: Vec<&str> = items.iter().map(|i| i.value.as_str()).collect();
-        assert!(values.contains(&"/tdd"), "got: {values:?}");
+        assert!(values.contains(&"/skill:tdd"), "got: {values:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -931,7 +1157,8 @@ mod tests {
         .unwrap();
         let got = combined_suggestions(&[s], "/hist");
         assert!(got.contains(&"/history".to_string()), "got: {got:?}");
-        assert!(got.contains(&"/histo".to_string()), "got: {got:?}");
+        // Skills surface under their canonical `/skill:name` spelling.
+        assert!(got.contains(&"/skill:histo".to_string()), "got: {got:?}");
     }
 
     // --- completion popup candidates --------------------------------------
@@ -945,11 +1172,12 @@ mod tests {
         .unwrap();
         let items = complete("/", &[s]);
         let values: Vec<&str> = items.iter().map(|i| i.value.as_str()).collect();
-        // Every command spelling (canonical + alias) precedes skills.
+        // Every command spelling (canonical + alias) precedes skills, which
+        // appear under their canonical `/skill:name` spelling.
         assert!(values.contains(&"/help"));
         assert!(values.contains(&"/resume")); // alias of /load
-        assert!(values.contains(&"/grill"));
-        assert_eq!(*values.last().unwrap(), "/grill");
+        assert!(values.contains(&"/skill:grill"));
+        assert_eq!(*values.last().unwrap(), "/skill:grill");
         let help = items.iter().find(|i| i.value == "/help").unwrap();
         assert_eq!(help.description, "list commands");
     }
@@ -982,9 +1210,13 @@ mod tests {
             SkillScope::User,
         )
         .unwrap();
-        let items = complete("/gr", &[s]);
+        let items = complete("/gr", std::slice::from_ref(&s));
         let values: Vec<&str> = items.iter().map(|i| i.value.as_str()).collect();
-        assert!(values.contains(&"/grill"), "got: {values:?}");
+        assert!(values.contains(&"/skill:grill"), "got: {values:?}");
+        // The canonical `/skill:` prefix also completes.
+        let items = complete("/skill:gr", std::slice::from_ref(&s));
+        let values: Vec<&str> = items.iter().map(|i| i.value.as_str()).collect();
+        assert!(values.contains(&"/skill:grill"), "got: {values:?}");
     }
 
     #[test]
@@ -999,10 +1231,13 @@ mod tests {
         let items = complete("/sav", &[s]);
         let values: Vec<&str> = items.iter().map(|i| i.value.as_str()).collect();
         assert_eq!(*values.first().unwrap(), "/save");
-        assert!(values.contains(&"/save-notes"), "got: {values:?}");
+        assert!(values.contains(&"/skill:save-notes"), "got: {values:?}");
         // The fuzzy order places the contiguous match first.
         let save = items.iter().position(|i| i.value == "/save").unwrap();
-        let notes = items.iter().position(|i| i.value == "/save-notes").unwrap();
+        let notes = items
+            .iter()
+            .position(|i| i.value == "/skill:save-notes")
+            .unwrap();
         assert!(save < notes, "{values:?}");
     }
 

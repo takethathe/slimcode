@@ -147,19 +147,29 @@ cargo workspace，六个 crate：
   下钻；同 scope 同名时最浅目录优先、路径排序保证确定性；同名时 project 优先）、
   `install`（目录或单文件源，落为
   `<scope>/skills/<name>/SKILL.md`）、纯函数 `find_skill` / `suggest_skills` /
-  `skill_prompt`；`disable-model-invocation: true` 的 skill 不进系统提示词，
-  只通过显式 `/name` 触发；`Skill` 携带 `dir`（发现/安装时确定），
-  `skill_prompt` 把它注入触发消息，供模型解析正文里的相对路径；
+  `skill_prompt` / `format_skills_for_prompt` / `normalize_skill_trigger`；`disable-model-invocation: true` 的
+  skill 不进系统提示词，只通过显式 `/skill:name` 触发；`Skill` 携带 `dir`（发现/安装时
+  确定）与 `file`（`SKILL.md` 文件路径，用于 `<location>`）；`skill_prompt` 以 pi 风格
+  `<skill name location>` XML 块把正文注入触发消息并附 `References are relative to
+  <dir>.` 行，`already_loaded` 时正文换成去重提示；`format_skills_for_prompt` 产出
+  `## Skills` markdown 广告索引（每 skill 一行 `- name: description [Read from
+  <file>]`，含“按名字/描述匹配即用，或显式 `/{name}` 引用”的说明）；
+  `normalize_skill_trigger` 把裸 prompt 开头的 `/skill:name` 改写为 `/{name}`（one-shot CLI
+  无命令解析，避免 `/skill:` 前缀原样进 LLM）；`find_skill` / `suggest_skills` 兼容 `/skill:name`
+  与裸 `/name` 两种拼写，补全池统一用 `/skill:name`；
 - `/` 补全（ADR-0005）：`CompletionItem { value, description }` + `complete(input,
   skills) -> Vec<CompletionItem>`——把 `slimcode-commands` 的每个命令拼写（规范名 + 别名）
   与每个已安装 skill 合成候选池，用 `fuzzy::fuzzy_match` 模糊排序（裸 `/` 按注册表顺序列全部，
-  命令在前、skill 在后；非 `/` 输入返回空）；候选 `value` 始终是裸拼写（`/save`、`/resume`、
-  `/skill-name`），**不含** `usage` 的参数占位符，提交时经 `find`/`find_skill` 可解析；
+  命令在前、skill 在后；非 `/` 输入返回空）；候选 `value` 是命令的裸拼写（`/save`、`/resume`）
+  与 skill 的规范触发 `/skill:name`，**不含** `usage` 的参数占位符，提交时经
+  `find`/`find_skill` 可解析；
 - `context`：`ContextBuilder`（前端无关）把一轮 prompt 的上下文组装收敛为单一
   入口：基础系统提示（默认 `DEFAULT_SYSTEM_PROMPT` 或 `with_system` 覆盖）+
-  可自动调用 skill 广告（`with_skills`，build 时过滤 `disable-model-invocation`）+
+  可自动调用 skill 广告（`with_skills`，build 时经 `format_skills_for_prompt` 过滤
+  `disable-model-invocation`，产出 `## Skills` markdown 索引）+
   可选 message history（`with_history`，非空不重复插 system）+ user prompt（
-  `with_user_prompt`）或 skill 触发（`with_skill`，复用 `skill_prompt`）；
+  `with_user_prompt`）或 skill 触发（`with_skill`，build 时扫描 history 中是否已有
+  `<skill name="..."` 标记来决定是否去重，再调用 `skill_prompt`）；
   `build()` 返回可直接交给 `run_agent_from_messages` 的 `Vec<Message>`，缺
   user 时报错；空 history 前置一条 system 消息；
 - `tools`：把七工具 factory 绑定到启动 `cwd`。
@@ -224,7 +234,8 @@ Further Notes）。
 - `--help` / `-h`：打印用法后退出；
 - **one-shot**：`slimcode "<prompt>"`（可 `--cwd <dir>`、`--model <model>`、
   `--base-url <url>`）经共享 `ContextBuilder` 组装消息列表（新会话首轮前置系统
-  提示并广告可自动调用 skill），经共享 `run_turn` 跑一轮七工具循环、流式渲染事件、
+  提示并广告可自动调用 skill；开头的 `/skill:name` 会先被 `normalize_skill_trigger`
+  改写为 `/{name}`，因为 one-shot 没有命令解析器），经共享 `run_turn` 跑一轮七工具循环、流式渲染事件、
   打印 token 用量并保存会话；
 - **无 prompt + TTY**：交给 `slimcode_tui::terminal::run` 启动全屏 TUI（见上节）；
 - **无 prompt + 非 TTY**：在配置解析前就以明确错误退出（非零退出码）。

@@ -27,7 +27,7 @@ use slimcode_common::context::ContextBuilder;
 use slimcode_common::history::HistoryStore;
 use slimcode_common::render::{DisplayItem, Renderer};
 use slimcode_common::session::{SessionStore, infer_title};
-use slimcode_common::skills::{Skill, SkillStore};
+use slimcode_common::skills::{Skill, SkillStore, normalize_skill_trigger};
 
 fn usage() -> String {
     format!(
@@ -65,7 +65,14 @@ fn run_once(
 ) -> Result<i32, String> {
     let (mut provider, tools) = slimcode_common::setup::setup(cwd, config)?;
     let mut session = store.new_session();
-    session.title = infer_title(&[Message::text(slimcode_agent::session::Role::User, prompt)]);
+    // The CLI one-shot path has no command parser, so a leading `/skill:{name}`
+    // trigger is normalized to the `/{name}` form the model understands before
+    // it becomes a user message (the TUI already embeds the skill content).
+    let prompt = normalize_skill_trigger(prompt);
+    session.title = infer_title(&[Message::text(
+        slimcode_agent::session::Role::User,
+        prompt.as_str(),
+    )]);
     let messages = ContextBuilder::new()
         .with_skills(skills)
         .with_user_prompt(prompt)

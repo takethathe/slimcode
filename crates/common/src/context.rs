@@ -8,7 +8,7 @@
 
 use slimcode_agent::session::{Message, Role};
 
-use crate::skills::{Skill, skill_prompt};
+use crate::skills::{Skill, format_skills_for_prompt, skill_prompt};
 
 /// Default base system prompt grounding the agent in its tools and working
 /// directory. Skill descriptions are appended on top by the builder's `build()`.
@@ -23,28 +23,34 @@ pub const DEFAULT_SYSTEM_PROMPT: &str = concat!(
     "- When a tool fails, read the error and retry with a corrected approach."
 );
 
-/// Assemble the full system prompt: the base grounding plus a list of
-/// auto-invokable skills (those without `disable-model-invocation: true`).
-/// Skills marked `disable-model-invocation` stay out of the system prompt and
-/// are only reachable through an explicit `/name` trigger.
+/// Assemble the full system prompt: the base grounding plus a `## Skills`
+/// markdown index of auto-invokable skills (those without
+/// `disable-model-invocation: true`), each bullet carrying its name,
+/// description, and the `SKILL.md` file the model can `read`. Skills marked
+/// `disable-model-invocation` stay out of the system prompt and are only
+/// reachable through an explicit `/skill:name` trigger.
 fn build_system_prompt(base: &str, skills: &[Skill]) -> String {
     let mut prompt = base.to_string();
-    let auto: Vec<&Skill> = skills
-        .iter()
-        .filter(|s| !s.disable_model_invocation)
-        .collect();
-    if !auto.is_empty() {
-        prompt.push_str("\n\n## Available skills\n\n");
-        prompt.push_str("Enter the `/name` as a command to apply it:\n\n");
-        for s in auto {
-            prompt.push_str(&format!(
-                "- `/{name}` — {desc}\n",
-                name = s.name,
-                desc = s.description
-            ));
-        }
-    }
+    prompt.push_str(&format_skills_for_prompt(skills));
     prompt
+}
+
+/// One turn's user message: either a plain prompt or a skill trigger. The
+/// skill body is rendered at `build()` time so a skill already loaded in an
+/// earlier message of the history can be replaced by an already-loaded notice
+/// instead of being repeated.
+#[derive(Debug)]
+enum UserInput {
+    Prompt(String),
+    Skill { skill: Skill, arg: Option<String> },
+}
+
+/// Has this skill's `<skill name="...">` block already been injected into one
+/// of the history messages? Detected from the XML wrapper the trigger inserts,
+/// so the check is stateless and survives session reloads.
+fn skill_loaded_in(history: &[Message], skill: &Skill) -> bool {
+    let marker = format!("<skill name=\"{}\"", skill.name);
+    history.iter().any(|m| m.text_content().contains(&marker))
 }
 
 /// A fluent builder for one turn's message list.
@@ -59,7 +65,7 @@ pub struct ContextBuilder {
     system: String,
     skills: Vec<Skill>,
     history: Vec<Message>,
-    user: Option<String>,
+    user: Option<UserInput>,
 }
 
 impl ContextBuilder {
@@ -94,14 +100,19 @@ impl ContextBuilder {
 
     /// Set this turn's user message from a plain prompt.
     pub fn with_user_prompt(mut self, prompt: impl Into<String>) -> Self {
-        self.user = Some(prompt.into());
+        self.user = Some(UserInput::Prompt(prompt.into()));
         self
     }
 
-    /// Set this turn's user message from a skill trigger, reusing
-    /// [`crate::skills::skill_prompt`] to produce the message text.
+    /// Set this turn's user message from a skill trigger. The skill body is
+    /// rendered at `build()` time via [`crate::skills::skill_prompt`], so a
+    /// skill already loaded in the supplied history is replaced by an
+    /// already-loaded notice instead of being repeated.
     pub fn with_skill(mut self, skill: &Skill, arg: Option<&str>) -> Self {
-        self.user = Some(skill_prompt(skill, arg));
+        self.user = Some(UserInput::Skill {
+            skill: skill.clone(),
+            arg: arg.map(str::to_string),
+        });
         self
     }
 
@@ -109,14 +120,23 @@ impl ContextBuilder {
     ///
     /// Semantics (aligned with the CLI's former `messages_for_prompt`):
     /// - The final system text is the base system (default or overridden) plus
-    ///   an `## Available skills` section for auto-invokable skills.
+    ///   the `## Skills` markdown index for auto-invokable skills.
     /// - An empty history seeds exactly one leading `Role::System` message;
     ///   a non-empty history is not re-seeded.
-    /// - A `Role::User` message (prompt or skill trigger) is appended last.
+    /// - A `Role::User` message (prompt or skill trigger) is appended last; a
+    ///   skill trigger whose `<skill name="...">` block already appears in the
+    ///   history is deduplicated (body replaced, base-dir reference kept).
     pub fn build(self) -> Result<Vec<Message>, String> {
-        let user = self.user.ok_or_else(|| {
-            "no user message set: call with_user_prompt or with_skill".to_string()
-        })?;
+        let user = match self.user {
+            Some(UserInput::Prompt(prompt)) => prompt,
+            Some(UserInput::Skill { skill, arg }) => {
+                let already_loaded = skill_loaded_in(&self.history, &skill);
+                skill_prompt(&skill, arg.as_deref(), already_loaded)
+            }
+            None => {
+                return Err("no user message set: call with_user_prompt or with_skill".to_string());
+            }
+        };
         let base = self.system;
         let mut messages = self.history;
         if messages.is_empty() {
@@ -149,6 +169,7 @@ mod tests {
             body: String::new(),
             scope: SkillScope::User,
             dir: std::path::PathBuf::new(),
+            file: std::path::PathBuf::new(),
         }
     }
 
@@ -218,9 +239,9 @@ mod tests {
             .build()
             .unwrap();
         let system = messages[0].text_content();
-        assert!(system.contains("## Available skills"), "got: {system}");
+        assert!(system.contains("## Skills"), "got: {system}");
         assert!(
-            system.contains("- `/auto` — runs automatically"),
+            system.contains("- auto: runs automatically [Read from "),
             "got: {system}"
         );
         assert!(!system.contains("manual"), "got: {system}");
@@ -228,7 +249,7 @@ mod tests {
     }
 
     #[test]
-    fn skills_section_is_markdown() {
+    fn skills_section_is_markdown_skill_index() {
         let skills = vec![
             skill("auto", "runs automatically", false),
             skill("hist", "history-ish", false),
@@ -239,18 +260,29 @@ mod tests {
             .build()
             .unwrap();
         let system = messages[0].text_content();
-        // Heading + blank line + instruction + blank line + bullet list.
-        assert!(system.contains("## Available skills\n\n"), "got: {system}");
+        // The `## Skills` header + one markdown bullet per skill.
+        assert!(system.contains("## Skills"), "got: {system}");
         assert!(
-            system.contains("Enter the `/name` as a command to apply it:\n\n"),
+            system.contains(
+                "Use a skill when its name or description matches the task, or when the user \
+                 references it explicitly as /{name}."
+            ),
             "got: {system}"
         );
         assert!(
-            system.contains("- `/hist` — history-ish\n"),
+            system.contains("Read the file and follow its instructions."),
+            "got: {system}"
+        );
+        assert!(
+            system.contains("- hist: history-ish [Read from "),
+            "got: {system}"
+        );
+        assert!(
+            system.contains("- auto: runs automatically [Read from "),
             "got: {system}"
         );
         // The base grounding (markdown) is still present before the skills
-        // heading.
+        // section.
         assert!(system.contains("You are slimcode"), "got: {system}");
     }
 
@@ -280,7 +312,7 @@ mod tests {
             .build()
             .unwrap();
         let system = messages[0].text_content();
-        assert!(!system.contains("Available skills"), "got: {system}");
+        assert!(!system.contains("## Skills"), "got: {system}");
         assert!(system.contains("read"));
     }
 
@@ -320,9 +352,12 @@ mod tests {
             .build()
             .unwrap();
         let system = messages[0].text_content();
-        assert!(system.contains("- `/tdd` — test first"), "got: {system}");
         assert!(
-            system.contains("- `/grill` — stress-test a plan"),
+            system.contains("- tdd: test first [Read from "),
+            "got: {system}"
+        );
+        assert!(
+            system.contains("- grill: stress-test a plan [Read from "),
             "got: {system}"
         );
         let _ = fs::remove_dir_all(&dir);
@@ -348,12 +383,13 @@ mod tests {
             .build()
             .unwrap();
         let user = messages[1].text_content();
-        assert!(user.contains("demo"), "got: {user}");
+        assert!(user.starts_with("<skill name=\"demo\""), "got: {user}");
+        assert!(user.ends_with("</skill>"), "got: {user}");
         assert!(!user.contains("Task:"), "got: {user}");
     }
 
     #[test]
-    fn with_skill_embeds_skill_directory() {
+    fn with_skill_embeds_skill_directory_and_file() {
         let s = Skill {
             name: "demo".to_string(),
             description: "A demo skill".to_string(),
@@ -361,6 +397,7 @@ mod tests {
             body: "Do the demo.".to_string(),
             scope: SkillScope::User,
             dir: std::path::PathBuf::from("/tmp/skills/demo"),
+            file: std::path::PathBuf::from("/tmp/skills/demo/SKILL.md"),
         };
         let messages = ContextBuilder::new()
             .with_system("sys")
@@ -369,9 +406,14 @@ mod tests {
             .unwrap();
         let user = messages[1].text_content();
         assert!(
-            user.contains("Skill directory: /tmp/skills/demo"),
+            user.contains("References are relative to /tmp/skills/demo."),
             "got: {user}"
         );
+        assert!(
+            user.contains("location=\"/tmp/skills/demo/SKILL.md\""),
+            "got: {user}"
+        );
+        assert!(user.contains("Do the demo."));
     }
 
     #[test]
@@ -383,7 +425,62 @@ mod tests {
             .build()
             .unwrap();
         let user = messages[1].text_content();
-        assert!(user.ends_with("Task: run it now"), "got: {user}");
+        assert!(user.ends_with("</skill>\n\nrun it now"), "got: {user}");
+    }
+
+    #[test]
+    fn with_skill_dedupes_when_already_loaded_in_history() {
+        let s = Skill {
+            name: "demo".to_string(),
+            description: "A demo skill".to_string(),
+            disable_model_invocation: false,
+            body: "Do the demo.".to_string(),
+            scope: SkillScope::User,
+            dir: std::path::PathBuf::from("/tmp/skills/demo"),
+            file: std::path::PathBuf::from("/tmp/skills/demo/SKILL.md"),
+        };
+        // The skill was already loaded in an earlier user message: its body is
+        // replaced by an already-loaded notice, but the base-dir reference line
+        // is kept.
+        let history = vec![Message::text(Role::User, skill_prompt(&s, None, false))];
+        let messages = ContextBuilder::new()
+            .with_system("sys")
+            .with_history(history)
+            .with_skill(&s, None)
+            .build()
+            .unwrap();
+        let user = messages[1].text_content();
+        assert!(
+            user.contains("References are relative to /tmp/skills/demo."),
+            "got: {user}"
+        );
+        assert!(user.contains("already loaded"), "got: {user}");
+        assert!(!user.contains("Do the demo."), "got: {user}");
+    }
+
+    #[test]
+    fn with_skill_not_deduped_when_absent_from_history() {
+        let s = Skill {
+            name: "demo".to_string(),
+            description: "A demo skill".to_string(),
+            disable_model_invocation: false,
+            body: "Do the demo.".to_string(),
+            scope: SkillScope::User,
+            dir: std::path::PathBuf::from("/tmp/skills/demo"),
+            file: std::path::PathBuf::from("/tmp/skills/demo/SKILL.md"),
+        };
+        // A different skill in history does not trigger dedup.
+        let other = skill("other", "Other skill", false);
+        let history = vec![Message::text(Role::User, skill_prompt(&other, None, false))];
+        let messages = ContextBuilder::new()
+            .with_system("sys")
+            .with_history(history)
+            .with_skill(&s, None)
+            .build()
+            .unwrap();
+        let user = messages[1].text_content();
+        assert!(user.contains("Do the demo."), "got: {user}");
+        assert!(!user.contains("already loaded"), "got: {user}");
     }
 
     #[test]

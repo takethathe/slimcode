@@ -11,9 +11,9 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 use slimcode_agent::agent::StopReason;
 use slimcode_commands::{COMMANDS, find};
@@ -22,10 +22,16 @@ use slimcode_common::skills::{
     CompletionItem, Skill, SkillScope, combined_suggestions, complete, find_skill,
 };
 use tui_textarea::{CursorMove, TextArea};
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-/// Height in rows of the input box (including its border).
+/// Resting height in rows of the input box (including its border): one content
+/// row. The box grows with its (wrapped) content up to [`MAX_INPUT_RATIO`] of
+/// the terminal height, so multi-line prompts stay visible while editing.
 const INPUT_HEIGHT: u16 = 3;
+
+/// Max share of the terminal height the input box may occupy (pi-style): a
+/// 24-row terminal caps the input at ~7 rows.
+const MAX_INPUT_RATIO: u16 = 30;
 
 /// Maximum number of rows the `/` completion popup shows before scrolling.
 const COMPLETION_VISIBLE: usize = 5;
@@ -318,7 +324,13 @@ impl App {
             // (typing, arrows, ...), and recomputes the completion popup.
             _ => {
                 self.recall = None;
-                self.input.input(key);
+                // pi's newline key: Ctrl+J inserts a newline (tui_textarea
+                // would otherwise treat it as delete-line-by-head).
+                if key.code == KeyCode::Char('j') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    self.input.insert_newline();
+                } else {
+                    self.input.input(key);
+                }
                 self.refresh_completion();
                 None
             }
@@ -521,9 +533,17 @@ impl App {
         } else {
             0
         };
+
+        // Word-wrap the input at the box's content width and let the box grow
+        // with its content (up to 30% of the terminal), so multi-line prompts
+        // stay visible while editing (pi-style).
+        let input_content_width = (area.width.saturating_sub(2)).max(1) as usize;
+        let (input_rows, cursor) = wrapped_input(&self.input, input_content_width);
+        let input_height = input_box_height(area.height, input_rows.len());
+
         let [transcript_area, input_area, popup_area, status_area] = Layout::vertical([
             Constraint::Min(0),
-            Constraint::Length(INPUT_HEIGHT),
+            Constraint::Length(input_height),
             Constraint::Length(popup_height),
             Constraint::Length(STATUS_HEIGHT),
         ])
@@ -538,8 +558,8 @@ impl App {
         let transcript = Paragraph::new(lines).block(Block::bordered().title(" transcript "));
         frame.render_widget(transcript, transcript_area);
 
-        // Input box.
-        frame.render_widget(&self.input, input_area);
+        // Input box: word-wrapped rows, dynamic height, cursor kept visible.
+        render_input(frame, input_area, &self.input, &input_rows, cursor);
 
         // Completion popup, when active.
         if let Some(comp) = &self.completion
@@ -802,7 +822,7 @@ impl App {
             let n = spec.parse::<usize>().unwrap_or(1);
             return Some(Effect::ReplayHistory(n));
         }
-        // Skill trigger: `/skill-name`.
+        // Skill trigger: `/skill-name` or the canonical `/skill:name`.
         if let Some(skill) = find_skill(&self.skills, name) {
             return Some(Effect::TriggerSkill {
                 name: skill.name.clone(),
@@ -836,7 +856,7 @@ impl App {
             self.push_notice(line);
         }
         self.push_notice("multi-line: Shift+Enter inserts a newline; Enter submits");
-        self.push_notice("skills: /skills lists installed skills; /<skill> runs one");
+        self.push_notice("skills: /skills lists installed skills; /skill:<name> runs one");
     }
 
     /// Render the installed skills list.
@@ -866,7 +886,7 @@ impl App {
                     ""
                 };
                 format!(
-                    "  /{:<width$}  {}{}  [{}]",
+                    "  /skill:{:<width$}  {}{}  [{}]",
                     skill.name, skill.description, manual, scope
                 )
             })
@@ -905,6 +925,105 @@ fn input_with_text(text: &str) -> TextArea<'static> {
 fn decorate_input(textarea: &mut TextArea<'static>) {
     textarea.set_placeholder_text("prompt… Enter submits, Shift+Enter newline, ↑ history");
     textarea.set_block(Block::bordered().title(" input "));
+}
+
+/// Height of the input box (including its border): the wrapped content height
+/// plus the border, grown with content but capped at [`MAX_INPUT_RATIO`] of the
+/// terminal height (pi-style). At least the resting [`INPUT_HEIGHT`], and never
+/// so tall that the status line is pushed off screen.
+fn input_box_height(area_height: u16, wrapped_rows: usize) -> u16 {
+    let desired = (wrapped_rows as u16).saturating_add(2); // + border
+    let max = (area_height.saturating_mul(MAX_INPUT_RATIO) / 100)
+        .max(INPUT_HEIGHT)
+        .min(area_height.saturating_sub(STATUS_HEIGHT));
+    desired.clamp(INPUT_HEIGHT, max.max(INPUT_HEIGHT))
+}
+
+/// Word-wrap the input's logical lines at `width`, returning the visual rows
+/// and the cursor's visual (row, col) within them. Every character of the
+/// input appears exactly once across the rows (`wrap_to_width` never drops
+/// chars), so the cursor column maps exactly. Returns `None` for the cursor
+/// when the input is empty (the placeholder shows).
+fn wrapped_input(input: &TextArea<'static>, width: usize) -> (Vec<String>, Option<(usize, usize)>) {
+    let (cursor_line, cursor_col) = input.cursor();
+    let mut rows: Vec<String> = Vec::new();
+    let mut cursor = None;
+    for (li, line) in input.lines().iter().enumerate() {
+        let wrapped = wrap_to_width(line, width);
+        let row_start = rows.len();
+        rows.extend(wrapped);
+        if li == cursor_line {
+            let mut consumed = 0usize;
+            for (ri, row) in rows[row_start..].iter().enumerate() {
+                let n = row.chars().count();
+                if cursor_col <= consumed + n {
+                    cursor = Some((row_start + ri, cursor_col.saturating_sub(consumed)));
+                    break;
+                }
+                consumed += n;
+            }
+            if cursor.is_none() {
+                // Clamp to the last row of this logical line.
+                let last = rows.len().saturating_sub(1);
+                cursor = Some((last, rows[last].chars().count()));
+            }
+        }
+    }
+    (rows, cursor)
+}
+
+/// Render the input box: word-wrapped rows in a bordered block, scrolled so
+/// the cursor row stays visible when the content overflows, with the terminal
+/// cursor placed at the mapped position (pi-style editor behaviour).
+fn render_input(
+    frame: &mut Frame,
+    area: Rect,
+    input: &TextArea<'static>,
+    rows: &[String],
+    cursor: Option<(usize, usize)>,
+) {
+    let inner_h = area.height.saturating_sub(2) as usize;
+    // Keep the cursor row visible when the content is taller than the box.
+    let top = match cursor {
+        Some((row, _)) if row >= inner_h => row + 1 - inner_h,
+        _ => 0,
+    };
+    let window: Vec<String> = rows.iter().skip(top).take(inner_h).cloned().collect();
+
+    let text: Text = if input.is_empty() {
+        // Placeholder: a cursor-width space plus the dim placeholder text.
+        Text::from(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                input.placeholder_text().to_string(),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]))
+    } else {
+        Text::from(
+            window
+                .iter()
+                .cloned()
+                .map(Line::from)
+                .collect::<Vec<Line>>(),
+        )
+    };
+    let block = input
+        .block()
+        .cloned()
+        .unwrap_or_else(|| Block::bordered().title(" input "));
+    frame.render_widget(Paragraph::new(text).block(block), area);
+
+    // Place the terminal cursor at the input cursor's visual position.
+    if let Some((row, col)) = cursor {
+        let visual_row = row.saturating_sub(top);
+        let prefix: String = rows[row].chars().take(col).collect();
+        let x = area.x + 1 + UnicodeWidthStr::width(prefix.as_str()) as u16;
+        let y = area.y + 1 + visual_row as u16;
+        if y < area.y + area.height && x < area.x + area.width {
+            frame.set_cursor_position(Position { x, y });
+        }
+    }
 }
 
 /// Split a `/command` line into its name (leading slash kept) and optional
@@ -1022,6 +1141,7 @@ mod tests {
             body: String::new(),
             scope: SkillScope::User,
             dir: std::path::PathBuf::new(),
+            file: std::path::PathBuf::new(),
         }
     }
 
@@ -1346,7 +1466,7 @@ mod tests {
         // the list (the header may have scrolled off the pane).
         assert!(buffer_contains(&buffer, "/!!"));
         assert!(buffer_contains(&buffer, "Shift+Enter"));
-        assert!(buffer_contains(&buffer, "/<skill> runs one"));
+        assert!(buffer_contains(&buffer, "/skill:<name> runs one"));
 
         let mut app = App::new(
             "~/proj",
@@ -1358,7 +1478,7 @@ mod tests {
         assert_eq!(app.handle_key(key(KeyCode::Enter)), None);
         let buffer = render_buffer(&mut app, 100, 20);
         assert!(buffer_contains(&buffer, "skills:"));
-        assert!(buffer_contains(&buffer, "/grill"));
+        assert!(buffer_contains(&buffer, "/skill:grill"));
     }
 
     #[test]
@@ -1829,7 +1949,7 @@ mod tests {
         type_text(&mut app, "/gr");
         let comp = app.completion.as_ref().expect("popup open");
         let values: Vec<&str> = comp.items.iter().map(|i| i.value.as_str()).collect();
-        assert!(values.contains(&"/grill"), "{values:?}");
+        assert!(values.contains(&"/skill:grill"), "{values:?}");
     }
 
     #[test]
@@ -1848,7 +1968,7 @@ mod tests {
         type_text(&mut app, "i");
         let comp = app.completion.as_ref().expect("popup open");
         let values: Vec<&str> = comp.items.iter().map(|i| i.value.as_str()).collect();
-        assert!(values.contains(&"/grill"), "{values:?}");
+        assert!(values.contains(&"/skill:grill"), "{values:?}");
 
         // And the freshly installed skill dispatches as a skill trigger.
         type_text(&mut app, "ll");

@@ -357,7 +357,7 @@ fn install_skill(skills: &SkillStore, path: &Path, scope: SkillScope) -> Result<
     let skill = skills.install(path, scope)?;
     let target = skills.skill_dir(scope, &skill.name);
     Ok(format!(
-        "installed skill /{} to {}",
+        "installed skill /skill:{} to {}",
         skill.name,
         target.display()
     ))

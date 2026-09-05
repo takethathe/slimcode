@@ -16,10 +16,19 @@ _Avoid_: slash-command
 An installable set of agent instructions (a `SKILL.md` with frontmatter `name` /
 `description` / `disable-model-invocation`), discovered from a user scope
 (`<home>/skills/`) or a project scope (`<cwd>/.slimcode/skills/`) and triggered
-like a Command via `/name`. `disable-model-invocation: true` keeps the skill out
-of the system prompt so the model only uses it on an explicit `/name` trigger.
-A `/name` trigger injects the skill body plus its directory (the base for
-relative paths in the body) as that turn's user message.
+like a Command via `/skill:name`. `disable-model-invocation: true` keeps the skill
+out of the system prompt so the model only uses it on an explicit `/skill:name`
+trigger. A `/skill:name` trigger injects the skill body plus its file location
+(`<location>`) and directory (the base for relative paths in the body) as that
+turn's user message, wrapped in a `<skill>` XML block (pi-style). Skills without
+`disable-model-invocation` are advertised in the system prompt as a `## Skills`
+markdown index, one bullet per skill (`- name: description [Read from
+<file>]`), and the
+model applies a skill when its name/description matches the task or when the user
+references it explicitly as `/{name}`. If the
+skill was already loaded in an earlier message of the same conversation, its body
+is replaced by an already-loaded notice (the base-dir line is kept) so the model
+finds the instructions in the earlier message instead of reloading.
 _Avoid_: plugin, extension
 
 **Session**:
@@ -43,7 +52,7 @@ or skill trigger. Distinct from message history (`session.messages`, which may b
 _Avoid_: context window (collides with the LLM notion), assembled messages
 
 **Multi-line prompt**:
-A Prompt entered across multiple lines in the TUI input box (Shift+Enter inserts a newline; Enter submits). Stored and submitted as a single Prompt.
+A Prompt entered across multiple lines in the TUI input box (Shift+Enter or Ctrl+J inserts a newline; Enter submits). Stored and submitted as a single Prompt.
 _Avoid_: block, paste
 
 **Completion popup**:

@@ -62,6 +62,8 @@ test(core): cover timeout path
 
 ## Agent skills
 
+> `/{name}` 格式一般特指 skill，例如 `/code-review`。
+
 ### Issue tracker
 
 Issues and specs live as markdown files under `.scratch/`. See `docs/agents/issue-tracker.md`.

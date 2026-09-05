@@ -30,10 +30,17 @@ history**（`session.messages`）是会话中已发生的消息，可被当作 C
 
 - 新会话（空 history）首轮前置一条 system 消息；恢复的会话 history 已含
   system，不重复插入。
-- 只有 `disable-model-invocation: false` 的 skill 描述进入 system 的
-  `## Available skills` 段落；`true` 的 skill 仅通过显式 `/name` 触发。
-- `/name` 触发时，skill 正文与 skill 目录一并成为当轮 user 消息，模型无需
-  再 read `SKILL.md`，直接按正文里的相对路径引用辅助文件。
+- 只有 `disable-model-invocation: false` 的 skill 进入 system 的
+  `## Skills` markdown 索引（每 skill 一行 `- name: description [Read from
+  <file>]`，`file` 是其 `SKILL.md` 路径），并说明
+  模型可按名字/描述匹配即用该 skill，或按用户显式 `/{name}` 引用触发；
+  `true` 的 skill 仅通过显式 `/skill:name` 触发。
+- `/skill:name` 触发时，skill 正文以 pi 风格的 `<skill name location>` XML 块
+  注入当轮 user 消息，并附 `References are relative to <skill 目录>.` 一行，模型
+  无需再 read `SKILL.md`，直接按正文里的相对路径引用辅助文件。
+- 去重：若同一 skill 已在更早 message 加载过（扫描 `<skill name="..."` 标记），
+  重触发时正文替换为 “already loaded” 提示、保留外壳与 base-dir 行，模型去更早
+  的 message 找指令，避免重复加载；扫描无状态，会话 `/load` 恢复后依然有效。
 - 当轮 user 消息必须存在（`with_user_prompt` 或 `with_skill`），否则
   `build()` 报错，而不是静默产出没有 user 消息的 turn。
 
