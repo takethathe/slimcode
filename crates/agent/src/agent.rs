@@ -3,9 +3,8 @@
 //! Shape locked by `.scratch/slimcode-v1` ticket 04:
 //! - loop: model response with `tool_calls` → execute tools → append tool
 //!   results → loop, until the model stops calling tools;
-//! - stop conditions: no tool_calls → `Completed`; iteration cap →
-//!   `MaxIterations` (the runtime's only hard safety; user interrupt is a CLI
-//!   layer concern);
+//! - stop conditions: no tool_calls → `Completed`; user interrupt (cancel
+//!   token) → `Cancelled` (the CLI/TUI layer concern);
 //! - tool execution defaults to **serial** (local tool engines are naturally
 //!   serial and share no concurrent state); `parallel_tools` is a switch
 //!   reserved for future I/O-heavy tools;
@@ -162,8 +161,6 @@ fn assemble(deltas: &[Delta]) -> (String, Vec<ToolCall>, FinishReason) {
 pub enum StopReason {
     /// The model produced a final answer with no tool calls.
     Completed,
-    /// Hit the iteration cap before the model finished.
-    MaxIterations,
     /// The caller requested a cancel (Esc in the TUI) at some boundary of the
     /// run. Whatever already streamed / was already applied stays; no error
     /// is implied and the stop renders nothing.
@@ -190,21 +187,11 @@ pub enum AgentEvent {
     Stop(StopReason),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct RunConfig {
-    pub max_iterations: usize,
     /// Execute multiple tool calls from one response concurrently, or one at a
     /// time (appending results as we go).
     pub parallel_tools: bool,
-}
-
-impl Default for RunConfig {
-    fn default() -> Self {
-        Self {
-            max_iterations: 10,
-            parallel_tools: false,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -339,17 +326,21 @@ fn run_loop<P: Provider>(
     cancel: &CancelToken,
     on_event: EventSink<'_>,
 ) -> Result<(Vec<Message>, usize, StopReason), String> {
-    let mut stop = StopReason::Completed;
     let mut iterations = 0usize;
 
-    for turn in 1..=cfg.max_iterations {
+    // Unbounded loop: a coding agent runs until the model stops calling tools
+    // (`FinishReason::Stop`), the caller cancels, or the provider errors.
+    // There is intentionally no iteration cap — ending a run is the model's
+    // job (no tool calls ⇒ final answer). Each `break` carries the
+    // [`StopReason`] for that exit.
+    let stop = 'run: loop {
         // Boundary: a cancel between iterations (or before the first request)
         // stops before any provider call is made.
         if cancel.is_cancelled() {
-            stop = StopReason::Cancelled;
-            break;
+            break 'run StopReason::Cancelled;
         }
-        iterations = turn;
+        iterations += 1;
+        let turn = iterations;
         on_event(AgentEvent::Turn { turn })?;
 
         let deltas = match provider.chat(&messages, tools, cancel) {
@@ -357,10 +348,7 @@ fn run_loop<P: Provider>(
             // A provider error that landed together with a cancel (its
             // interruptible read aborted) is a silent cancelled stop, not an
             // error.
-            Err(_) if cancel.is_cancelled() => {
-                stop = StopReason::Cancelled;
-                break;
-            }
+            Err(_) if cancel.is_cancelled() => break 'run StopReason::Cancelled,
             Err(e) => return Err(e),
         };
         // Anything the provider returned was emitted live during the
@@ -372,8 +360,7 @@ fn run_loop<P: Provider>(
         // the streamed deltas stay on the transcript, but no assistant
         // message enters history.
         if cancel.is_cancelled() {
-            stop = StopReason::Cancelled;
-            break;
+            break 'run StopReason::Cancelled;
         }
         let (text, tool_calls, reason) = assemble(&deltas);
         let mut asst = Message::text(Role::Assistant, text);
@@ -381,10 +368,7 @@ fn run_loop<P: Provider>(
         messages.push(asst);
 
         match reason {
-            FinishReason::Stop => {
-                stop = StopReason::Completed;
-                break;
-            }
+            FinishReason::Stop => break 'run StopReason::Completed,
             FinishReason::ToolCalls => {
                 let cancelled = execute_tools(
                     tools,
@@ -395,16 +379,12 @@ fn run_loop<P: Provider>(
                     &mut messages,
                 )?;
                 if cancelled {
-                    stop = StopReason::Cancelled;
-                    break;
+                    break 'run StopReason::Cancelled;
                 }
                 // fall through to the next turn (tool results are in history)
             }
         }
-        if turn == cfg.max_iterations {
-            stop = StopReason::MaxIterations;
-        }
-    }
+    };
 
     on_event(AgentEvent::Stop(stop.clone()))?;
     Ok((messages, iterations, stop))
@@ -670,7 +650,6 @@ mod tests {
             script,
             vec![weather_tool()],
             &RunConfig {
-                max_iterations: 5,
                 parallel_tools: true,
             },
         )
@@ -712,7 +691,10 @@ mod tests {
     }
 
     #[test]
-    fn runaway_loop_stops_at_max_iterations() {
+    fn runaway_loop_keeps_going_until_model_stops() {
+        // A model that never stops calling tools keeps the loop alive; there is
+        // no iteration cap. It ends only when the model finally returns no
+        // tool calls (Completed), well past the old cap of 3.
         let mut script = Vec::new();
         for i in 0..5 {
             script.push(vec![
@@ -721,17 +703,11 @@ mod tests {
                 done_tools(),
             ]);
         }
-        let res = run(
-            script,
-            vec![weather_tool()],
-            &RunConfig {
-                max_iterations: 3,
-                parallel_tools: false,
-            },
-        )
-        .unwrap();
-        assert_eq!(res.stop, StopReason::MaxIterations);
-        assert_eq!(res.iterations, 3);
+        script.push(vec![t("done"), done_stop()]);
+        let res = run(script, vec![weather_tool()], &RunConfig::default()).unwrap();
+        assert_eq!(res.stop, StopReason::Completed);
+        assert_eq!(res.iterations, 6);
+        assert_eq!(res.messages.len(), 1 /*sys*/ + 1 /*user*/ + 6 + 5);
     }
 
     #[test]
@@ -990,7 +966,6 @@ mod tests {
             done_tools(),
         ]];
         let cfg = RunConfig {
-            max_iterations: 5,
             parallel_tools: true,
         };
         let res = run_agent(

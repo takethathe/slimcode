@@ -96,7 +96,7 @@ cargo workspace，六个 crate：
 折入自 ticket 04 原型，决策：
 
 - 循环：模型带 `tool_calls` 的响应 → 执行工具 → 追加 `role: tool` 结果 → 循环，直到模型不再调工具；
-- 停止：无 tool_calls → `Completed`；`max_iterations` → `MaxIterations`（运行时唯一硬保险）；
+- 停止：无 tool_calls → `Completed`（coding agent 无迭代上限，何时结束由模型决定）；
   取消（ticket 07）→ `StopReason::Cancelled`——`CancelToken`（`Arc<AtomicBool>`，`new`/`cancel`/
   `reset`/`is_cancelled`/`Clone`）由每个 run 入口携带，在每个 runner 边界检查：provider chat 之前、
   chat 返回 Err 时若 flag 置位视为静默 Cancelled 而非错误、已流出的 deltas 之后（半段文本不落 history）、

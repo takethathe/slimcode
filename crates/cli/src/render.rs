@@ -116,9 +116,6 @@ fn render_structural(item: &DisplayItem) -> String {
             format!("  {icon} {name}: {result}")
         }
         DisplayItem::Stop(StopReason::Completed) => "✓ done".to_string(),
-        DisplayItem::Stop(StopReason::MaxIterations) => {
-            "⚠ stopped: max iterations reached".to_string()
-        }
         // The one-shot CLI never sets the cancel token, so a Cancelled stop
         // cannot reach it (Esc cancellation is a TUI-only path).
         DisplayItem::Stop(StopReason::Cancelled) => {
@@ -238,10 +235,6 @@ mod tests {
     #[test]
     fn stop_reasons_render() {
         assert_eq!(render_stream(&[agent_stop()]), "✓ done\n");
-        assert_eq!(
-            render_stream(&[AgentEvent::Stop(StopReason::MaxIterations)]),
-            "⚠ stopped: max iterations reached\n"
-        );
     }
 
     #[test]

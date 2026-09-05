@@ -897,14 +897,10 @@ impl App {
             }
             // A completed run renders nothing (no `✓ done` line); a cancelled
             // run (Esc) also renders nothing — the partial transcript is the
-            // feedback and no error line appears. An abnormal stop renders as
-            // red error text.
+            // feedback. There is no abnormal stop: a run ends either because
+            // the model stopped calling tools or because the user cancelled.
             DisplayItem::Stop(StopReason::Completed) => return,
             DisplayItem::Stop(StopReason::Cancelled) => return,
-            DisplayItem::Stop(StopReason::MaxIterations) => {
-                self.transcript
-                    .push(Entry::Error("stopped: max iterations reached".to_string()));
-            }
             // `/usage` and the CLI summary share the dim notice line; the
             // per-turn usage line is gone (the footer shows totals, ticket 03).
             DisplayItem::Usage(u) => {
@@ -1894,16 +1890,6 @@ mod tests {
         assert!(!buffer_contains(&buffer, "⚠"));
         assert!(!buffer_contains(&buffer, "cancelled"));
         assert!(!buffer_contains(&buffer, "stopped"));
-    }
-
-    #[test]
-    fn abnormal_stop_renders_red_error_text() {
-        let mut app = seeded_app();
-        app.render(&DisplayItem::Stop(StopReason::MaxIterations))
-            .unwrap();
-        let buffer = render_buffer(&mut app, 60, 12);
-        assert!(buffer_contains(&buffer, "stopped: max iterations reached"));
-        assert!(!buffer_contains(&buffer, "⚠ stopped"));
     }
 
     #[test]
