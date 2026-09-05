@@ -62,6 +62,7 @@ skill 不写入 `config.toml`，按 scope 从目录发现：
 - **user scope**：`<家目录>/skills/`（随 `SLIMCODE_HOME` 走），跨项目共享；
 - **project scope**：启动目录下的 `.slimcode/skills/`，仅当前项目，同名 skill 优先于 user。
 
+发现为递归深搜：任意深度含 `SKILL.md` 的目录都是 skill（分类目录会被穿透），
 slimcode 不内置 skill，两个目录默认不存在（视为空），首次 `/install-skill` 才创建；
 skill 集完全由用户安装内容决定。详见 [user-manual.md](./user-manual.md) 的 Skills 节。
 

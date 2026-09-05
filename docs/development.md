@@ -142,8 +142,10 @@ cargo workspace，六个 crate：
   （见 CONTEXT.md）；
 - `skills`：`Skill` 模型 + `SkillStore`（前端无关）：`SKILL.md` 的 YAML 风格
   frontmatter（`name` / `description` / `disable-model-invocation`）解析、
-  user（`<home>/skills/`）与 project（`<cwd>/.slimcode/skills/`）两 scope 的
-  发现（同名时 project 优先）、`install`（目录或单文件源，落为
+  user（`<home>/skills/`）与 project（`<cwd>/.slimcode/skills/`）两 scope 的**递归深搜**
+  发现（任意深度含 `SKILL.md` 的目录都是 skill，分类目录逐层穿透；skill 目录本身不
+  下钻；同 scope 同名时最浅目录优先、路径排序保证确定性；同名时 project 优先）、
+  `install`（目录或单文件源，落为
   `<scope>/skills/<name>/SKILL.md`）、纯函数 `find_skill` / `suggest_skills` /
   `skill_prompt`；`disable-model-invocation: true` 的 skill 不进系统提示词，
   只通过显式 `/name` 触发；`Skill` 携带 `dir`（发现/安装时确定），

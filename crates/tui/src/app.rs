@@ -144,7 +144,8 @@ pub struct App {
     pub input: TextArea<'static>,
     /// Status-line state.
     pub status: StatusLine,
-    /// Snapshot of installed skills used for `/skill` dispatch and suggestions.
+    /// Snapshot of installed skills used for `/skill` dispatch and suggestions;
+    /// refreshed after a runtime `/install-skill` (see [`App::set_skills`]).
     pub skills: Vec<Skill>,
     /// Recent prompts for ↑/↓ recall, in `HistoryStore` order (oldest first,
     /// newest last — recall starts at the newest entry, matching `/!1`). The
@@ -233,6 +234,14 @@ impl App {
         self.status.session_id = id.to_string();
         self.reset_view();
         self.push_notice(format!("loaded session: {id}"));
+    }
+
+    /// Replace the skills snapshot. The terminal loop calls this after a
+    /// runtime `/install-skill` re-reads the store, so `/` completion,
+    /// did-you-mean prediction, and skill dispatch see the new skill
+    /// immediately instead of on the next launch.
+    pub fn set_skills(&mut self, skills: Vec<Skill>) {
+        self.skills = skills;
     }
 
     /// On-key reducer: returns the effect (if any) the loop must fulfil.
@@ -1821,6 +1830,36 @@ mod tests {
         let comp = app.completion.as_ref().expect("popup open");
         let values: Vec<&str> = comp.items.iter().map(|i| i.value.as_str()).collect();
         assert!(values.contains(&"/grill"), "{values:?}");
+    }
+
+    #[test]
+    fn runtime_skill_install_refreshes_completion_and_dispatch() {
+        let mut app = seeded_app();
+        // No skills installed yet: `/gr` matches no command and no skill.
+        type_text(&mut app, "/gr");
+        assert!(app.completion.is_none());
+
+        // A runtime `/install-skill` re-reads the store and pushes the fresh
+        // snapshot into the app (the terminal loop wires this up).
+        app.set_skills(vec![skill("grill", "stress-test a plan")]);
+
+        // The next keystroke recomputes the popup: the new skill is
+        // predictable without a restart.
+        type_text(&mut app, "i");
+        let comp = app.completion.as_ref().expect("popup open");
+        let values: Vec<&str> = comp.items.iter().map(|i| i.value.as_str()).collect();
+        assert!(values.contains(&"/grill"), "{values:?}");
+
+        // And the freshly installed skill dispatches as a skill trigger.
+        type_text(&mut app, "ll");
+        let effect = app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            effect,
+            Some(Effect::TriggerSkill {
+                name: "grill".to_string(),
+                arg: None
+            })
+        );
     }
 
     #[test]

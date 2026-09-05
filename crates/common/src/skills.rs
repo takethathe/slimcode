@@ -3,7 +3,9 @@
 //! A `Skill` is a markdown file (conventionally `SKILL.md`) with YAML-style
 //! frontmatter carrying `name`, `description`, and an optional
 //! `disable-model-invocation` flag. Skills are discovered from two scopes —
-//! user (`<home>/skills/`) and project (`<cwd>/.slimcode/skills/`) — and are
+//! user (`<home>/skills/`) and project (`<cwd>/.slimcode/skills/`) — by
+//! recursively scanning for `SKILL.md` at any depth (category folders such as
+//! `skills/engineering/…` are walked through), and are
 //! triggered from an interactive frontend (the TUI) as `/name` commands, just
 //! like the built-in commands. Only skills whose `disable_model_invocation` is
 //! false have their description advertised to the model (via the system
@@ -310,36 +312,81 @@ fn read_source(source: &Path) -> Result<(String, bool), String> {
 }
 
 /// Read all skills from a skills directory (user or project scope).
+///
+/// Discovery is recursive: any `SKILL.md` under the root is a skill, so
+/// category folders (`skills/engineering/…`) are walked through to find skill
+/// directories at any depth. A skill directory itself is not descended into —
+/// its files and subdirectories are the skill's payload. Root-level `.md`
+/// files remain single-file skills; deeper `.md` files are ignored. Hidden
+/// entries (dot-prefixed) are skipped at every level.
+///
+/// Name collisions within one scope resolve to the shallowest skill
+/// directory (a root-level `/install-skill` install beats a deeper vendored
+/// copy declaring the same frontmatter name), with sorted paths as a
+/// deterministic tiebreak.
 fn read_skill_dir(dir: &Path, scope: SkillScope) -> Result<Vec<Skill>, String> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
-    let mut out = Vec::new();
-    for entry in fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
-        let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') {
-            continue;
-        }
-        let path = entry.path();
-        if path.is_dir() {
-            let skill_md = path.join("SKILL.md");
-            if !skill_md.is_file() {
-                continue; // not a skill directory
-            }
-            let content = fs::read_to_string(&skill_md)
-                .map_err(|e| format!("{}: {e}", skill_md.display()))?;
-            out.push(parse_skill(&content, scope)?.with_dir(path.clone()));
-        } else if path.is_file() && path.extension().is_some_and(|e| e == "md") {
-            let content =
-                fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-            // A root-level `.md` skill has no dedicated directory; its parent
-            // (the skills root) is the closest base for relative references.
-            let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
-            out.push(parse_skill(&content, scope)?.with_dir(dir));
+    let mut skills = Vec::new();
+    walk_skill_dir(dir, true, scope, &mut skills)?;
+    // Stable sort shallowest-first (fewest path components), then by path, so
+    // same-scope collisions resolve deterministically.
+    skills.sort_by(|a, b| {
+        a.dir
+            .components()
+            .count()
+            .cmp(&b.dir.components().count())
+            .then_with(|| a.dir.cmp(&b.dir))
+    });
+    let mut out: Vec<Skill> = Vec::new();
+    for skill in skills {
+        if !out.iter().any(|s| s.name == skill.name) {
+            out.push(skill);
         }
     }
     Ok(out)
+}
+
+/// Depth-first scan of `dir`. `at_root` marks the skills root, the only level
+/// at which standalone `.md` files count as single-file skills. Sorted
+/// traversal keeps discovery deterministic.
+fn walk_skill_dir(
+    dir: &Path,
+    at_root: bool,
+    scope: SkillScope,
+    out: &mut Vec<Skill>,
+) -> Result<(), String> {
+    let mut entries: Vec<_> = fs::read_dir(dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))?
+        .filter_map(Result::ok)
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let is_dir = entry
+            .file_type()
+            .map_err(|e| format!("{}: {e}", path.display()))?
+            .is_dir();
+        if is_dir {
+            let skill_md = path.join("SKILL.md");
+            if skill_md.is_file() {
+                let content = fs::read_to_string(&skill_md)
+                    .map_err(|e| format!("{}: {e}", skill_md.display()))?;
+                out.push(parse_skill(&content, scope)?.with_dir(path));
+            } else {
+                walk_skill_dir(&path, false, scope, out)?;
+            }
+        } else if at_root && path.extension().is_some_and(|e| e == "md") {
+            // A root-level `.md` skill has no dedicated directory; the skills
+            // root is the closest base for relative references.
+            let content =
+                fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            out.push(parse_skill(&content, scope)?.with_dir(dir.to_path_buf()));
+        }
+    }
+    Ok(())
 }
 
 /// Recursively copy the contents of `from` into `to`.
@@ -666,6 +713,110 @@ mod tests {
         );
         let useronly = find_skill(&skills, "useronly").unwrap();
         assert_eq!(useronly.dir, home.join("skills").join("useronly"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn store_lists_nested_skill_dirs_recursively() {
+        let dir = unique_temp_dir("slimcode-skills-deep");
+        let home = dir.join("home");
+        let cwd = dir.join("proj");
+        let root = home.join("skills");
+
+        // Category folders: skills/engineering/tdd and skills/design/grill.
+        fs::create_dir_all(root.join("engineering").join("tdd").join("references")).unwrap();
+        fs::create_dir_all(root.join("design").join("grill")).unwrap();
+        // Skill payload must NOT become a skill: a skill directory is not
+        // descended into, even when its files carry frontmatter.
+        fs::write(
+            root.join("engineering")
+                .join("tdd")
+                .join("references")
+                .join("REFERENCE.md"),
+            "---\nname: reference\ndescription: payload doc\n---\nref\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("engineering").join("tdd").join("SKILL.md"),
+            "---\nname: tdd\ndescription: test first\n---\nred green refactor\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("design").join("grill").join("SKILL.md"),
+            "---\nname: grill\ndescription: stress-test a plan\n---\ninterview\n",
+        )
+        .unwrap();
+        // Root-level single-file skill (backward compat).
+        fs::write(
+            root.join("plain.md"),
+            "---\nname: plain\ndescription: a root file skill\n---\nbody\n",
+        )
+        .unwrap();
+        // Hidden directory is skipped, even though it contains a SKILL.md.
+        fs::create_dir_all(root.join(".hidden").join("secret")).unwrap();
+        fs::write(
+            root.join(".hidden").join("secret").join("SKILL.md"),
+            "---\nname: hidden\ndescription: must not load\n---\nno\n",
+        )
+        .unwrap();
+        // A deeper `.md` without an owning SKILL.md dir is not a skill.
+        fs::write(
+            root.join("engineering").join("notes.md"),
+            "---\nname: notes\ndescription: grouping note\n---\nno\n",
+        )
+        .unwrap();
+
+        let store = SkillStore::new(&home, &cwd);
+        let skills = store.list().unwrap();
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["grill", "plain", "tdd"]);
+
+        // The nested skill resolves relative payload references against its
+        // own directory, not the skills root.
+        let tdd = find_skill(&skills, "tdd").unwrap();
+        assert_eq!(tdd.scope, SkillScope::User);
+        assert_eq!(tdd.dir, root.join("engineering").join("tdd"));
+        assert_eq!(tdd.body, "red green refactor\n");
+
+        // Root-level single-file skills keep the skills root as their base.
+        let plain = find_skill(&skills, "plain").unwrap();
+        assert_eq!(plain.dir, root);
+
+        // The nested skill is triggerable via the `/` completion popup.
+        let items = complete("/tdd", &skills);
+        let values: Vec<&str> = items.iter().map(|i| i.value.as_str()).collect();
+        assert!(values.contains(&"/tdd"), "got: {values:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_scope_name_collision_prefers_shallowest_skill() {
+        let dir = unique_temp_dir("slimcode-skills-dup");
+        let home = dir.join("home");
+        let cwd = dir.join("proj");
+        // A root-level install (shallowest) beats a deeper vendored copy that
+        // declares the same frontmatter name.
+        fs::create_dir_all(home.join("skills").join("dup")).unwrap();
+        fs::create_dir_all(home.join("skills").join("engineering").join("dup")).unwrap();
+        fs::write(
+            home.join("skills").join("dup").join("SKILL.md"),
+            "---\nname: dup\ndescription: installed copy\n---\nroot\n",
+        )
+        .unwrap();
+        fs::write(
+            home.join("skills")
+                .join("engineering")
+                .join("dup")
+                .join("SKILL.md"),
+            "---\nname: dup\ndescription: vendored copy\n---\nnested\n",
+        )
+        .unwrap();
+
+        let store = SkillStore::new(&home, &cwd);
+        let skills = store.list().unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].description, "installed copy");
+        assert_eq!(skills[0].dir, home.join("skills").join("dup"));
         let _ = fs::remove_dir_all(&dir);
     }
 

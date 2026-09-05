@@ -184,7 +184,12 @@ disable-model-invocation: true   # 可选；省略 = false
 - **user**：`~/.slimcode/skills/`（可用 `SLIMCODE_HOME` 覆盖家目录），跨项目共享；
 - **project**：`<cwd>/.slimcode/skills/`，仅当前项目；同名 skill 时 project 优先。
 
-每个 skill 在对应目录下以 `<name>/SKILL.md` 存放；也可直接放 `<name>.md` 单文件。
+发现是**递归深搜**：根目录下任意深度含 `SKILL.md` 的目录都是一个 skill，分类目录
+（如 `skills/engineering/ask-matt/SKILL.md`）会被逐层穿透；一个 skill 目录自身不会被
+继续下钻（其子目录/文件是它的附属资源，如 `references/`）。每个 skill 以
+`<name>/SKILL.md` 存放；也可在根目录直接放 `<name>.md` 单文件。触发名一律取
+frontmatter 的 `name`，与所在深度无关。同一 scope 内同名冲突时**最浅目录优先**
+（根级的 `/install-skill` 安装胜过嵌套的 vendored 副本），路径排序保证确定性。
 
 **默认状态**：slimcode 不内置任何 skill——两个 scope 目录默认不存在（视为空），
 首次 `/install-skill` 时才创建；所有 skill 均需自行安装，无随包分发的默认集。
@@ -203,7 +208,8 @@ disable-model-invocation: true   # 可选；省略 = false
 
 - `/install-skill <path> --user|--project`：把目录（含 `SKILL.md`）或单个 markdown
   文件复制到对应 scope，`--user` 与 `--project` 二选一；同名 skill 会被覆盖更新；
-  与内置命令重名的 skill 会被拒绝安装；
+  与内置命令重名的 skill 会被拒绝安装；安装成功后立即生效——新 skill 无需重启即可
+  出现在 `/` 补全弹框、未知 `/` 的预测提示中，也可直接 `/name` 触发；
 - `/skills`：列出已安装 skill（触发名、描述、manual-only 标记、scope）；
 - `/name [任务]`：触发一个 skill，把其正文（+ 可选任务，另附 skill 所在目录，
   供正文里的相对路径解析）作为一轮 agent 指令执行；与其它 `/` 命令一样，skill

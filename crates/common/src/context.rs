@@ -285,6 +285,50 @@ mod tests {
     }
 
     #[test]
+    fn system_prompt_injects_descriptions_of_nested_skills() {
+        use crate::skills::SkillStore;
+        use crate::testutil::unique_temp_dir;
+        use std::fs;
+
+        let dir = unique_temp_dir("slimcode-context-skills");
+        let home = dir.join("home");
+        let cwd = dir.join("proj");
+        fs::create_dir_all(home.join("skills").join("engineering").join("tdd")).unwrap();
+        fs::create_dir_all(home.join("skills").join("design").join("grill")).unwrap();
+        fs::write(
+            home.join("skills")
+                .join("engineering")
+                .join("tdd")
+                .join("SKILL.md"),
+            "---\nname: tdd\ndescription: test first\n---\nred green refactor\n",
+        )
+        .unwrap();
+        fs::write(
+            home.join("skills")
+                .join("design")
+                .join("grill")
+                .join("SKILL.md"),
+            "---\nname: grill\ndescription: stress-test a plan\n---\ninterview\n",
+        )
+        .unwrap();
+
+        let store = SkillStore::new(&home, &cwd);
+        let skills = store.list().unwrap();
+        let messages = ContextBuilder::new()
+            .with_skills(&skills)
+            .with_user_prompt("hello")
+            .build()
+            .unwrap();
+        let system = messages[0].text_content();
+        assert!(system.contains("- `/tdd` — test first"), "got: {system}");
+        assert!(
+            system.contains("- `/grill` — stress-test a plan"),
+            "got: {system}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn with_user_prompt_sets_user_message() {
         let messages = ContextBuilder::new()
             .with_system("sys")

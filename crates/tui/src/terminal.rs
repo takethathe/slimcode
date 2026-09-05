@@ -207,7 +207,13 @@ impl<'a> Tui<'a> {
                 let result = parse_install_args(Some(&reference))
                     .and_then(|(path, scope)| install_skill(self.skills, &path, scope));
                 match result {
-                    Ok(msg) => self.app.push_notice(msg),
+                    Ok(msg) => {
+                        self.app.push_notice(msg);
+                        // Re-read the store so `/` completion, `did you mean`,
+                        // and skill dispatch see the new skill without a restart.
+                        let fresh = self.skills.list().unwrap_or_default();
+                        self.app.set_skills(fresh);
+                    }
                     Err(e) => self.app.push_error(e),
                 }
                 Ok(())
