@@ -186,6 +186,10 @@ disable-model-invocation: true   # 可选；省略 = false
 
 每个 skill 在对应目录下以 `<name>/SKILL.md` 存放；也可直接放 `<name>.md` 单文件。
 
+**默认状态**：slimcode 不内置任何 skill——两个 scope 目录默认不存在（视为空），
+首次 `/install-skill` 时才创建；所有 skill 均需自行安装，无随包分发的默认集。
+想确认当前已装 skill 用 `/skills`。
+
 #### 安装与使用
 
 在 TUI 输入框中直接输入命令（无提示符）：
