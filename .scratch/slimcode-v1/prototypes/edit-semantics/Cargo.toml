@@ -1,0 +1,13 @@
+[package]
+name = "edit-semantics-proto"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# PROTOTYPE for slimcode ticket 03. Throwaway — not part of the workspace.
+
+[[bin]]
+name = "edit-semantics-proto"
+path = "src/main.rs"
+
+[dependencies]

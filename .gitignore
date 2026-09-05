@@ -1,5 +1,4 @@
-/target
-.scratch
+target/
 .codegraph
 .mcp.json
 .codex

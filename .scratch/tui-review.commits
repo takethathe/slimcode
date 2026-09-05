@@ -1,0 +1,7 @@
+acee219 docs(tui): sync docs and land ADRs for the TUI migration
+2857d5f feat(tui,cli): add terminal loop, launch rule, remove REPL
+37d5a75 feat(tui): add input-history recall and history commands
+eb5807e feat(tui): add pure TUI app core with TestBackend tests
+e51abfe refactor(common,cli): move shared pure helpers into slimcode-common
+39f6194 refactor(cli): stream one-shot output live through shared runner
+80f2b3a feat(common,agent): add shared renderer model and turn runner
