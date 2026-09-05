@@ -12,6 +12,8 @@
 //! separate, dynamic `/` trigger set (`slimcode-common::skills`); the frontend
 //! combines both when predicting partial `/` input.
 
+pub mod fuzzy;
+
 /// How a command matches input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommandKind {

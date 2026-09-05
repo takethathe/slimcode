@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use slimcode_commands::{COMMANDS, suggest};
+use slimcode_commands::{COMMANDS, fuzzy::fuzzy_match, suggest};
 
 /// Where a skill was discovered from (or installed into).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -409,6 +409,96 @@ pub fn combined_suggestions(skills: &[Skill], input: &str) -> Vec<String> {
     out
 }
 
+/// One selectable row in the TUI's `/` completion popup: the exact text to
+/// commit to the input buffer and a short description.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletionItem {
+    /// The `/`-prefixed spelling to commit (e.g. `/save`, `/resume`, or
+    /// `/skill-name`). Unlike [`combined_suggestions`], this is the bare
+    /// spelling — never the usage string with its argument placeholder.
+    pub value: String,
+    pub description: String,
+}
+
+/// Ranked completion candidates for a partial `/` input: every command
+/// spelling (canonical name and aliases) plus every installed skill, fuzzy
+/// matched and sorted best-first. A bare `/` yields every candidate in
+/// registry order (commands first, then skills); a non-`/` input yields none.
+pub fn complete(input: &str, skills: &[Skill]) -> Vec<CompletionItem> {
+    let trimmed = input.trim();
+    if !trimmed.starts_with('/') {
+        return Vec::new();
+    }
+    let query = trimmed.strip_prefix('/').unwrap_or(trimmed);
+
+    // Candidate pool: every command spelling (canonical + alias) then every
+    // skill, as `/name`. Commands first keeps the registry order for the
+    // bare-`/` case; aliases are real spellings, so `/res` completes to
+    // `/resume` which `find` resolves back to `/load`.
+    let mut pool: Vec<(&str, &'static str)> = Vec::new();
+    for command in COMMANDS {
+        for spelling in command.spellings() {
+            // Command spellings already carry the leading `/`; store the bare
+            // name so the final `/name` value is not doubled.
+            let bare = spelling.strip_prefix('/').unwrap_or(spelling);
+            pool.push((bare, command.description));
+        }
+    }
+    let skill_pool: Vec<(&str, String)> = skills
+        .iter()
+        .map(|s| (s.name.as_str(), s.description.clone()))
+        .collect();
+
+    let mut scored: Vec<(i64, usize, CompletionItem)> = Vec::new();
+    if query.is_empty() {
+        // Bare `/`: everything, in pool order, unsorted (registry first).
+        let mut out: Vec<CompletionItem> = pool
+            .into_iter()
+            .map(|(spelling, desc)| CompletionItem {
+                value: format!("/{spelling}"),
+                description: desc.to_string(),
+            })
+            .collect();
+        out.extend(skill_pool.into_iter().map(|(name, desc)| CompletionItem {
+            value: format!("/{name}"),
+            description: desc,
+        }));
+        return out;
+    }
+
+    for (spelling, desc) in pool {
+        if let Some(score) = fuzzy_match(query, spelling) {
+            // Skip the leading `/` in the value; the pool stores bare names.
+            let idx = scored.len();
+            scored.push((
+                score,
+                idx,
+                CompletionItem {
+                    value: format!("/{spelling}"),
+                    description: desc.to_string(),
+                },
+            ));
+        }
+    }
+    for (name, desc) in skill_pool {
+        if let Some(score) = fuzzy_match(query, name) {
+            let idx = scored.len();
+            scored.push((
+                score,
+                idx,
+                CompletionItem {
+                    value: format!("/{name}"),
+                    description: desc,
+                },
+            ));
+        }
+    }
+    // Best score first; ties keep pool order (commands before skills,
+    // registry order within commands) via the insertion index.
+    scored.sort_by_key(|(score, idx, _)| (*score, *idx));
+    scored.into_iter().map(|(_, _, item)| item).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -691,5 +781,93 @@ mod tests {
         let got = combined_suggestions(&[s], "/hist");
         assert!(got.contains(&"/history".to_string()), "got: {got:?}");
         assert!(got.contains(&"/histo".to_string()), "got: {got:?}");
+    }
+
+    // --- completion popup candidates --------------------------------------
+
+    #[test]
+    fn complete_bare_slash_yields_every_command_then_skills() {
+        let s = parse_skill(
+            "---\nname: grill\ndescription: stress-test a plan\n---\nb\n",
+            SkillScope::User,
+        )
+        .unwrap();
+        let items = complete("/", &[s]);
+        let values: Vec<&str> = items.iter().map(|i| i.value.as_str()).collect();
+        // Every command spelling (canonical + alias) precedes skills.
+        assert!(values.contains(&"/help"));
+        assert!(values.contains(&"/resume")); // alias of /load
+        assert!(values.contains(&"/grill"));
+        assert_eq!(*values.last().unwrap(), "/grill");
+        let help = items.iter().find(|i| i.value == "/help").unwrap();
+        assert_eq!(help.description, "list commands");
+    }
+
+    #[test]
+    fn complete_non_slash_input_is_empty() {
+        assert!(complete("hist", &[]).is_empty());
+        assert!(complete("", &[]).is_empty());
+    }
+
+    #[test]
+    fn complete_prefix_matches_command_name() {
+        let items = complete("/sav", &[]);
+        let values: Vec<&str> = items.iter().map(|i| i.value.as_str()).collect();
+        assert_eq!(values, vec!["/save"]);
+        assert_eq!(items[0].description, "save the current session");
+    }
+
+    #[test]
+    fn complete_matches_command_alias() {
+        let items = complete("/res", &[]);
+        let values: Vec<&str> = items.iter().map(|i| i.value.as_str()).collect();
+        assert!(values.contains(&"/resume"), "got: {values:?}");
+    }
+
+    #[test]
+    fn complete_matches_skill_name() {
+        let s = parse_skill(
+            "---\nname: grill\ndescription: stress-test a plan\n---\nb\n",
+            SkillScope::User,
+        )
+        .unwrap();
+        let items = complete("/gr", &[s]);
+        let values: Vec<&str> = items.iter().map(|i| i.value.as_str()).collect();
+        assert!(values.contains(&"/grill"), "got: {values:?}");
+    }
+
+    #[test]
+    fn complete_ranks_fuzzy_matches_best_first() {
+        let s = parse_skill(
+            "---\nname: save-notes\ndescription: save loose notes\n---\nb\n",
+            SkillScope::User,
+        )
+        .unwrap();
+        // Query "sav" matches /save (contiguous) far better than the skill
+        // "save-notes" (gappy s..a..v spread over the word).
+        let items = complete("/sav", &[s]);
+        let values: Vec<&str> = items.iter().map(|i| i.value.as_str()).collect();
+        assert_eq!(*values.first().unwrap(), "/save");
+        assert!(values.contains(&"/save-notes"), "got: {values:?}");
+        // The fuzzy order places the contiguous match first.
+        let save = items.iter().position(|i| i.value == "/save").unwrap();
+        let notes = items.iter().position(|i| i.value == "/save-notes").unwrap();
+        assert!(save < notes, "{values:?}");
+    }
+
+    #[test]
+    fn complete_unknown_is_empty() {
+        assert!(complete("/zzz", &[]).is_empty());
+    }
+
+    #[test]
+    fn complete_values_are_bare_spellings_not_usages() {
+        // The value must be commit-able (no `<id>` placeholder), unlike the
+        // usage strings combined_suggestions surfaces. Querying the exact
+        // canonical name yields its bare spelling, not `/load <id>`.
+        let items = complete("/load", &[]);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].value, "/load");
+        assert_eq!(items[0].description, "load a saved session");
     }
 }

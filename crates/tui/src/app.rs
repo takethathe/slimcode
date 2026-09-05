@@ -13,17 +13,22 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 use slimcode_agent::agent::StopReason;
 use slimcode_commands::{COMMANDS, find};
 use slimcode_common::render::{DisplayItem, Renderer, usage_summary};
-use slimcode_common::skills::{Skill, SkillScope, combined_suggestions, find_skill};
+use slimcode_common::skills::{
+    CompletionItem, Skill, SkillScope, combined_suggestions, complete, find_skill,
+};
 use tui_textarea::{CursorMove, TextArea};
 use unicode_width::UnicodeWidthChar;
 
 /// Height in rows of the input box (including its border).
 const INPUT_HEIGHT: u16 = 3;
+
+/// Maximum number of rows the `/` completion popup shows before scrolling.
+const COMPLETION_VISIBLE: usize = 5;
 
 /// Number of lines a PageUp / PageDown key scrolls the transcript by.
 const PAGE_LINES: usize = 10;
@@ -99,6 +104,38 @@ pub struct Recall {
     pub index: usize,
 }
 
+/// Active `/` completion state: the fuzzy candidate list shown below the
+/// input box, the selected row (wrap-around), and the scroll window start.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Completion {
+    /// Ranked candidates (best first) for the current partial `/` input.
+    pub items: Vec<CompletionItem>,
+    /// Index of the highlighted candidate into `items`.
+    pub selected: usize,
+    /// First row of the scroll window into `items` (keeps the selection
+    /// visible without scrolling every keystroke).
+    pub offset: usize,
+}
+
+impl Completion {
+    /// Clamp the scroll window so the selection stays visible.
+    fn clamp_offset(&mut self) {
+        if self.items.is_empty() {
+            self.selected = 0;
+            self.offset = 0;
+            return;
+        }
+        let max = self.items.len().saturating_sub(1);
+        self.selected = self.selected.min(max);
+        let window = COMPLETION_VISIBLE.min(self.items.len());
+        if self.selected < self.offset {
+            self.offset = self.selected;
+        } else if self.selected >= self.offset + window {
+            self.offset = self.selected + 1 - window;
+        }
+    }
+}
+
 /// The pure TUI app core.
 pub struct App {
     /// The transcript rendered in the top pane.
@@ -116,6 +153,8 @@ pub struct App {
     pub history: Vec<String>,
     /// Active history-recall state, if any.
     pub recall: Option<Recall>,
+    /// Active `/` completion popup state, if any.
+    pub completion: Option<Completion>,
     /// Lines scrolled up from the bottom of the transcript (0 = at bottom).
     pub scroll: usize,
     /// Whether the view auto-follows new output.
@@ -146,6 +185,7 @@ impl App {
             skills,
             history: Vec::new(),
             recall: None,
+            completion: None,
             scroll: 0,
             follow: true,
             content_width: 0,
@@ -204,34 +244,173 @@ impl App {
                 _ => {}
             }
         }
+        let completion_open = self.completion.is_some();
         match key.code {
-            // ↑/↓ at the empty input enter history recall; in recall they
-            // navigate; otherwise they move the text-area cursor (the recall
-            // state owns them so tui-textarea's own ↑/↓ do not fight it).
+            // ↑/↓ with the completion popup open navigate it (wrap-around);
+            // otherwise they enter history recall at the empty input or move
+            // the text-area cursor.
             KeyCode::Up | KeyCode::Down => {
-                self.handle_vertical(key);
+                if completion_open {
+                    self.completion_arrow(key.code);
+                } else {
+                    self.handle_vertical(key);
+                }
                 None
             }
-            // Enter submits the buffer (or re-runs a recalled prompt as a
-            // fresh turn without re-recording it); Shift+Enter inserts a
-            // newline so the input box stays multi-line.
-            KeyCode::Enter => self.handle_enter(key),
+            // Enter with the popup open applies the selected completion and
+            // submits it (execute); otherwise recall/newline/submit as before.
+            KeyCode::Enter => {
+                if completion_open && !key.modifiers.contains(KeyModifiers::SHIFT) {
+                    self.accept_completion_and_submit()
+                } else {
+                    let effect = self.handle_enter(key);
+                    self.refresh_completion();
+                    effect
+                }
+            }
+            // Tab accepts the selected completion onto the buffer with a
+            // trailing space (no submit); with `/` typed but no popup yet it
+            // force-opens the popup; otherwise the text area handles it.
+            KeyCode::Tab => {
+                if completion_open {
+                    self.accept_completion();
+                } else if self.input_text().starts_with('/') {
+                    self.refresh_completion();
+                } else {
+                    self.input.input(key);
+                }
+                None
+            }
+            // Escape cancels the popup (keeps the typed text) and recall.
+            KeyCode::Esc => {
+                self.recall = None;
+                self.completion = None;
+                None
+            }
+            // PageUp/PageDown page the completion list while it is open;
+            // otherwise they scroll the transcript.
             KeyCode::PageUp => {
-                self.scroll_up(PAGE_LINES);
+                if completion_open {
+                    self.completion_page(PAGE_LINES, true);
+                } else {
+                    self.scroll_up(PAGE_LINES);
+                }
                 None
             }
             KeyCode::PageDown => {
-                self.scroll_down(PAGE_LINES);
+                if completion_open {
+                    self.completion_page(PAGE_LINES, false);
+                } else {
+                    self.scroll_down(PAGE_LINES);
+                }
                 None
             }
-            // Everything else exits recall (if active) and goes to the text
-            // area (typing, arrows, ...).
+            // Everything else exits recall (if active), goes to the text area
+            // (typing, arrows, ...), and recomputes the completion popup.
             _ => {
                 self.recall = None;
                 self.input.input(key);
+                self.refresh_completion();
                 None
             }
         }
+    }
+
+    /// Whether the `/` completion popup should currently be active: the whole
+    /// input is a single line, it starts with `/`, and no argument whitespace
+    /// has been typed yet (a space closes the popup so the user can type
+    /// arguments after the completed command name).
+    fn completion_active(&self) -> bool {
+        self.input.lines().len() == 1
+            && self.input_text().starts_with('/')
+            && !self.input_text()[1..].contains(char::is_whitespace)
+    }
+
+    /// Recompute the candidate list from the current input. Preserves the
+    /// selected value when it is still a candidate; otherwise selects the best
+    /// match (first). Closes the popup when the input leaves the `/` context
+    /// or nothing matches.
+    fn refresh_completion(&mut self) {
+        if !self.completion_active() {
+            self.completion = None;
+            return;
+        }
+        let items = complete(&self.input_text(), &self.skills);
+        if items.is_empty() {
+            self.completion = None;
+            return;
+        }
+        let kept = self
+            .completion
+            .as_ref()
+            .and_then(|c| c.items.get(c.selected).map(|i| i.value.clone()));
+        let selected = kept
+            .and_then(|value| items.iter().position(|i| i.value == value))
+            .unwrap_or(0);
+        let mut comp = Completion {
+            items,
+            selected,
+            offset: 0,
+        };
+        comp.clamp_offset();
+        self.completion = Some(comp);
+    }
+
+    /// Move the completion selection, wrapping around the ends.
+    fn completion_arrow(&mut self, code: KeyCode) {
+        let Some(comp) = self.completion.as_mut() else {
+            return;
+        };
+        let len = comp.items.len();
+        if len == 0 {
+            return;
+        }
+        match code {
+            KeyCode::Up => comp.selected = (comp.selected + len - 1) % len,
+            KeyCode::Down => comp.selected = (comp.selected + 1) % len,
+            _ => {}
+        }
+        comp.clamp_offset();
+    }
+
+    /// Move the completion selection by a page of `lines`, saturating at the
+    /// ends (no wrap-around for pages).
+    fn completion_page(&mut self, lines: usize, up: bool) {
+        let Some(comp) = self.completion.as_mut() else {
+            return;
+        };
+        let max = comp.items.len().saturating_sub(1);
+        if up {
+            comp.selected = comp.selected.saturating_sub(lines);
+        } else {
+            comp.selected = (comp.selected + lines).min(max);
+        }
+        comp.clamp_offset();
+    }
+
+    /// Accept the selected completion onto the input buffer with a trailing
+    /// space (cursor lands after it) and close the popup, without submitting.
+    /// No-op when there is no active popup or nothing is selected.
+    fn accept_completion(&mut self) {
+        let Some(comp) = self.completion.take() else {
+            return;
+        };
+        if let Some(item) = comp.items.get(comp.selected) {
+            self.set_input_text(&format!("{} ", item.value));
+        }
+    }
+
+    /// Apply the selected completion to the buffer (no trailing space) and
+    /// submit it as a command: Enter executes the selection, not the literal
+    /// partial text. Falls back to a plain submit when there is no popup.
+    fn accept_completion_and_submit(&mut self) -> Option<Effect> {
+        let Some(comp) = self.completion.take() else {
+            return self.submit_current_input();
+        };
+        if let Some(item) = comp.items.get(comp.selected).cloned() {
+            self.set_input_text(&item.value);
+        }
+        self.submit_current_input()
     }
 
     /// Handle ↑/↓: history recall or text-area cursor movement.
@@ -321,9 +500,22 @@ impl App {
 
     /// Draw the whole screen into `area` of the given frame.
     pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
-        let [transcript_area, input_area, status_area] = Layout::vertical([
+        // The completion popup (when open) is an extra region between the
+        // input box and the status line: a bordered list of `visible` rows.
+        let visible = self
+            .completion
+            .as_ref()
+            .map(|c| c.items.len().min(COMPLETION_VISIBLE))
+            .unwrap_or(0);
+        let popup_height = if self.completion.is_some() && visible > 0 {
+            (visible as u16).saturating_add(2)
+        } else {
+            0
+        };
+        let [transcript_area, input_area, popup_area, status_area] = Layout::vertical([
             Constraint::Min(0),
             Constraint::Length(INPUT_HEIGHT),
+            Constraint::Length(popup_height),
             Constraint::Length(STATUS_HEIGHT),
         ])
         .areas(area);
@@ -340,9 +532,55 @@ impl App {
         // Input box.
         frame.render_widget(&self.input, input_area);
 
+        // Completion popup, when active.
+        if let Some(comp) = &self.completion
+            && popup_height > 0
+        {
+            self.render_completion(frame, popup_area, comp);
+        }
+
         // Status line.
         let status = Paragraph::new(self.status_line_text());
         frame.render_widget(status, status_area);
+    }
+
+    /// Render the `/` completion popup into `area`: a bordered list of the
+    /// visible candidates with the selection highlighted and marked `→`.
+    fn render_completion(&self, frame: &mut Frame, area: Rect, comp: &Completion) {
+        let visible = comp.items.len().min(COMPLETION_VISIBLE);
+        let start = comp.offset;
+        let end = (comp.offset + visible).min(comp.items.len());
+        let window: &[CompletionItem] = &comp.items[start..end];
+
+        let name_width = window
+            .iter()
+            .map(|i| i.value.chars().count())
+            .max()
+            .unwrap_or(0);
+        let mut rows: Vec<ListItem> = Vec::with_capacity(window.len());
+        for item in window {
+            let name = format!("{:<width$}", item.value, width = name_width);
+            let line = Line::from(vec![
+                Span::styled(name, Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw("  "),
+                Span::styled(item.description.clone(), Style::default().fg(Color::Gray)),
+            ]);
+            rows.push(ListItem::new(line));
+        }
+
+        let total = comp.items.len();
+        let title = if total > visible {
+            format!(" completion {}–{}/{total} ", start + 1, end)
+        } else {
+            " completion ".to_string()
+        };
+        let list = List::new(rows)
+            .block(Block::bordered().title(title))
+            .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
+            .highlight_symbol("→ ");
+        let mut state = ListState::default();
+        state.select(Some(comp.selected.saturating_sub(start)));
+        frame.render_stateful_widget(list, area, &mut state);
     }
 
     /// Push a streamed display item into the transcript and re-follow.
@@ -1367,6 +1605,228 @@ mod tests {
         app.set_history(vec!["stored".to_string()]);
         app.handle_key(key(KeyCode::Up));
         assert!(app.recall.is_some());
+        assert_eq!(app.handle_key(ctrl_key('c')), Some(Effect::Quit));
+    }
+
+    // --- `/` completion popup ---------------------------------------------
+
+    #[test]
+    fn typing_slash_opens_completion_with_all_candidates() {
+        let mut app = seeded_app();
+        type_text(&mut app, "/");
+        let comp = app.completion.as_ref().expect("popup should open on /");
+        assert!(comp.items.len() >= COMMANDS.len());
+        assert_eq!(comp.selected, 0);
+        assert!(comp.items.iter().any(|i| i.value == "/help"));
+    }
+
+    #[test]
+    fn typing_filters_completion_to_matches() {
+        let mut app = seeded_app();
+        type_text(&mut app, "/sav");
+        let comp = app.completion.as_ref().expect("popup open");
+        let values: Vec<&str> = comp.items.iter().map(|i| i.value.as_str()).collect();
+        assert_eq!(values, vec!["/save"]);
+        assert_eq!(comp.selected, 0);
+    }
+
+    #[test]
+    fn non_slash_input_does_not_open_completion() {
+        let mut app = seeded_app();
+        type_text(&mut app, "hello");
+        assert!(app.completion.is_none());
+    }
+
+    #[test]
+    fn space_closes_completion_for_arguments() {
+        let mut app = seeded_app();
+        type_text(&mut app, "/sav");
+        assert!(app.completion.is_some());
+        // Typing a space (entering the argument part) closes the popup.
+        type_text(&mut app, " ");
+        assert!(app.completion.is_none());
+    }
+
+    #[test]
+    fn tab_commits_selection_with_trailing_space() {
+        let mut app = seeded_app();
+        type_text(&mut app, "/sav");
+        let effect = app.handle_key(key(KeyCode::Tab));
+        assert_eq!(effect, None);
+        assert!(app.completion.is_none());
+        // The selected candidate is committed with a trailing space, ready for
+        // an argument; it is NOT submitted.
+        assert_eq!(app.input_text(), "/save ");
+    }
+
+    #[test]
+    fn tab_commits_alias_spelling() {
+        let mut app = seeded_app();
+        type_text(&mut app, "/res");
+        app.handle_key(key(KeyCode::Tab));
+        // `/res` fuzzy-matches the `/resume` alias; committing that spelling
+        // still resolves to `/load` on submit.
+        assert_eq!(app.input_text(), "/resume ");
+    }
+
+    #[test]
+    fn enter_commits_selection_and_executes() {
+        let mut app = seeded_app();
+        type_text(&mut app, "/sav");
+        // The popup's best match for `/sav` is `/save`; Enter expands and runs
+        // it (Q4: execute the selection, not the literal partial text).
+        let effect = app.handle_key(key(KeyCode::Enter));
+        assert_eq!(effect, Some(Effect::SaveSession));
+        assert!(app.completion.is_none());
+        assert!(app.input_text().is_empty());
+    }
+
+    #[test]
+    fn enter_runs_selected_not_typed_when_multiple_candidates() {
+        let mut app = seeded_app();
+        // `/s` matches several commands; the best match (first) is `/sessions`
+        // (registry order, all score equally at a leading-s boundary hit).
+        type_text(&mut app, "/s");
+        let comp = app.completion.as_ref().unwrap();
+        assert_eq!(comp.items[0].value, "/sessions");
+        let effect = app.handle_key(key(KeyCode::Enter));
+        assert_eq!(effect, Some(Effect::ListSessions));
+    }
+
+    #[test]
+    fn enter_with_no_popup_submits_plain_input() {
+        let mut app = seeded_app();
+        type_text(&mut app, "plain prompt");
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Some(Effect::SubmitPrompt("plain prompt".to_string()))
+        );
+    }
+
+    #[test]
+    fn up_down_navigates_completion_with_wrap() {
+        let mut app = seeded_app();
+        type_text(&mut app, "/");
+        let len = app.completion.as_ref().unwrap().items.len();
+        // Down moves forward.
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.completion.as_ref().unwrap().selected, 1);
+        // Up wraps from the top to the last.
+        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.completion.as_ref().unwrap().selected, len - 1);
+    }
+
+    #[test]
+    fn selection_survives_recompute_when_still_a_candidate() {
+        let mut app = seeded_app();
+        // `/s`: candidates include /sessions (first) and /save. Move down to
+        // /save, then narrow to `/sa` where /save is still present: the
+        // selection sticks to /save.
+        type_text(&mut app, "/s");
+        let before: Vec<&str> = app
+            .completion
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .map(|i| i.value.as_str())
+            .collect();
+        assert!(before.contains(&"/save"), "{before:?}");
+        let save_idx = app
+            .completion
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .position(|i| i.value == "/save")
+            .unwrap();
+        for _ in 0..save_idx {
+            app.handle_key(key(KeyCode::Down));
+        }
+        assert_eq!(app.completion.as_ref().unwrap().selected, save_idx);
+        assert_eq!(
+            app.completion.as_ref().unwrap().items[save_idx].value,
+            "/save"
+        );
+        // Narrowing to `/sa` keeps /save selected (still the chosen value).
+        type_text(&mut app, "a");
+        let comp = app.completion.as_ref().unwrap();
+        assert_eq!(comp.items[comp.selected].value, "/save");
+    }
+
+    #[test]
+    fn esc_closes_completion_and_keeps_text() {
+        let mut app = seeded_app();
+        type_text(&mut app, "/sav");
+        assert!(app.completion.is_some());
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.completion.is_none());
+        assert_eq!(app.input_text(), "/sav");
+    }
+
+    #[test]
+    fn backspace_into_command_reopens_completion() {
+        let mut app = seeded_app();
+        // Commit /save with Tab (trailing space, popup closed), then delete
+        // the space: the popup reopens with /save still the best match.
+        type_text(&mut app, "/sav");
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.input_text(), "/save ");
+        assert!(app.completion.is_none());
+        app.handle_key(key(KeyCode::Backspace));
+        assert!(app.completion.is_some());
+        let comp = app.completion.as_ref().unwrap();
+        assert_eq!(comp.items[comp.selected].value, "/save");
+    }
+
+    #[test]
+    fn page_keys_scroll_completion_not_transcript() {
+        let mut app = seeded_app();
+        // Seed a transcript taller than the pane so scrolling is observable.
+        for i in 0..12 {
+            app.render(&DisplayItem::Text(format!("line {i}\n")))
+                .unwrap();
+        }
+        type_text(&mut app, "/");
+        let scroll_before = app.scroll;
+        app.handle_key(key(KeyCode::PageDown));
+        // The transcript scroll is untouched; the popup selection advanced.
+        assert_eq!(app.scroll, scroll_before);
+        let comp = app.completion.as_ref().unwrap();
+        assert!(comp.selected >= 10, "selected: {}", comp.selected);
+    }
+
+    #[test]
+    fn completion_popup_renders_below_input_with_selection() {
+        let mut app = seeded_app();
+        type_text(&mut app, "/sav");
+        let buffer = render_buffer(&mut app, 60, 14);
+        // The candidate is drawn with its name and description, selected.
+        assert!(buffer_contains(&buffer, "/save"));
+        assert!(buffer_contains(&buffer, "save the current session"));
+        // The completion box title marks it as such.
+        assert!(buffer_contains(&buffer, "completion"));
+    }
+
+    #[test]
+    fn completion_includes_installed_skills() {
+        let mut app = App::new(
+            "~/proj",
+            "sess-1",
+            "model-x",
+            vec![skill("grill", "stress-test a plan")],
+        );
+        type_text(&mut app, "/gr");
+        let comp = app.completion.as_ref().expect("popup open");
+        let values: Vec<&str> = comp.items.iter().map(|i| i.value.as_str()).collect();
+        assert!(values.contains(&"/grill"), "{values:?}");
+    }
+
+    #[test]
+    fn ctrl_c_quits_with_completion_open() {
+        let mut app = seeded_app();
+        type_text(&mut app, "/sav");
         assert_eq!(app.handle_key(ctrl_key('c')), Some(Effect::Quit));
     }
 }

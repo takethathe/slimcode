@@ -46,6 +46,14 @@ _Avoid_: context window (collides with the LLM notion), assembled messages
 A Prompt entered across multiple lines in the TUI input box (Shift+Enter inserts a newline; Enter submits). Stored and submitted as a single Prompt.
 _Avoid_: block, paste
 
+**Completion popup**:
+The fuzzy candidate list shown below the TUI input box while a partial `/` command is typed (commands + installed skills, ranked best-first). `↑`/`↓` move the selection, `Tab` commits it to the buffer, `Enter` executes it, `Esc` cancels. Distinct from the post-submit "did you mean" notice.
+_Avoid_: autocomplete box, suggestion popup, picker
+
+**Commit to buffer**:
+The action of accepting a Completion popup selection with `Tab`: the selected `/` spelling is written into the input buffer with a trailing space and the cursor placed after it, ready for an argument; the command is **not** submitted. `Enter` commits without the trailing space and submits immediately.
+_Avoid_: 上屏, fill, autofill, insert completion
+
 **Frontend**:
 A user-facing entry point — the one-shot CLI or the interactive TUI — that reads input, drives the shared turn runner, and renders output through its own Renderer.
 _Avoid_: UI, client

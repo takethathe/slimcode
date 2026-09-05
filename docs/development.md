@@ -110,7 +110,11 @@ cargo workspace，六个 crate：
   `CommandKind::Numbered`（如 `/!N`：`name` 后跟数字序列，匹配 `/!3`）；
 - `COMMANDS`：命令注册表的单一事实来源（`/help`、启动 banner、未知命令提示均由此生成）；
 - `find(input)`：精确解析规范名或别名到命令；
-- `suggest(input)`：按前缀预测匹配命令（`/` 单独列出全部，非 `/` 输入返回空）。
+- `suggest(input)`：按前缀预测匹配命令（`/` 单独列出全部，非 `/` 输入返回空）；
+- `fuzzy`（ADR-0005）：通用子序列模糊匹配器 `fuzzy_match(query, text) -> Option<i64>`，
+  **分数越低越优**——连续命中（每字符 −50）、词边界（`-_. /:` 前，−100）、精确匹配（−1000）加分，
+  间隔（每字符 +20）与靠后位置（+1/索引）减分，启发式整数缩放自 pi 的 `fuzzy.ts`；
+  纯函数、无依赖、可独立单测，供 `/` 补全弹框的候选排序使用。
 
 这里只登记**内置**命令；安装的 **skill** 是另一组动态 `/` 触发
 （`slimcode-common::skills`），前端在预测部分 `/` 输入时把两者合并
@@ -144,6 +148,11 @@ cargo workspace，六个 crate：
   `skill_prompt`；`disable-model-invocation: true` 的 skill 不进系统提示词，
   只通过显式 `/name` 触发；`Skill` 携带 `dir`（发现/安装时确定），
   `skill_prompt` 把它注入触发消息，供模型解析正文里的相对路径；
+- `/` 补全（ADR-0005）：`CompletionItem { value, description }` + `complete(input,
+  skills) -> Vec<CompletionItem>`——把 `slimcode-commands` 的每个命令拼写（规范名 + 别名）
+  与每个已安装 skill 合成候选池，用 `fuzzy::fuzzy_match` 模糊排序（裸 `/` 按注册表顺序列全部，
+  命令在前、skill 在后；非 `/` 输入返回空）；候选 `value` 始终是裸拼写（`/save`、`/resume`、
+  `/skill-name`），**不含** `usage` 的参数占位符，提交时经 `find`/`find_skill` 可解析；
 - `context`：`ContextBuilder`（前端无关）把一轮 prompt 的上下文组装收敛为单一
   入口：基础系统提示（默认 `DEFAULT_SYSTEM_PROMPT` 或 `with_system` 覆盖）+
   可自动调用 skill 广告（`with_skills`，build 时过滤 `disable-model-invocation`）+
@@ -183,6 +192,15 @@ cargo workspace，六个 crate：
   会清空 transcript 再重建会话视图。输入历史 recall：输入框为空时按 `↑`/`↓` 进入
   （从最新一条开始），`Enter` 把选中的历史 prompt 作为新一轮重跑（不再写入历史）；
   记录在每轮提交时追加（不查重，同 `HistoryStore::append`）。
+- **`/` 补全弹框（ADR-0005）**：`App::completion: Option<Completion>`（`items` /
+  `selected` / `offset`，`Completion::clamp_offset` 让选中项始终落在滚动窗口内）。
+  条件：整条输入为单行、以 `/` 开头且 `/` 后无空白（输入空格进入参数段即关闭弹框）；
+  每次按键后 `refresh_completion` 重算候选（`common::skills::complete`），已选中值仍是
+  候选时保留选择，否则回落到最佳匹配（index 0）。按键：`↑`/`↓` 循环导航、`PgUp`/`PgDn`
+  翻页（弹框打开时优先于 transcript 滚动）、`Tab` 上屏（写入裸拼写 + 尾部空格、光标
+  落空格后、不提交）、`Enter` 展开选中项后直接提交执行、`Esc` 取消并保留文本。弹框在
+  input 与 status 之间动态扩展高度渲染（`render_completion`，ratatui `List`，选中行
+  `→` + 反色，最多 `COMPLETION_VISIBLE=5` 行，超出显示滚动窗口标记）。
 - **终端循环（`terminal`）**：薄壳。`run(cwd, config, store, history, skills)` 先经
   `common::setup::setup` 构造 provider + 工具（**在**进入 raw mode / alternate
   screen 之前，API-key/配置错误在普通终端上浮现），再 `enable_raw_mode` +
