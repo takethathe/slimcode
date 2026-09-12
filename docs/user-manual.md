@@ -102,7 +102,7 @@ one-shot 模式没有命令解析器：如果 prompt 以 `/skill:name` 开头，
 ### 交互式 TUI
 
 不带参数启动（stdout 是终端）即进入全屏 TUI，会话在每一轮后自动保存到
-`~/.slimcode/sessions/<id>.json`：
+`~/.slimcode/sessions/<project-key>/<id>.json`（每个项目一个目录）：
 
 ```bash
 slimcode
@@ -186,8 +186,8 @@ recall 状态下按 `Enter` 会把选中的历史 prompt 作为**新一轮**运�
 | --- | --- |
 | `/help` | 列出命令 |
 | `/new` | 新建会话（清空 transcript） |
-| `/load <id>` | 从磁盘恢复一个已保存会话（`/resume` 同义；清空 transcript 后载入其消息历史） |
-| `/sessions` | 列出已保存会话 id |
+| `/load <id>` | 从磁盘恢复一个已保存会话（`/resume` 同义；清空 transcript 后载入其消息历史）。只查找当前项目的会话 |
+| `/sessions` | 列出**当前项目**已保存的会话 id |
 | `/usage` | 显示累计 token 用量 |
 | `/save` | 显式保存当前会话 |
 | `/history` | 列出输入历史（最近 20 条、最新在前、带编号） |
@@ -334,11 +334,29 @@ markdown 结构冲突。与 Skill 的区别：Skill 按需触发（`/skill:name`
 
 ### 会话文件
 
-每个会话以 JSON 存于 `~/.slimcode/sessions/`，消息模型为
+会话**按项目分区**存放：每个项目一个目录，目录名是该项目的 project home（git 仓库根，
+非 git 时回退到 OS 用户家目录）的 basename 加路径 hash——所以同一项目每次启动都落到
+同一目录，不同路径的同名仓库也不会混到一起。每个会话以 JSON 存于
+`~/.slimcode/sessions/<project-key>/<id>.json`，消息模型为
 `Message{role, parts, tool_calls, tool_call_id}` + `Session{id, created_at,
 messages, title}`。`/load` 恢复会话后，历史消息（含系统提示与 `## Environment`
 环境信息）原样继续，环境沿用首轮冻结值。
 会话不记录工作目录——恢复后工具作用于当前启动目录。
+
+`/load` 与 `/sessions` **只作用于当前项目**：其他项目的会话（以及升级前旧的扁平
+`sessions/<id>.json` 文件）不会被列出，也不会被加载。
+
+**磁盘清理**（避免会话文件堆满磁盘）：
+
+- **启动时**：静默删除当前项目内的空会话文件（`messages` 为空、0 字节或 JSON 损坏），
+  无任何提示；
+- **每次保存后**：统计整个 `sessions/` 目录（所有项目 + 遗留的旧扁平文件）的总字节数，
+  超过配额（`config.toml` 的 `[sessions] max_mb`，默认 500 MiB）时按文件 mtime
+  **从最旧**删除，直到总占用降到配额的一半（默认 250 MiB）。当前正在使用的会话永不被
+  删，删空的项目目录一并移除；清理失败不影响保存。
+
+配额与旧文件清理的细节见 [configuration.md](./configuration.md) 的「会话存储配额」节与
+[ADR-0008](./adr/0008-project-scoped-sessions-with-quota-eviction.md)。
 
 ### 工具集
 

@@ -1,21 +1,21 @@
 //! Frontend-agnostic application configuration.
 //!
 //! `~/.slimcode/config.toml` holds overrides (`[ai] base_url` / `[ai] model` /
-//! `[ai] cache` / `[ai] api_key`). Precedence is frontend overrides
+//! `[ai] cache` / `[ai] api_key`, plus `[sessions] max_mb` for the session
+//! storage quota). Precedence is frontend overrides
 //! (`--base-url` / `--model` / `--api-key`) > env (`SLIMCODE_AI_BASE_URL` /
 //! `SLIMCODE_AI_MODEL` / `DASHSCOPE_API_KEY`) > config.toml > defaults (owned
 //! here). The API key therefore has three sources (`--api-key` >
 //! `DASHSCOPE_API_KEY` > `[ai] api_key`) — a conscious reversal of the earlier
 //! "key never touches disk" decision: env stays a higher-precedence secret
 //! source, the file is a convenience fallback. File values are literal only
-//! (no `$ENV` / `!command` interpolation).
+//! (no `$ENV` / `!command` interpolation). The session quota is the exception
+//! to the four-layer scheme: file > default, with no env or CLI override.
 //!
 //! This module is the single owner of that resolution and of the env var names
-//! and defaults behind it: it produces a [`slimcode_ai::BailianConfig`], so the
-//! provider layer stays pure data and no other crate re-parses the same env
-//! variables and defaults.
-
-use std::path::Path;
+//! and defaults behind it: it produces an [`AppConfig`] (the provider config
+//! plus the session quota), so the provider layer stays pure data and no other
+//! crate re-parses the same env variables and defaults.
 
 use serde::Deserialize;
 use slimcode_ai::BailianConfig;
@@ -24,6 +24,8 @@ use slimcode_ai::BailianConfig;
 pub const DEFAULT_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 /// Recommended default model (ticket 01).
 pub const DEFAULT_MODEL: &str = "qwen-plus";
+/// Default session quota in MiB (spec: 500).
+pub const DEFAULT_MAX_MB: u64 = 500;
 
 /// Environment variable holding the API key (required).
 pub const ENV_API_KEY: &str = "DASHSCOPE_API_KEY";
@@ -77,6 +79,8 @@ pub struct ConfigAnswers {
 struct FileConfig {
     #[serde(default)]
     ai: FileAi,
+    #[serde(default)]
+    sessions: FileSessions,
 }
 
 #[derive(Deserialize, Default)]
@@ -85,6 +89,11 @@ struct FileAi {
     model: Option<String>,
     cache: Option<bool>,
     api_key: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct FileSessions {
+    max_mb: Option<u64>,
 }
 
 /// The slimcode home directory: `$SLIMCODE_HOME` if set, else `~/.slimcode`.
@@ -205,6 +214,52 @@ fn resolve(
     ))
 }
 
+/// Convert a MiB value to bytes (1024² per MiB).
+pub fn max_mb_to_bytes(max_mb: u64) -> u64 {
+    max_mb * 1024 * 1024
+}
+
+/// Resolve `[sessions] max_mb` from config.toml text: the file value or the
+/// default (500). Tolerant of unparseable input (falls back to the default);
+/// there is deliberately no env / CLI override for this knob. A non-integer
+/// value fails the TOML parse, which the strict AI resolution path surfaces as
+/// a startup error while this tolerant reader just defaults.
+pub fn resolve_max_mb(file_toml: Option<&str>) -> u64 {
+    file_toml
+        .filter(|s| !s.trim().is_empty())
+        .and_then(|s| toml::from_str::<FileConfig>(s).ok())
+        .and_then(|f| f.sessions.max_mb)
+        .unwrap_or(DEFAULT_MAX_MB)
+}
+
+/// The resolved, non-secret application settings handed to frontends: the AI
+/// provider config plus the session storage quota in bytes.
+pub struct AppConfig {
+    pub provider: BailianConfig,
+    pub api_key_source: ApiKeySource,
+    pub sessions_max_bytes: u64,
+}
+
+/// Load config from the real environment and config file, applying frontend
+/// overrides on top, plus the session storage quota.
+pub fn load_app_config(overrides: Overrides) -> Result<AppConfig, String> {
+    let path = slimcode_home().map(|h| h.join("config.toml"));
+    let file_toml = match &path {
+        Some(p) if p.exists() => {
+            Some(std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?)
+        }
+        _ => None,
+    };
+    let (provider, api_key_source) =
+        resolve(file_toml.as_deref(), &|k| std::env::var(k).ok(), &overrides)?;
+    let sessions_max_bytes = max_mb_to_bytes(resolve_max_mb(file_toml.as_deref()));
+    Ok(AppConfig {
+        provider,
+        api_key_source,
+        sessions_max_bytes,
+    })
+}
+
 /// Read the current editable `[ai]` values from existing `config.toml` text
 /// (for the interactive `slimcode config` defaults). Tolerant: unparseable
 /// input yields all `None` — the subsequent [`merge_config_toml`] surfaces the
@@ -274,28 +329,6 @@ pub fn merge_config_toml(
     }
 
     toml::to_string(&root).map_err(|e| format!("config.toml: {e}"))
-}
-
-/// Load config from the real environment and config file, applying frontend
-/// overrides on top.
-pub fn load_with_overrides(overrides: Overrides) -> Result<(BailianConfig, ApiKeySource), String> {
-    let path = slimcode_home().map(|h| h.join("config.toml"));
-    load_from(path.as_deref(), &overrides)
-}
-
-/// Load config with an explicit config file path and frontend overrides. `None`
-/// (or a missing file) skips file loading entirely.
-pub fn load_from(
-    path: Option<&Path>,
-    overrides: &Overrides,
-) -> Result<(BailianConfig, ApiKeySource), String> {
-    let file_toml = match path {
-        Some(p) if p.exists() => {
-            Some(std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?)
-        }
-        _ => None,
-    };
-    resolve(file_toml.as_deref(), &|k| std::env::var(k).ok(), overrides)
 }
 
 #[cfg(test)]
@@ -761,5 +794,53 @@ mod tests {
         // (the CLI treats this as a no-op, never creating an empty file).
         let out = merge_config_toml(None, &ConfigAnswers::default()).unwrap();
         assert!(out.trim().is_empty(), "expected empty output, got: {out:?}");
+    }
+
+    // --- sessions max_mb (session-project-scoped ticket 04) ---------------
+
+    #[test]
+    fn sessions_max_mb_defaults_to_500() {
+        assert_eq!(resolve_max_mb(None), 500);
+        assert_eq!(resolve_max_mb(Some("\n  \n")), 500);
+        assert_eq!(resolve_max_mb(Some("[ai]\nmodel = \"m\"\n")), 500);
+    }
+
+    #[test]
+    fn sessions_max_mb_reads_file_value() {
+        assert_eq!(resolve_max_mb(Some("[sessions]\nmax_mb = 42\n")), 42);
+    }
+
+    #[test]
+    fn sessions_max_mb_ignores_non_numeric_value() {
+        // A non-integer `max_mb` fails the whole TOML parse; the tolerant
+        // reader falls back to the default rather than panicking.
+        assert_eq!(resolve_max_mb(Some("[sessions]\nmax_mb = \"abc\"\n")), 500);
+    }
+
+    #[test]
+    fn sessions_table_survives_ai_parse() {
+        // A config with only `[sessions]` still resolves the AI fields.
+        let env = env_of(&[(ENV_API_KEY, "sk-test")]);
+        let cfg = resolve_cfg(
+            Some("[sessions]\nmax_mb = 7\n"),
+            &env,
+            &Overrides::default(),
+        );
+        assert_eq!(cfg.model, DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn max_mb_converts_to_bytes() {
+        assert_eq!(max_mb_to_bytes(500), 500 * 1024 * 1024);
+        assert_eq!(max_mb_to_bytes(0), 0);
+    }
+
+    #[test]
+    fn default_quota_matches_session_store_default() {
+        // The config default (MiB) and the store's byte fallback must agree.
+        assert_eq!(
+            max_mb_to_bytes(DEFAULT_MAX_MB),
+            crate::session::DEFAULT_MAX_BYTES
+        );
     }
 }

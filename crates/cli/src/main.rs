@@ -28,7 +28,7 @@ use slimcode_common::context::{ContextBuilder, Environment};
 use slimcode_common::context_files::{ContextFile, load_context_files, resolve_project_home};
 use slimcode_common::history::HistoryStore;
 use slimcode_common::render::{DisplayItem, Renderer};
-use slimcode_common::session::{SessionStore, infer_title};
+use slimcode_common::session::{SessionStore, infer_title, project_key};
 use slimcode_common::skills::{Skill, SkillStore, normalize_skill_trigger};
 
 fn usage() -> String {
@@ -59,6 +59,12 @@ fn usage() -> String {
 }
 
 /// Non-interactive one-shot: run one prompt, save the session, print usage.
+//
+// `clippy::too_many_arguments` is allowed: all eight parameters are the
+// distinct inputs of the one-shot entry point (prompt, cwd, config, store,
+// skills, context files, environment, output), and bundling them would only
+// move the sprawl into a struct with no shared lifecycle.
+#[allow(clippy::too_many_arguments)]
 fn run_once(
     prompt: &str,
     cwd: &Path,
@@ -205,12 +211,14 @@ fn run(args: &[String], out: &mut dyn Write, tty: bool) -> Result<i32, String> {
         None => env::current_dir().map_err(|e| format!("cwd: {e}"))?,
     };
 
-    let (app_config, api_key_source) = config::load_with_overrides(Overrides {
+    let app = config::load_app_config(Overrides {
         base_url: parsed.base_url,
         model: parsed.model,
         cache: parsed.cache,
         api_key: parsed.api_key,
     })?;
+    let app_config = app.provider;
+    let api_key_source = app.api_key_source;
     let home =
         config::slimcode_home().ok_or_else(|| "cannot determine home directory".to_string())?;
     // Print the `chmod 600` hint right after loading — before any turn or, for
@@ -219,21 +227,30 @@ fn run(args: &[String], out: &mut dyn Write, tty: bool) -> Result<i32, String> {
     if let Some(w) = chmod_warning(&home.join("config.toml"), api_key_source) {
         eprintln!("slimcode: {w}");
     }
-    let store = SessionStore::new(home.join("sessions"));
+    // System environment info: OS name, global home (slimcode home), and the
+    // project home (git root, falling back to the OS user home). Frozen at
+    // startup; a restored session keeps the environment from its first turn.
+    let user_home = std::env::var_os("HOME").map(PathBuf::from);
+    let project_home = resolve_project_home(&cwd, user_home.as_deref());
+    // The session store is scoped to the current project: sessions persist
+    // under `<home>/sessions/<project-key>/`, so `/load` and `/sessions` only
+    // ever see this project's sessions.
+    let store = SessionStore::new(home.join("sessions"), project_key(&project_home))
+        .with_max_bytes(app.sessions_max_bytes);
+    // Startup empty-session cleanup: silently remove empty/corrupt session
+    // files from the current project's directory (best-effort; a cleanup
+    // failure never blocks startup).
+    let _ = store.cleanup_empty();
     let history = HistoryStore::new(home.join("history.json"));
     let skills_store = SkillStore::new(&home, &cwd);
     // Skill discovery failures must not block a run; `/skills` surfaces them.
     let skills = skills_store.list().unwrap_or_default();
     // AGENTS.md discovery is infallible: missing files simply yield none.
     let context_files = load_context_files(&home, &cwd);
-    // System environment info: OS name, global home (slimcode home), and the
-    // project home (git root, falling back to the OS user home). Frozen at
-    // startup; a restored session keeps the environment from its first turn.
-    let user_home = std::env::var_os("HOME").map(PathBuf::from);
     let environment = Environment {
         os: std::env::consts::OS.to_string(),
         global_home: home.clone(),
-        project_home: resolve_project_home(&cwd, user_home.as_deref()),
+        project_home,
     };
 
     match parsed.prompt {
@@ -343,9 +360,16 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
 mod tests {
     use super::*;
 
+    /// Serializes tests that mutate process-global env vars (`run_isolated`
+    /// and `no_args_no_tty_errors_clearly` both touch `ENV_API_KEY`/`ENV_HOME`;
+    /// without the lock they race in parallel runs and clobber each other's
+    /// restoration).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Run `args` with `tty` injected and env isolated: the API key is cleared
     /// and HOME points at a temp dir so config resolution is deterministic.
     fn run_isolated(args: &[String], tty: bool) -> Result<i32, String> {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let old_key = env::var_os(config::ENV_API_KEY);
         unsafe { env::remove_var(config::ENV_API_KEY) };
         let old_home = env::var_os(config::ENV_HOME);
@@ -378,6 +402,7 @@ mod tests {
     fn no_args_no_tty_errors_clearly() {
         // Launch rule: no prompt on a non-TTY fails with a clear error before
         // any config resolution (the API key is deliberately unset).
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let old_key = env::var_os(config::ENV_API_KEY);
         unsafe { env::remove_var(config::ENV_API_KEY) };
         let err = run(&[], &mut Vec::new(), false).unwrap_err();

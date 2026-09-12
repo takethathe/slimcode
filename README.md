@@ -93,7 +93,7 @@ slimcode --model qwen-max "为 README 补一段简介"
 ### 交互式 REPL
 
 不带参数启动即进入 REPL，会话在每一轮后自动保存到
-`~/.slimcode/sessions/<id>.json`：
+`~/.slimcode/sessions/<project-key>/<id>.json`：
 
 ```bash
 slimcode

@@ -25,6 +25,7 @@ slimcode 的配置分四层，**逐项**按以下优先级解析（高 → 低�
 | base URL | 命令行 `--base-url` 或环境变量 `SLIMCODE_AI_BASE_URL` 或 `config.toml` 的 `[ai] base_url` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | 否 |
 | model | 命令行 `--model` 或环境变量 `SLIMCODE_AI_MODEL` 或 `config.toml` 的 `[ai] model` | `qwen-plus` | 否 |
 | 上下文缓存 | 命令行 `--cache` / `--no-cache` 或环境变量 `SLIMCODE_AI_CACHE` 或 `config.toml` 的 `[ai] cache` | **`true`（默认开启）** | 否 |
+| 会话存储配额 | `config.toml` 的 `[sessions] max_mb` | `500`（MiB） | 否 |
 | slimcode 家目录 | 环境变量 `SLIMCODE_HOME` | `~/.slimcode` | 否 |
 
 ### 上下文缓存（cache）
@@ -71,6 +72,23 @@ export SLIMCODE_HOME=/path/to/custom/slimcode
 
 未设置 `SLIMCODE_HOME` 且 `$HOME` 为空时，slimcode 不加载 `config.toml`（文件
 加载被跳过），base URL 与 model 直接使用默认值。
+
+### 会话存储配额（`[sessions] max_mb`）
+
+`config.toml` 的 `[sessions]` 表只认一个键 `max_mb`：会话文件的总字节上限，
+单位 MiB，默认 `500`。**没有**环境变量或命令行覆盖——只有文件与默认两层：
+
+```toml
+[sessions]
+max_mb = 500
+```
+
+每次保存会话后，slimcode 统计 `sessions/` 下所有会话文件（含各项目子目录）的总字节数；
+超过 `max_mb` 时按文件 mtime **从最旧**删除，直到总占用降到阈值的一半（默认 250 MiB），
+并跳过当前正在使用的会话；删空的项目目录一并移除。清理是尽力而为的：失败不会让保存失败。
+启动时还会静默清理当前项目内的空会话（无消息、0 字节或损坏的 JSON）。
+详见 [user-manual.md](./user-manual.md) 的「会话文件」节与
+[ADR-0008](./adr/0008-project-scoped-sessions-with-quota-eviction.md)。
 
 ### Skill 目录（非 config.toml）
 

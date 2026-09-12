@@ -35,6 +35,30 @@ _Avoid_: plugin, extension
 A conversation with a stable id, timestamp, messages, and optional title; persisted as JSON and restorable via `/load`.
 _Avoid_: conversation (used interchangeably)
 
+**Session store**:
+The project-scoped place sessions are persisted: one directory per project
+(`<home>/sessions/<project-key>/`) holding one JSON file per Session. `/load` and
+`/sessions` see only the current project's directory.
+_Avoid_: sessions dir, archive
+
+**Project key**:
+The deterministic name of a project's directory inside the session store: the project
+home's basename plus a hash of its full path, so a given project always maps to the same
+directory and same-named projects at different paths stay separate.
+_Avoid_: project slug, project id
+
+**Storage quota**:
+The byte ceiling on the whole session store (`[sessions] max_mb`, default 500 MiB),
+distinct from any single session's size.
+_Avoid_: size limit, cache
+
+**Eviction**:
+Removing Session files once the session store exceeds the storage quota: oldest-first by
+mtime, down to half the quota, never the active session. An **empty session** (no
+messages, zero-byte, or unparseable JSON) is removed by a separate startup sweep that
+touches only the current project.
+_Avoid_: cleanup, pruning, GC
+
 **Message history**:
 The conversation messages of a Session (`session.messages`), restorable via `/load`.
 _Avoid_: history (bare — collides with input history)
