@@ -154,8 +154,6 @@ pub enum Effect {
     NewSession,
     /// Load the session with the given id (clears the transcript).
     LoadSession(String),
-    /// Persist the current session.
-    SaveSession,
     /// List persisted sessions.
     ListSessions,
     /// Show the usage for the last turn.
@@ -1077,7 +1075,6 @@ impl App {
                     None
                 }
                 "/new" => Some(Effect::NewSession),
-                "/save" => Some(Effect::SaveSession),
                 "/load" => match arg {
                     Some(id) if !id.is_empty() => Some(Effect::LoadSession(id.to_string())),
                     _ => {
@@ -2141,13 +2138,8 @@ mod tests {
     }
 
     #[test]
-    fn slash_save_sessions_usage_history_effects() {
+    fn slash_sessions_usage_history_effects() {
         let mut app = seeded_app();
-        type_text(&mut app, "/save");
-        assert_eq!(
-            app.handle_key(key(KeyCode::Enter)),
-            Some(Effect::SaveSession)
-        );
         type_text(&mut app, "/sessions");
         assert_eq!(
             app.handle_key(key(KeyCode::Enter)),
@@ -2394,10 +2386,10 @@ mod tests {
     #[test]
     fn typing_filters_completion_to_matches() {
         let mut app = seeded_app();
-        type_text(&mut app, "/sav");
+        type_text(&mut app, "/us");
         let comp = app.completion.as_ref().expect("popup open");
         let values: Vec<&str> = comp.items.iter().map(|i| i.value.as_str()).collect();
-        assert_eq!(values, vec!["/save"]);
+        assert_eq!(values, vec!["/usage"]);
         assert_eq!(comp.selected, 0);
     }
 
@@ -2411,7 +2403,7 @@ mod tests {
     #[test]
     fn space_closes_completion_for_arguments() {
         let mut app = seeded_app();
-        type_text(&mut app, "/sav");
+        type_text(&mut app, "/us");
         assert!(app.completion.is_some());
         // Typing a space (entering the argument part) closes the popup.
         type_text(&mut app, " ");
@@ -2421,13 +2413,13 @@ mod tests {
     #[test]
     fn tab_commits_selection_with_trailing_space() {
         let mut app = seeded_app();
-        type_text(&mut app, "/sav");
+        type_text(&mut app, "/us");
         let effect = app.handle_key(key(KeyCode::Tab));
         assert_eq!(effect, None);
         assert!(app.completion.is_none());
         // The selected candidate is committed with a trailing space, ready for
         // an argument; it is NOT submitted.
-        assert_eq!(app.input_text(), "/save ");
+        assert_eq!(app.input_text(), "/usage ");
     }
 
     #[test]
@@ -2443,11 +2435,11 @@ mod tests {
     #[test]
     fn enter_commits_selection_and_executes() {
         let mut app = seeded_app();
-        type_text(&mut app, "/sav");
-        // The popup's best match for `/sav` is `/save`; Enter expands and runs
+        type_text(&mut app, "/us");
+        // The popup's best match for `/us` is `/usage`; Enter expands and runs
         // it (Q4: execute the selection, not the literal partial text).
         let effect = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(effect, Some(Effect::SaveSession));
+        assert_eq!(effect, Some(Effect::ShowUsage));
         assert!(app.completion.is_none());
         assert!(app.input_text().is_empty());
     }
@@ -2491,9 +2483,9 @@ mod tests {
     #[test]
     fn selection_survives_recompute_when_still_a_candidate() {
         let mut app = seeded_app();
-        // `/s`: candidates include /sessions (first) and /save. Move down to
-        // /save, then narrow to `/sa` where /save is still present: the
-        // selection sticks to /save.
+        // `/s`: candidates include /sessions (first) and /skills. Move down to
+        // /skills, then narrow to `/sk` where /skills is still present: the
+        // selection sticks to /skills.
         type_text(&mut app, "/s");
         let before: Vec<&str> = app
             .completion
@@ -2503,27 +2495,27 @@ mod tests {
             .iter()
             .map(|i| i.value.as_str())
             .collect();
-        assert!(before.contains(&"/save"), "{before:?}");
-        let save_idx = app
+        assert!(before.contains(&"/skills"), "{before:?}");
+        let skills_idx = app
             .completion
             .as_ref()
             .unwrap()
             .items
             .iter()
-            .position(|i| i.value == "/save")
+            .position(|i| i.value == "/skills")
             .unwrap();
-        for _ in 0..save_idx {
+        for _ in 0..skills_idx {
             app.handle_key(key(KeyCode::Down));
         }
-        assert_eq!(app.completion.as_ref().unwrap().selected, save_idx);
+        assert_eq!(app.completion.as_ref().unwrap().selected, skills_idx);
         assert_eq!(
-            app.completion.as_ref().unwrap().items[save_idx].value,
-            "/save"
+            app.completion.as_ref().unwrap().items[skills_idx].value,
+            "/skills"
         );
-        // Narrowing to `/sa` keeps /save selected (still the chosen value).
-        type_text(&mut app, "a");
+        // Narrowing to `/sk` keeps /skills selected (still the chosen value).
+        type_text(&mut app, "k");
         let comp = app.completion.as_ref().unwrap();
-        assert_eq!(comp.items[comp.selected].value, "/save");
+        assert_eq!(comp.items[comp.selected].value, "/skills");
     }
 
     #[test]
@@ -2562,26 +2554,26 @@ mod tests {
     #[test]
     fn esc_closes_completion_and_keeps_text() {
         let mut app = seeded_app();
-        type_text(&mut app, "/sav");
+        type_text(&mut app, "/us");
         assert!(app.completion.is_some());
         app.handle_key(key(KeyCode::Esc));
         assert!(app.completion.is_none());
-        assert_eq!(app.input_text(), "/sav");
+        assert_eq!(app.input_text(), "/us");
     }
 
     #[test]
     fn backspace_into_command_reopens_completion() {
         let mut app = seeded_app();
-        // Commit /save with Tab (trailing space, popup closed), then delete
-        // the space: the popup reopens with /save still the best match.
-        type_text(&mut app, "/sav");
+        // Commit /usage with Tab (trailing space, popup closed), then delete
+        // the space: the popup reopens with /usage still the best match.
+        type_text(&mut app, "/us");
         app.handle_key(key(KeyCode::Tab));
-        assert_eq!(app.input_text(), "/save ");
+        assert_eq!(app.input_text(), "/usage ");
         assert!(app.completion.is_none());
         app.handle_key(key(KeyCode::Backspace));
         assert!(app.completion.is_some());
         let comp = app.completion.as_ref().unwrap();
-        assert_eq!(comp.items[comp.selected].value, "/save");
+        assert_eq!(comp.items[comp.selected].value, "/usage");
     }
 
     #[test]
@@ -2604,17 +2596,17 @@ mod tests {
     #[test]
     fn completion_popup_renders_above_input_with_selection() {
         let mut app = seeded_app();
-        type_text(&mut app, "/sav");
+        type_text(&mut app, "/us");
         let buffer = render_buffer(&mut app, 60, 16);
         // The candidate is drawn with its name and description, selected.
-        assert!(buffer_contains(&buffer, "/save"));
-        assert!(buffer_contains(&buffer, "save the current session"));
+        assert!(buffer_contains(&buffer, "/usage"));
+        assert!(buffer_contains(&buffer, "show token usage"));
         // No bordered box and no ` completion ` title any more (ticket 02).
         assert!(!buffer_contains(&buffer, "completion"));
         let h: u16 = 16;
         let input_top = h - FOOTER_HEIGHT - INPUT_HEIGHT;
         // The popup rows sit ABOVE the input box's top border row.
-        let popup_y = row_containing(&buffer, "→ /save").unwrap();
+        let popup_y = row_containing(&buffer, "→ /usage").unwrap();
         assert!(
             popup_y < input_top,
             "popup above input: {popup_y} vs {input_top}"
@@ -2631,7 +2623,7 @@ mod tests {
         assert!(line_at(&closed, input_top).trim_matches('─').is_empty());
         // Open: the popup eats into the transcript; the input top border row
         // stays exactly where it was (input position stability).
-        type_text(&mut app, "/sav");
+        type_text(&mut app, "/us");
         let open = render_buffer(&mut app, 60, h);
         assert_eq!(line_at(&open, input_top), line_at(&closed, input_top));
         let closed_top = line_at(&closed, input_top);
@@ -2641,12 +2633,12 @@ mod tests {
     #[test]
     fn completion_popup_has_top_separator_line() {
         let mut app = seeded_app();
-        type_text(&mut app, "/sav");
+        type_text(&mut app, "/us");
         let buffer = render_buffer(&mut app, 60, 16);
         // The row directly above the first candidate is a full-width `─`
         // separator line, giving the popup a top border and a clear visual
         // gap from the transcript (ticket 05).
-        let popup_y = row_containing(&buffer, "→ /save").unwrap();
+        let popup_y = row_containing(&buffer, "→ /usage").unwrap();
         let sep_y = popup_y - 1;
         let sep = line_at(&buffer, sep_y);
         assert!(sep.starts_with('─'), "separator row: {sep:?}");
@@ -3179,19 +3171,17 @@ mod tests {
     #[test]
     fn completion_popup_uses_select_list_tokens() {
         let mut app = seeded_app();
-        type_text(&mut app, "/save");
+        type_text(&mut app, "/usage");
         let buffer = render_buffer(&mut app, 80, 16);
         // Selected row: `→ ` cursor + accent name (no bold, no bg
         // inversion — pi select-list `selectedText`).
-        assert!(buffer_contains(&buffer, "→ /save"));
-        let y = row_containing(&buffer, "→ /save").unwrap();
+        assert!(buffer_contains(&buffer, "→ /usage"));
+        let y = row_containing(&buffer, "→ /usage").unwrap();
         let x = line_at(&buffer, y).find('/').unwrap() as u16;
         assert_eq!(cell_style(&buffer, x, y).fg, Some(Token::Accent.color()));
         // Description is `muted` (pi select-list `description` token).
-        let desc_y = row_containing(&buffer, "save the current session").unwrap();
-        let desc_x = line_at(&buffer, desc_y)
-            .find("save the current session")
-            .unwrap() as u16;
+        let desc_y = row_containing(&buffer, "show token usage").unwrap();
+        let desc_x = line_at(&buffer, desc_y).find("show token usage").unwrap() as u16;
         assert_eq!(
             cell_style(&buffer, desc_x, desc_y).fg,
             Some(Token::Muted.color())

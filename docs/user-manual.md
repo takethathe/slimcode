@@ -92,8 +92,9 @@ slimcode --model qwen-max "为 README 补一段简介"
 ```
 
 运行结束后打印 token 用量（含缓存命中数，如
-`tokens: 3019 prompt (2048 cached, 67.8%) + 104 completion = 3123 total`）与本次会话的
-保存路径。
+`tokens: 3019 prompt (2048 cached, 67.8%) + 104 completion = 3123 total`）。
+one-shot 模式不落盘会话：它没有 `/load`/`/sessions` 工作流，与 TUI 的规则一致
+（没有 assistant 消息的一轮不产生会话文件，ADR-0009 D5）。
 
 one-shot 模式没有命令解析器：如果 prompt 以 `/skill:name` 开头，它会被自动改写为
 `/{name}` 引用形式再交给模型（模型从系统提示词的 `## Skills` 索引得知
@@ -101,8 +102,10 @@ one-shot 模式没有命令解析器：如果 prompt 以 `/skill:name` 开头，
 
 ### 交互式 TUI
 
-不带参数启动（stdout 是终端）即进入全屏 TUI，会话在每一轮后自动保存到
-`~/.slimcode/sessions/<project-key>/<id>.json`（每个项目一个目录）：
+不带参数启动（stdout 是终端）即进入全屏 TUI。会话以追加式 JSONL 日志逐条写入
+`~/.slimcode/sessions/<project-key>/<id>.jsonl`（每个项目一个目录）：首个
+assistant 消息出现时才创建文件，之后每条进入历史的消息（assistant 回复、每个工具
+结果）各占一行，随 turn 进行实时追加（ADR-0009）：
 
 ```bash
 slimcode
@@ -168,7 +171,7 @@ recall 状态下按 `Enter` 会把选中的历史 prompt 作为**新一轮**运�
   不提交；
 - `Enter` 把选中项展开为完整命令名后**直接提交执行**（而不是提交你正在输入的部分文本）；
 - `Esc` 取消弹框、保留已输入文本；继续输入字符实时过滤，输入空格（进入参数段）时弹框关闭；
-- 候选值是命令的裸拼写（如 `/save`、`/resume`）或 skill 的规范触发 `/skill:name`，
+- 候选值是命令的裸拼写（如 `/usage`、`/resume`）或 skill 的规范触发 `/skill:name`，
   不含 `usage` 中的参数占位符；skill 匹配只看**名字部分**——`/skill:` 前缀不参与打分，
   所以输入 `s`/`k`/`i`/`l` 等会误中所有 skill 的前缀字母不会产生干扰，而 `/skill:name`
   这种带前缀的输入也会剥掉前缀后按名字匹配；
@@ -189,7 +192,6 @@ recall 状态下按 `Enter` 会把选中的历史 prompt 作为**新一轮**运�
 | `/load <id>` | 从磁盘恢复一个已保存会话（`/resume` 同义；清空 transcript 后载入其消息历史）。只查找当前项目的会话 |
 | `/sessions` | 列出**当前项目**已保存的会话 id |
 | `/usage` | 显示累计 token 用量 |
-| `/save` | 显式保存当前会话 |
 | `/history` | 列出输入历史（最近 20 条、最新在前、带编号） |
 | `/skills` | 列出已安装的 skill（含 user/project scope 与 manual-only 标记） |
 | `/install-skill <path> --user\|--project` | 从路径安装一个 skill（目录含 `SKILL.md`，或单个 markdown 文件） |
@@ -336,24 +338,32 @@ markdown 结构冲突。与 Skill 的区别：Skill 按需触发（`/skill:name`
 
 会话**按项目分区**存放：每个项目一个目录，目录名是该项目的 project home（git 仓库根，
 非 git 时回退到 OS 用户家目录）的 basename 加路径 hash——所以同一项目每次启动都落到
-同一目录，不同路径的同名仓库也不会混到一起。每个会话以 JSON 存于
-`~/.slimcode/sessions/<project-key>/<id>.json`，消息模型为
-`Message{role, parts, tool_calls, tool_call_id}` + `Session{id, created_at,
-messages, title}`。`/load` 恢复会话后，历史消息（含系统提示与 `## Environment`
+同一目录，不同路径的同名仓库也不会混到一起。每个会话是一个追加式 JSONL 日志
+（ADR-0009）：
+`~/.slimcode/sessions/<project-key>/<id>.jsonl`，首行为日志头
+（`type`/`v`/`id`/`created_at`/`project_home`），之后每条进入历史的消息（
+assistant 回复、每个工具结果）各占一行、随 turn 进行实时追加；`title` 变更也会追加为
+一条 `title` 记录。日志格式见 [ADR-0009](./adr/0009-appended-jsonl-session-log.md)。
+
+写入侧不校验、不 fsync，崩溃最多留下一个残缺尾行；读取侧**宽容**：未知/损坏的记录行
+会被跳过并计数，残缺尾行会被丢弃并补一个换行，悬空的工具调用批次会在内存中补上
+`Error: interrupted` 结果（磁盘字节不会被改写）。`/load` 若遇到跳过记录或修补的工具
+调用，会给出相应 notice。`/load` 恢复会话后，历史消息（含系统提示与 `## Environment`
 环境信息）原样继续，环境沿用首轮冻结值。
 会话不记录工作目录——恢复后工具作用于当前启动目录。
 
-`/load` 与 `/sessions` **只作用于当前项目**：其他项目的会话（以及升级前旧的扁平
-`sessions/<id>.json` 文件）不会被列出，也不会被加载。
+`/load` 与 `/sessions` **只作用于当前项目**：其他项目的会话不会被列出，也不会被加载。
+升级前旧的整文件 `sessions/<id>.json` 会留在磁盘上但不可见（不列出、不加载、不被空
+会话清理删除），只计入磁盘配额（见下）。
 
 **磁盘清理**（避免会话文件堆满磁盘）：
 
-- **启动时**：静默删除当前项目内的空会话文件（`messages` 为空、0 字节或 JSON 损坏），
-  无任何提示；
-- **每次保存后**：统计整个 `sessions/` 目录（所有项目 + 遗留的旧扁平文件）的总字节数，
-  超过配额（`config.toml` 的 `[sessions] max_mb`，默认 500 MiB）时按文件 mtime
-  **从最旧**删除，直到总占用降到配额的一半（默认 250 MiB）。当前正在使用的会话永不被
-  删，删空的项目目录一并移除；清理失败不影响保存。
+- **启动时**：静默删除当前项目内**重放不到任何 assistant 消息**的 `.jsonl` 日志
+  （0 字节、日志头损坏、或只有头的崩溃残留），无任何提示；
+- **每次追加后**：统计整个 `sessions/` 目录（所有项目的 `.jsonl` 日志 + 遗留的旧
+  扁平/`.json` 文件）的总字节数，超过配额（`config.toml` 的 `[sessions] max_mb`，默认
+  500 MiB）时按文件 mtime **从最旧**删除，直到总占用降到配额的一半（默认 250 MiB）。
+  当前正在使用的会话永不被删，删空的项目目录一并移除；清理失败不影响会话。
 
 配额与旧文件清理的细节见 [configuration.md](./configuration.md) 的「会话存储配额」节与
 [ADR-0008](./adr/0008-project-scoped-sessions-with-quota-eviction.md)。

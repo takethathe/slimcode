@@ -557,7 +557,7 @@ pub fn combined_suggestions(skills: &[Skill], input: &str) -> Vec<String> {
 /// commit to the input buffer and a short description.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompletionItem {
-    /// The `/`-prefixed spelling to commit (e.g. `/save`, `/resume`, or
+    /// The `/`-prefixed spelling to commit (e.g. `/usage`, `/resume`, or
     /// `/skill:name`). Unlike [`combined_suggestions`], this is the bare
     /// spelling — never the usage string with its argument placeholder.
     pub value: String,
@@ -1200,10 +1200,10 @@ mod tests {
 
     #[test]
     fn complete_prefix_matches_command_name() {
-        let items = complete("/sav", &[]);
+        let items = complete("/us", &[]);
         let values: Vec<&str> = items.iter().map(|i| i.value.as_str()).collect();
-        assert_eq!(values, vec!["/save"]);
-        assert_eq!(items[0].description, "save the current session");
+        assert_eq!(values, vec!["/usage"]);
+        assert_eq!(items[0].description, "show token usage");
     }
 
     #[test]
@@ -1291,21 +1291,21 @@ mod tests {
     #[test]
     fn complete_ranks_fuzzy_matches_best_first() {
         // A skill whose bare name exactly equals the query scores the exact
-        // match (best) and outranks the /save command that only starts with
+        // match (best) and outranks the /usage command that only starts with
         // the same letters: matching happens on the name, not the trigger.
         let s = parse_skill(
-            "---\nname: sav\ndescription: save quick\n---\nb\n",
+            "---\nname: us\ndescription: usage quick\n---\nb\n",
             SkillScope::User,
         )
         .unwrap();
-        let items = complete("/sav", &[s]);
+        let items = complete("/us", &[s]);
         let values: Vec<&str> = items.iter().map(|i| i.value.as_str()).collect();
-        assert_eq!(*values.first().unwrap(), "/skill:sav", "{values:?}");
-        assert!(values.contains(&"/save"), "got: {values:?}");
+        assert_eq!(*values.first().unwrap(), "/skill:us", "{values:?}");
+        assert!(values.contains(&"/usage"), "got: {values:?}");
         // The exact-name match is ranked strictly above the fuzzy command hit.
-        let sav = items.iter().position(|i| i.value == "/skill:sav").unwrap();
-        let save = items.iter().position(|i| i.value == "/save").unwrap();
-        assert!(sav < save, "{values:?}");
+        let us = items.iter().position(|i| i.value == "/skill:us").unwrap();
+        let usage = items.iter().position(|i| i.value == "/usage").unwrap();
+        assert!(us < usage, "{values:?}");
     }
 
     #[test]

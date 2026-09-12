@@ -184,6 +184,11 @@ pub enum AgentEvent {
         ok: bool,
         result: String,
     },
+    /// A message just entered history — the assembled assistant reply, and
+    /// every tool result as it is pushed (ADR-0009 D2/D5). The session layer
+    /// persists these as they happen; nothing here touches a file. Serial and
+    /// parallel tool execution alike emit one event per result.
+    Message(Message),
     Stop(StopReason),
 }
 
@@ -218,7 +223,9 @@ fn dispatch(tools: &[Tool], tc: &ToolCall) -> Result<String, String> {
 type EventSink<'a> = &'a mut dyn FnMut(AgentEvent) -> Result<(), String>;
 
 /// Append one tool result to history, emitting ToolStart/ToolResult events
-/// through the sink. `tc` is the tool call this result belongs to.
+/// through the sink, then the per-message event announcing the history entry
+/// (ADR-0009 D2: the session layer persists each result as it is pushed). `tc`
+/// is the tool call this result belongs to.
 fn push_tool_result(
     tc: &ToolCall,
     res: Result<String, String>,
@@ -239,7 +246,9 @@ fn push_tool_result(
         result: body.clone(),
     })?;
     let content = if ok { body } else { format!("Error: {body}") };
-    messages.push(Message::tool_result(&tc.id, content));
+    let msg = Message::tool_result(&tc.id, content);
+    messages.push(msg.clone());
+    on_event(AgentEvent::Message(msg))?;
     Ok(())
 }
 
@@ -365,7 +374,10 @@ fn run_loop<P: Provider>(
         let (text, tool_calls, reason) = assemble(&deltas);
         let mut asst = Message::text(Role::Assistant, text);
         asst.tool_calls = tool_calls.clone();
-        messages.push(asst);
+        messages.push(asst.clone());
+        // Announce the history entry right after it is pushed, so the session
+        // layer persists the message at the moment it exists (ADR-0009 D2).
+        on_event(AgentEvent::Message(asst))?;
 
         match reason {
             FinishReason::Stop => break 'run StopReason::Completed,
@@ -392,8 +404,8 @@ fn run_loop<P: Provider>(
 
 /// The agent loop over an existing message history (already including the
 /// latest user message), streaming every event to `on_event` live and
-/// returning the updated message history. Used by `slimcode-common`'s shared
-/// runner to render live through a `Renderer`.
+/// returning the updated message history together with the stop reason. Used
+/// by `slimcode-common`'s shared runner to render live through a `Renderer`.
 pub fn run_agent_from_messages_sink<P: Provider>(
     provider: &mut P,
     tools: &[Tool],
@@ -401,9 +413,9 @@ pub fn run_agent_from_messages_sink<P: Provider>(
     cfg: &RunConfig,
     cancel: &CancelToken,
     on_event: EventSink<'_>,
-) -> Result<Vec<Message>, String> {
-    let (messages, _, _) = run_loop(provider, tools, messages, cfg, cancel, on_event)?;
-    Ok(messages)
+) -> Result<(Vec<Message>, StopReason), String> {
+    let (messages, _, stop) = run_loop(provider, tools, messages, cfg, cancel, on_event)?;
+    Ok((messages, stop))
 }
 
 /// The agent loop over an existing message history (already including the
@@ -632,6 +644,92 @@ mod tests {
         assert!(res.events.iter().any(
             |e| matches!(e, AgentEvent::ToolResult { name, ok: true, .. } if name == "get_weather")
         ));
+    }
+
+    // --- per-message events (ticket 02) ------------------------------------
+
+    #[test]
+    fn message_events_announce_every_history_entry() {
+        // A tool-calling turn: the assembled assistant message and each tool
+        // result must be announced after entering history (one event each),
+        // in history order.
+        let script = vec![
+            vec![
+                tc_start(0, "call_1", "get_weather"),
+                tc_args(0, "{\"city\": \"Beijing\"}"),
+                done_tools(),
+            ],
+            vec![t("Beijing is 25C."), done_stop()],
+        ];
+        let res = run(script, vec![weather_tool()], &RunConfig::default()).unwrap();
+        let announced: Vec<&Message> = res
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Message(m) => Some(m),
+                _ => None,
+            })
+            .collect();
+        // The announced messages are exactly the ones that entered history.
+        assert_eq!(
+            announced.iter().map(|m| (*m).clone()).collect::<Vec<_>>(),
+            res.messages[2..]
+        );
+    }
+
+    #[test]
+    fn message_events_sit_after_stream_and_before_stop() {
+        // The full event sequence for one tool-calling turn: the assistant
+        // message event comes after its streamed deltas and before the tool
+        // start; each tool result event follows its own ToolStart/ToolResult;
+        // the stop is last.
+        let script = vec![
+            vec![
+                t("checking "),
+                tc_start(0, "call_1", "get_weather"),
+                tc_args(0, "{}"),
+                done_tools(),
+            ],
+            vec![t("done"), done_stop()],
+        ];
+        let res = run(script, vec![weather_tool()], &RunConfig::default()).unwrap();
+        let kinds: Vec<&str> = res
+            .events
+            .iter()
+            .map(|e| match e {
+                AgentEvent::Turn { .. } => "turn",
+                AgentEvent::Stream(_) => "stream",
+                AgentEvent::ToolStart { .. } => "tool-start",
+                AgentEvent::ToolResult { .. } => "tool-result",
+                AgentEvent::Message(m) => {
+                    if m.role == Role::Assistant {
+                        "message-assistant"
+                    } else {
+                        "message-tool"
+                    }
+                }
+                AgentEvent::Stop(_) => "stop",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "turn",
+                "stream",
+                "stream",
+                "stream",
+                "stream",
+                "message-assistant",
+                "tool-start",
+                "tool-result",
+                "message-tool",
+                "turn",
+                "stream",
+                "stream",
+                "message-assistant",
+                "stop",
+            ]
+        );
     }
 
     #[test]

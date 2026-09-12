@@ -9,13 +9,23 @@
 //! reads its concrete provider's total usage and feeds a
 //! [`DisplayItem::Usage`] to its renderer itself (spec §Implementation
 //! Decisions).
+//!
+//! Per-message events (ADR-0009 D5): the loop announces every message that
+//! enters history (assistant replies and each tool result). The runner
+//! forwards those to a caller-provided sink (`on_message`) — never mapped to a
+//! display item, never touching disk — so a session layer can persist each
+//! message at the moment it exists.
 
-use slimcode_agent::agent::{CancelToken, Message, Provider, RunConfig, Tool};
+use slimcode_agent::agent::{
+    AgentEvent, CancelToken, Message, Provider, RunConfig, StopReason, Tool,
+};
 
 use crate::render::{Renderer, map_event};
 
 /// Drive one agent turn over `messages`, streaming every event to `renderer`
-/// live as the loop runs, and return the updated message history.
+/// live as the loop runs, forwarding each message that enters history to
+/// `on_message`, and returning the updated message history plus the stop
+/// reason.
 ///
 /// `cancel` is threaded into the agent loop untouched: while it stays clear
 /// the run behaves exactly as before; the moment it is set the run stops at
@@ -23,7 +33,8 @@ use crate::render::{Renderer, map_event};
 /// passes a token it never sets).
 ///
 /// A provider error propagates as `Err(String)`; no partial history is
-/// fabricated.
+/// fabricated. `on_message` errors abort the loop the same way a renderer
+/// error does.
 pub fn run_turn<P: Provider>(
     provider: &mut P,
     tools: &[Tool],
@@ -31,7 +42,8 @@ pub fn run_turn<P: Provider>(
     cfg: &RunConfig,
     cancel: &CancelToken,
     renderer: &mut dyn Renderer,
-) -> Result<Vec<Message>, String> {
+    on_message: &mut dyn FnMut(&Message) -> Result<(), String>,
+) -> Result<(Vec<Message>, StopReason), String> {
     slimcode_agent::agent::run_agent_from_messages_sink(
         provider,
         tools,
@@ -39,8 +51,13 @@ pub fn run_turn<P: Provider>(
         cfg,
         cancel,
         &mut |e| {
-            if let Some(item) = map_event(&e) {
-                renderer.render(&item)?;
+            match &e {
+                AgentEvent::Message(m) => on_message(m)?,
+                _ => {
+                    if let Some(item) = map_event(&e) {
+                        renderer.render(&item)?;
+                    }
+                }
             }
             Ok(())
         },
@@ -148,6 +165,11 @@ mod tests {
         )
     }
 
+    /// A sink that accepts every message (no persistence in these tests).
+    fn noop_sink() -> impl FnMut(&Message) -> Result<(), String> {
+        |_| Ok(())
+    }
+
     // --- behavior -----------------------------------------------------------
 
     #[test]
@@ -169,15 +191,17 @@ mod tests {
             Message::text(Role::User, "weather?"),
         ];
         let cancel = CancelToken::new();
-        let updated = run_turn(
+        let (updated, stop) = run_turn(
             &mut provider,
             &[weather_tool()],
             messages,
             &RunConfig::default(),
             &cancel,
             &mut renderer,
+            &mut noop_sink(),
         )
         .unwrap();
+        assert_eq!(stop, StopReason::Completed);
 
         // Raw tool deltas are suppressed; streamed text and structural lines
         // arrive in order, live.
@@ -261,13 +285,14 @@ mod tests {
             Message::text(Role::User, "weather?"),
         ];
         let cancel = CancelToken::new();
-        let updated = run_turn(
+        let (updated, stop) = run_turn(
             &mut provider,
             &[weather_tool()],
             messages.clone(),
             &RunConfig::default(),
             &cancel,
             &mut renderer,
+            &mut noop_sink(),
         )
         .unwrap();
 
@@ -281,6 +306,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(updated, result.messages);
+        assert_eq!(stop, result.stop);
     }
 
     #[test]
@@ -301,6 +327,7 @@ mod tests {
             &RunConfig::default(),
             &cancel,
             &mut renderer,
+            &mut noop_sink(),
         )
         .unwrap();
         assert!(
@@ -336,6 +363,7 @@ mod tests {
             &RunConfig::default(),
             &cancel,
             &mut renderer,
+            &mut noop_sink(),
         )
         .unwrap_err();
         assert!(err.contains("provider exploded"), "err: {err}");
@@ -355,6 +383,7 @@ mod tests {
             &RunConfig::default(),
             &cancel,
             &mut renderer,
+            &mut noop_sink(),
         )
         .unwrap_err();
         assert!(err.contains("renderer exploded"), "err: {err}");
@@ -374,15 +403,17 @@ mod tests {
             cancel: cancel.clone(),
         };
         let mut renderer = RecordingRenderer::new();
-        let updated = run_turn(
+        let (updated, stop) = run_turn(
             &mut wrapped,
             &[],
             vec![Message::text(Role::User, "hi")],
             &RunConfig::default(),
             &cancel,
             &mut renderer,
+            &mut noop_sink(),
         )
         .unwrap();
+        assert_eq!(stop, StopReason::Cancelled);
         // The stream ends with Stop(Cancelled); the partial text of the
         // aborted request was still streamed live.
         assert!(
@@ -414,6 +445,72 @@ mod tests {
                 .all(|m| !m.text_content().contains("partial"))
         );
         assert_eq!(updated.len(), 1);
+    }
+
+    #[test]
+    fn on_message_sink_sees_every_history_entry_in_order() {
+        // The runner forwards each message that enters history (the assembled
+        // assistant reply and every tool result) to the sink, in history
+        // order, alongside the live stream.
+        let script = vec![
+            vec![
+                text("checking "),
+                tc_start(0, "call_1", "get_weather"),
+                tc_args(0, "{}"),
+                done_tools(),
+            ],
+            vec![text("25C"), done_stop()],
+        ];
+        let mut provider = FakeProvider::new(script);
+        let mut renderer = RecordingRenderer::new();
+        let messages = vec![
+            Message::text(Role::System, "be helpful"),
+            Message::text(Role::User, "weather?"),
+        ];
+        let cancel = CancelToken::new();
+        let mut seen: Vec<Message> = Vec::new();
+        let (updated, _) = run_turn(
+            &mut provider,
+            &[weather_tool()],
+            messages,
+            &RunConfig::default(),
+            &cancel,
+            &mut renderer,
+            &mut |m| {
+                seen.push(m.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+        // The sink saw assistant(tool_calls), tool, then the final assistant —
+        // exactly the messages that entered history after the turn's input.
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[0].role, Role::Assistant);
+        assert_eq!(seen[0].tool_calls.len(), 1);
+        assert_eq!(seen[0].tool_calls[0].id, "call_1");
+        assert_eq!(seen[1].role, Role::Tool);
+        assert_eq!(seen[1].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(seen[2].role, Role::Assistant);
+        assert_eq!(seen, updated[2..]);
+    }
+
+    #[test]
+    fn on_message_sink_error_aborts_the_run() {
+        let script = vec![vec![text("hi"), done_stop()]];
+        let mut provider = FakeProvider::new(script);
+        let mut renderer = RecordingRenderer::new();
+        let cancel = CancelToken::new();
+        let err = run_turn(
+            &mut provider,
+            &[],
+            vec![Message::text(Role::User, "hi")],
+            &RunConfig::default(),
+            &cancel,
+            &mut renderer,
+            &mut |_| Err("sink exploded".to_string()),
+        )
+        .unwrap_err();
+        assert!(err.contains("sink exploded"), "err: {err}");
     }
 
     /// Cancels the shared token on its first chat call, then delegates.

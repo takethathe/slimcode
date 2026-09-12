@@ -62,6 +62,10 @@ pub fn map_event(e: &AgentEvent) -> Option<DisplayItem> {
             ok: *ok,
             result: result.clone(),
         }),
+        // Per-message events are storage seams, not display units: the runner
+        // forwards them to the session layer's sink separately (ADR-0009 D5),
+        // so the rendered transcript is byte-identical to before.
+        AgentEvent::Message(_) => None,
         AgentEvent::Stop(reason) => Some(DisplayItem::Stop(reason.clone())),
     }
 }
@@ -295,6 +299,15 @@ mod tests {
             map_event(&stop(StopReason::Cancelled)),
             Some(DisplayItem::Stop(StopReason::Cancelled))
         );
+    }
+
+    #[test]
+    fn message_event_is_not_a_display_unit() {
+        // The per-message event feeds the session layer's sink, never the
+        // transcript: it must not map to a DisplayItem.
+        use slimcode_agent::session::{Message as Msg, Role};
+        let e = AgentEvent::Message(Msg::text(Role::Assistant, "hi"));
+        assert!(map_event(&e).is_none());
     }
 
     #[test]

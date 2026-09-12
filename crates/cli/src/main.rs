@@ -2,8 +2,9 @@
 //!
 //! Two modes (ADR-0003):
 //! - `slimcode "<prompt>"` — non-interactive: run one prompt to completion in
-//!   the current directory (or `--cwd`), stream events, print token usage, and
-//!   save the session.
+//!   the current directory (or `--cwd`), stream events, print token usage. No
+//!   session is persisted (the one-shot has no `/load`/`/sessions` workflow),
+//!   per ADR-0009 D5.
 //! - `slimcode` on a terminal — the full-screen TUI: a scrollable transcript,
 //!   a multi-line input box, live streamed output, `/` commands and skills,
 //!   and ↑/↓ input-history recall. On a non-TTY (pipe/CI) it fails with a
@@ -21,14 +22,13 @@ use std::env;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
-use slimcode_agent::agent::Message;
 use slimcode_ai::BailianConfig;
 use slimcode_common::config::{self, Overrides};
 use slimcode_common::context::{ContextBuilder, Environment};
 use slimcode_common::context_files::{ContextFile, load_context_files, resolve_project_home};
 use slimcode_common::history::HistoryStore;
 use slimcode_common::render::{DisplayItem, Renderer};
-use slimcode_common::session::{SessionStore, infer_title, project_key};
+use slimcode_common::session::{SessionStore, project_key};
 use slimcode_common::skills::{Skill, SkillStore, normalize_skill_trigger};
 
 fn usage() -> String {
@@ -58,33 +58,30 @@ fn usage() -> String {
     )
 }
 
-/// Non-interactive one-shot: run one prompt, save the session, print usage.
+/// Non-interactive one-shot: run one prompt, print usage. Sessions are never
+/// persisted here (ADR-0009 D5): the one-shot has no `/load`/`/sessions`
+/// workflow, so it leaves no session files behind — matching the TUI's rule
+/// that a turn with no assistant message leaves no log.
 //
-// `clippy::too_many_arguments` is allowed: all eight parameters are the
-// distinct inputs of the one-shot entry point (prompt, cwd, config, store,
-// skills, context files, environment, output), and bundling them would only
-// move the sprawl into a struct with no shared lifecycle.
+// `clippy::too_many_arguments` is allowed: all seven parameters are the
+// distinct inputs of the one-shot entry point (prompt, cwd, config, skills,
+// context files, environment, output), and bundling them would only move the
+// sprawl into a struct with no shared lifecycle.
 #[allow(clippy::too_many_arguments)]
 fn run_once(
     prompt: &str,
     cwd: &Path,
     config: BailianConfig,
-    store: &SessionStore,
     skills: &[Skill],
     context_files: &[ContextFile],
     environment: Environment,
     out: &mut dyn Write,
 ) -> Result<i32, String> {
     let (mut provider, tools) = slimcode_common::setup::setup(cwd, config)?;
-    let mut session = store.new_session();
     // The CLI one-shot path has no command parser, so a leading `/skill:{name}`
     // trigger is normalized to the `/{name}` form the model understands before
     // it becomes a user message (the TUI already embeds the skill content).
     let prompt = normalize_skill_trigger(prompt);
-    session.title = infer_title(&[Message::text(
-        slimcode_agent::session::Role::User,
-        prompt.as_str(),
-    )]);
     let messages = ContextBuilder::new()
         .with_environment(environment)
         .with_context_files(context_files)
@@ -94,19 +91,18 @@ fn run_once(
     let cfg = slimcode_agent::agent::RunConfig::default();
     let cancel = slimcode_agent::agent::CancelToken::new();
     let mut renderer = render::TextRenderer::new(out);
-    let updated = slimcode_common::runner::run_turn(
+    // One-shot: no session persistence, so the per-message sink is a no-op.
+    let (_updated, _stop) = slimcode_common::runner::run_turn(
         &mut provider,
         &tools,
         messages,
         &cfg,
         &cancel,
         &mut renderer,
+        &mut |_| Ok(()),
     )?;
-    session.messages = updated;
-    let path = store.save(&session)?;
     let usage = provider.total_usage;
     renderer.render(&DisplayItem::Usage(usage))?;
-    writeln!(out, "session saved: {}", path.display()).map_err(|e| e.to_string())?;
     Ok(0)
 }
 
@@ -235,8 +231,12 @@ fn run(args: &[String], out: &mut dyn Write, tty: bool) -> Result<i32, String> {
     // The session store is scoped to the current project: sessions persist
     // under `<home>/sessions/<project-key>/`, so `/load` and `/sessions` only
     // ever see this project's sessions.
-    let store = SessionStore::new(home.join("sessions"), project_key(&project_home))
-        .with_max_bytes(app.sessions_max_bytes);
+    let store = SessionStore::new(
+        home.join("sessions"),
+        project_key(&project_home),
+        project_home.clone(),
+    )
+    .with_max_bytes(app.sessions_max_bytes);
     // Startup empty-session cleanup: silently remove empty/corrupt session
     // files from the current project's directory (best-effort; a cleanup
     // failure never blocks startup).
@@ -258,7 +258,6 @@ fn run(args: &[String], out: &mut dyn Write, tty: bool) -> Result<i32, String> {
             &p,
             &cwd,
             app_config,
-            &store,
             &skills,
             &context_files,
             environment,

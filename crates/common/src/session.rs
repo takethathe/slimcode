@@ -1,20 +1,37 @@
-//! Session persistence: `~/.slimcode/sessions/<project-key>/<id>.json`.
+//! Session persistence: append-only JSONL session logs at
+//! `~/.slimcode/sessions/<project-key>/<id>.jsonl` (ADR-0009).
 //!
 //! Sessions are partitioned per project: the store is rooted at the sessions
 //! directory plus a project key derived from the project home path (git root,
 //! falling back to the OS user home), so `/load` and `/sessions` only ever see
 //! the current project's sessions. Disk use is bounded two ways: a startup
-//! sweep drops the current project's empty sessions, and every save enforces a
-//! whole-store byte quota by evicting oldest-first down to half the quota. The
-//! frontend-agnostic metadata decisions live here: id =
+//! sweep drops the current project's empty logs, and every append enforces a
+//! whole-store byte quota by evicting oldest-first down to half the quota
+//! (legacy whole-file `.json` sessions still count toward the quota, though
+//! they are invisible to load/list/cleanup).
+//!
+//! A log is a header line plus one typed record per line: the header carries
+//! the identity (`type`/`v`/`id`/`created_at`/`project_home`) and is mandatory,
+//! then `message` and `title` records follow. Writing is append-only and never
+//! validates or fsyncs; reading is lenient — unknown/malformed records are
+//! skipped and counted, a torn tail is dropped and sealed, and a dangling tool
+//! batch is repaired in memory only (the log bytes are never rewritten on
+//! read). See ADR-0009 D3/D4/D5/D6 for the invariants.
+//!
+//! The frontend-agnostic metadata decisions live here: id =
 //! `slimcode-<unix>-<pid>-<n>`, `created_at` = RFC3339 UTC (no chrono dep;
 //! civil-from-days below), and the title is inferred from the first user
 //! message (truncated to 48 chars).
 
+use std::collections::HashSet;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use slimcode_agent::session::{Message, Role, Session};
 
@@ -59,9 +76,16 @@ pub fn project_key(project_home: &Path) -> String {
     format!("{basename}-{:012x}", hash >> 16)
 }
 
-/// True when `path` is a regular session file (a plain `.json` file, not a
-/// directory or other entry that happens to end in `.json`).
-fn is_session_file(path: &Path) -> bool {
+/// True when `path` is a session log (a plain `.jsonl` file, not a directory
+/// or other entry that happens to end in `.jsonl`).
+fn is_log_file(path: &Path) -> bool {
+    path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+}
+
+/// True when `path` is a legacy whole-file session (a plain `.json` file). Old
+/// files stay on disk and still count toward the quota, but are invisible to
+/// load/list/cleanup (ADR-0009 D1).
+fn is_legacy_json_file(path: &Path) -> bool {
     path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("json")
 }
 
@@ -116,23 +140,86 @@ pub fn infer_title(messages: &[Message]) -> Option<String> {
     Some(with_ellipsis)
 }
 
+/// The mandatory first line of a session log (ADR-0009 D4): the identity
+/// record. `project_home` is the canonicalized project home the project key
+/// was derived from. A missing or malformed header makes the whole log
+/// unreadable — the load is a loud error, never a silent empty session.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LogHeader {
+    #[serde(rename = "type")]
+    kind: String,
+    v: u32,
+    id: String,
+    created_at: String,
+    project_home: String,
+}
+
+impl LogHeader {
+    fn new(session: &Session, project_home: &str) -> Self {
+        Self {
+            kind: "session".to_string(),
+            v: 1,
+            id: session.id.clone(),
+            created_at: session.created_at.clone(),
+            project_home: project_home.to_string(),
+        }
+    }
+}
+
+/// One record line after the header (ADR-0009 D4). Internally tagged on
+/// `type` so the log stays self-describing and future versions can skip
+/// unknown record types on read.
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum LogRecord<'a> {
+    Message { message: &'a Message },
+    Title { title: &'a str },
+}
+
+/// What a lenient log replay produced (ADR-0009 D3): the session plus how much
+/// was skipped/repaired, so the frontend can surface it.
+#[derive(Clone, Debug)]
+pub struct LoadOutcome {
+    pub session: Session,
+    /// Malformed or unknown record lines that were skipped.
+    pub skipped_records: usize,
+    /// Tool calls whose result never arrived; each got an in-memory
+    /// `Error: interrupted` result (the log bytes are untouched).
+    pub repaired_tool_calls: usize,
+}
+
 /// A project-scoped, directory-backed session store
-/// (`<base>/<project-key>/<id>.json`).
+/// (`<base>/<project-key>/<id>.jsonl`).
 pub struct SessionStore {
     base: PathBuf,
     project: String,
-    /// Whole-store byte quota; `save` evicts oldest sessions past this.
+    /// Canonicalized project home, written into every log header.
+    project_home: String,
+    /// Whole-store byte quota; appends evict oldest sessions past this.
     max_bytes: u64,
     next_id: AtomicUsize,
 }
 
 impl SessionStore {
     /// Build a store rooted at `base` (the sessions directory itself) and
-    /// scoped to the given project key, with the default quota.
-    pub fn new(base: impl Into<PathBuf>, project: impl Into<String>) -> Self {
+    /// scoped to the given project key, with the default quota. `project_home`
+    /// is the same project home the key was derived from; it is canonicalized
+    /// (falling back to the path as given) and stamped into every log header.
+    pub fn new(
+        base: impl Into<PathBuf>,
+        project: impl Into<String>,
+        project_home: impl Into<PathBuf>,
+    ) -> Self {
+        let home = project_home.into();
+        let project_home = home
+            .canonicalize()
+            .unwrap_or(home)
+            .to_string_lossy()
+            .into_owned();
         Self {
             base: base.into(),
             project: project.into(),
+            project_home,
             max_bytes: DEFAULT_MAX_BYTES,
             next_id: AtomicUsize::new(0),
         }
@@ -176,33 +263,260 @@ impl SessionStore {
         {
             return Err(format!("invalid session id: {id:?}"));
         }
-        Ok(self.base.join(&self.project).join(format!("{id}.json")))
+        Ok(self.base.join(&self.project).join(format!("{id}.jsonl")))
     }
 
-    /// Persist a session as pretty JSON, creating the project directory if
-    /// needed, then enforce the store quota (best-effort; never fails the save).
-    pub fn save(&self, session: &Session) -> Result<PathBuf, String> {
+    /// Append one message to `session`'s log (ADR-0009 D2/D5):
+    ///
+    /// * before the first assistant message the call is a no-op — no file is
+    ///   created and `None` is returned;
+    /// * the first assistant message creates the log exclusively — the header,
+    ///   the current title (if any) and the session's whole message backlog
+    ///   are written, and `Some(path)` is returned;
+    /// * afterwards, exactly one record line is appended per call.
+    ///
+    /// `session` must already contain `message` (the caller pushes it into
+    /// memory first); the creation path writes the backlog from
+    /// `session.messages`.
+    ///
+    /// Creation is exclusive (`create_new`): if the log already exists between
+    /// the existence check and the open, that is a loud error, never a merge.
+    /// Nothing here validates or fsyncs (ADR-0009 D6) — appends are
+    /// fire-and-forget; the store quota is enforced best-effort after each
+    /// write.
+    pub fn append(&self, session: &Session, message: &Message) -> Result<Option<PathBuf>, String> {
         let path = self.session_path(&session.id)?;
+        if path.exists() {
+            let line = serde_json::to_string(&LogRecord::Message { message })
+                .map_err(|e| format!("serialize record: {e}"))?;
+            append_line(&path, &line)?;
+            self.evict_over_quota(&session.id);
+            return Ok(None);
+        }
+        if message.role != Role::Assistant {
+            // Nothing worth persisting yet: no file until the first assistant
+            // message (ADR-0009 D5).
+            return Ok(None);
+        }
         let parent = path
             .parent()
             .ok_or_else(|| format!("no parent for {}", path.display()))?;
         fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-        let json =
-            serde_json::to_string_pretty(session).map_err(|e| format!("serialize session: {e}"))?;
-        fs::write(&path, json).map_err(|e| format!("{}: {e}", path.display()))?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let header = LogHeader::new(session, &self.project_home);
+        write_header(&mut file, &path, &header)?;
+        if let Some(title) = &session.title {
+            write_record(&mut file, &path, &LogRecord::Title { title })?;
+        }
+        for m in &session.messages {
+            write_record(&mut file, &path, &LogRecord::Message { message: m })?;
+        }
+        drop(file);
         self.evict_over_quota(&session.id);
-        Ok(path)
+        Ok(Some(path))
+    }
+
+    /// Append a title record to `session`'s log. Errors when the log does not
+    /// exist yet (a title record must never precede the header).
+    pub fn append_title(&self, session: &Session, title: &str) -> Result<(), String> {
+        let path = self.session_path(&session.id)?;
+        if !path.exists() {
+            return Err(format!(
+                "{}: no session log to append a title to",
+                path.display()
+            ));
+        }
+        let line = serde_json::to_string(&LogRecord::Title { title })
+            .map_err(|e| format!("serialize record: {e}"))?;
+        append_line(&path, &line)?;
+        self.evict_over_quota(&session.id);
+        Ok(())
+    }
+
+    /// Leniently replay `id`'s log into a session (ADR-0009 D3). The header is
+    /// mandatory: a missing or malformed header is a loud error. Every record
+    /// line after it is replayed with best effort — unknown record types and
+    /// malformed lines are skipped and counted; a torn tail is dropped and
+    /// sealed (earlier bytes are never rewritten); a dangling tool batch is
+    /// repaired in memory only, never on disk.
+    pub fn load(&self, id: &str) -> Result<LoadOutcome, String> {
+        let path = self.session_path(id)?;
+        let text = fs::read_to_string(&path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                format!("session {id:?} not found in project {:?}", self.project)
+            } else {
+                format!("{}: {e}", path.display())
+            }
+        })?;
+        if text.is_empty() {
+            return Err(format!("{}: empty session log", path.display()));
+        }
+        let mut lines = text.lines();
+        let header_line = lines
+            .next()
+            .ok_or_else(|| format!("{}: missing log header", path.display()))?;
+        let header: LogHeader = serde_json::from_str(header_line)
+            .map_err(|e| format!("{}: invalid log header: {e}", path.display()))?;
+        if header.kind != "session" {
+            return Err(format!(
+                "{}: not a session log (header type {:?})",
+                path.display(),
+                header.kind
+            ));
+        }
+
+        // A torn tail is the signature of a crash mid-append: the final line is
+        // a partial write. It is kept only when it parses as a complete
+        // record; either way the tail is sealed with a newline so later
+        // appends stay aligned. The seal is the only disk write a read may
+        // ever perform, it never touches earlier bytes, and its failure is
+        // best-effort (the replay already succeeded) — ADR-0009 D6.
+        let mut record_lines: Vec<&str> = lines.collect();
+        if !text.ends_with('\n') {
+            if let Some(last) = record_lines.pop()
+                && parse_record(last).is_ok()
+            {
+                record_lines.push(last);
+            }
+            let _ = seal_tail(&path);
+        }
+
+        let mut skipped_records = 0usize;
+        let mut repaired_tool_calls = 0usize;
+        let mut title: Option<String> = None;
+        let mut messages: Vec<Message> = Vec::new();
+        let mut batch: Option<OpenBatch> = None;
+
+        for line in record_lines {
+            let record = match parse_record(line) {
+                Ok(r) => r,
+                Err(_) => {
+                    skipped_records += 1;
+                    continue;
+                }
+            };
+            match record {
+                Record::Message(message) => {
+                    if message.role == Role::Assistant && !message.tool_calls.is_empty() {
+                        // A new tool batch starts; any previous dangling batch
+                        // closes first (later results cannot repair it). The
+                        // requested ids stay in tool_calls order (a Vec) so a
+                        // dangling batch is repaired deterministically
+                        // (ADR-0009 D3); the HashSet is only a membership test.
+                        close_batch(&mut batch, &mut messages, &mut repaired_tool_calls);
+                        let ids: Vec<String> =
+                            message.tool_calls.iter().map(|tc| tc.id.clone()).collect();
+                        let matched: HashSet<String> = HashSet::new();
+                        batch = Some(OpenBatch { ids, matched });
+                        messages.push(message);
+                    } else if message.role == Role::Tool {
+                        // A result belongs to the open batch only when its id
+                        // was actually requested; anything else is an orphan
+                        // and is dropped (ADR-0009 D3).
+                        let belongs = batch.as_ref().is_some_and(|b| {
+                            message
+                                .tool_call_id
+                                .as_ref()
+                                .is_some_and(|id| b.ids.contains(id))
+                        });
+                        if belongs {
+                            let id = message.tool_call_id.clone().unwrap();
+                            batch.as_mut().unwrap().matched.insert(id);
+                            messages.push(message);
+                        }
+                    } else {
+                        // Any other message (user/system text, or an assistant
+                        // message without tool calls) closes a dangling batch,
+                        // then passes through.
+                        close_batch(&mut batch, &mut messages, &mut repaired_tool_calls);
+                        messages.push(message);
+                    }
+                }
+                Record::Title(t) => title = Some(t),
+            }
+        }
+        close_batch(&mut batch, &mut messages, &mut repaired_tool_calls);
+
+        Ok(LoadOutcome {
+            session: Session {
+                id: header.id,
+                created_at: header.created_at,
+                title,
+                messages,
+            },
+            skipped_records,
+            repaired_tool_calls,
+        })
+    }
+
+    /// List this project's session ids (stable-sorted). Legacy `.json` files
+    /// stay invisible (ADR-0009 D1).
+    pub fn list(&self) -> Result<Vec<String>, String> {
+        let dir = self.base.join(&self.project);
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut ids: Vec<String> = fs::read_dir(&dir)
+            .map_err(|e| format!("{}: {e}", dir.display()))?
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let path = e.path();
+                let name = e.file_name().to_string_lossy().into_owned();
+                if !is_log_file(&path) {
+                    return None;
+                }
+                name.strip_suffix(".jsonl").map(str::to_string)
+            })
+            .collect();
+        ids.sort();
+        Ok(ids)
+    }
+
+    /// Delete empty session logs in this project's directory and return how
+    /// many were removed. A log is empty when it replays to no assistant
+    /// message: a zero-byte file, a missing/malformed header, or a header-only
+    /// residue from a crash during log creation. Unreadable files are kept
+    /// (removal is best-effort and silent). Legacy `.json` files and other
+    /// projects are out of scope.
+    pub fn cleanup_empty(&self) -> Result<usize, String> {
+        let dir = self.base.join(&self.project);
+        if !dir.exists() {
+            return Ok(0);
+        }
+        let mut removed = 0;
+        let entries = fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !is_log_file(&path) {
+                continue;
+            }
+            // A read failure keeps the file; replaying to no assistant message
+            // marks it for removal.
+            let empty = match fs::read(&path) {
+                Ok(bytes) => !replays_to_assistant(&bytes),
+                Err(_) => false,
+            };
+            if empty && fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
 
     /// Best-effort quota enforcement: once the whole sessions directory exceeds
-    /// `max_bytes`, delete session files oldest-first by mtime (skipping the
-    /// active session) until the total is at or below `max_bytes / 2`. Legacy
-    /// root-level files participate, and directories emptied by eviction are
-    /// removed. Failures are ignored so a storage hiccup never breaks `save`.
+    /// `max_bytes`, delete session files (logs and legacy whole-file sessions
+    /// alike) oldest-first by mtime — skipping the active session — until the
+    /// total is at or below `max_bytes / 2`. Legacy root-level files
+    /// participate, and directories emptied by eviction are removed. Failures
+    /// are ignored so a storage hiccup never breaks an append.
     fn evict_over_quota(&self, keep: &str) {
         let mut files = Vec::new();
         let mut total = 0u64;
-        walk_json(&self.base, &mut files, &mut total);
+        walk_store_files(&self.base, &mut files, &mut total);
         if total <= self.max_bytes {
             return;
         }
@@ -223,92 +537,146 @@ impl SessionStore {
         }
         remove_empty_subdirs(&self.base);
     }
+}
 
-    /// Load a session by id. A missing id reports that it is absent from the
-    /// current project (rather than exposing a raw path error), since sessions
-    /// of other projects and legacy root files are deliberately invisible.
-    pub fn load(&self, id: &str) -> Result<Session, String> {
-        let path = self.session_path(id)?;
-        let json = fs::read_to_string(&path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                format!("session {id:?} not found in project {:?}", self.project)
-            } else {
-                format!("{}: {e}", path.display())
-            }
-        })?;
-        serde_json::from_str(&json).map_err(|e| format!("{}: {e}", path.display()))
-    }
+/// Append one record line to `path` (adding a trailing newline).
+fn append_line(path: &Path, line: &str) -> Result<(), String> {
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    file.write_all(line.as_bytes())
+        .and_then(|_| file.write_all(b"\n"))
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
 
-    /// List this project's session ids (stable-sorted).
-    pub fn list(&self) -> Result<Vec<String>, String> {
-        let dir = self.base.join(&self.project);
-        if !dir.exists() {
-            return Ok(Vec::new());
-        }
-        let mut ids: Vec<String> = fs::read_dir(&dir)
-            .map_err(|e| format!("{}: {e}", dir.display()))?
-            .filter_map(|e| e.ok())
-            .filter_map(|e| {
-                let path = e.path();
-                let name = e.file_name().to_string_lossy().into_owned();
-                if !is_session_file(&path) {
-                    return None;
-                }
-                name.strip_suffix(".json").map(str::to_string)
-            })
-            .collect();
-        ids.sort();
-        Ok(ids)
-    }
+/// Write the header line through an open file handle (the create path already
+/// holds the handle exclusively).
+fn write_header(file: &mut fs::File, path: &Path, header: &LogHeader) -> Result<(), String> {
+    let line = serde_json::to_string(header).map_err(|e| format!("serialize header: {e}"))?;
+    file.write_all(line.as_bytes())
+        .and_then(|_| file.write_all(b"\n"))
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
 
-    /// Delete empty session files in this project's directory and return how
-    /// many were removed. Empty means: a session whose `messages` is empty, a
-    /// zero-byte file, or a JSON file that fails to parse. Unreadable files are
-    /// kept (removal is best-effort and silent; callers decide what to
-    /// surface). Other projects and legacy root-level files are out of scope.
-    pub fn cleanup_empty(&self) -> Result<usize, String> {
-        let dir = self.base.join(&self.project);
-        if !dir.exists() {
-            return Ok(0);
+/// Write one record line through an open file handle.
+fn write_record(file: &mut fs::File, path: &Path, record: &LogRecord<'_>) -> Result<(), String> {
+    let line = serde_json::to_string(record).map_err(|e| format!("serialize record: {e}"))?;
+    file.write_all(line.as_bytes())
+        .and_then(|_| file.write_all(b"\n"))
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Seal a torn log tail with a trailing newline so later appends stay aligned
+/// (the only disk write a read may ever perform; ADR-0009 D6).
+fn seal_tail(path: &Path) -> Result<(), String> {
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    file.write_all(b"\n")
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// A replayed record line.
+enum Record {
+    Message(Message),
+    Title(String),
+}
+
+/// Parse one record line; any line that is not a well-formed, known record is
+/// an error (the caller counts it as skipped).
+fn parse_record(line: &str) -> Result<Record, String> {
+    let value: Value = serde_json::from_str(line).map_err(|e| format!("invalid JSON: {e}"))?;
+    match value.get("type").and_then(Value::as_str) {
+        Some("message") => {
+            let message = value
+                .get("message")
+                .cloned()
+                .ok_or_else(|| "message record without message".to_string())?;
+            let message: Message = serde_json::from_value(message)
+                .map_err(|e| format!("invalid message record: {e}"))?;
+            Ok(Record::Message(message))
         }
-        let mut removed = 0;
-        let entries = fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !is_session_file(&path) {
-                continue;
-            }
-            // A read failure keeps the file; a parse failure (including a
-            // zero-byte file) or empty messages marks it for removal.
-            let empty = match fs::read(&path) {
-                Ok(bytes) => serde_json::from_slice::<Session>(&bytes)
-                    .map(|s| s.messages.is_empty())
-                    .unwrap_or(true),
-                Err(_) => false,
-            };
-            if empty && fs::remove_file(&path).is_ok() {
-                removed += 1;
-            }
+        Some("title") => {
+            let title = value
+                .get("title")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "title record without title".to_string())?;
+            Ok(Record::Title(title.to_string()))
         }
-        Ok(removed)
+        Some(other) => Err(format!("unknown record type {other:?}")),
+        None => Err("record without a type".to_string()),
     }
 }
 
-/// Collect every `.json` file under `dir` (recursing into subdirectories) as
-/// `(path, size, mtime)`; `total` accumulates the byte sum. mtime read failures
-/// are treated as the oldest (evicted first) so a quota run still makes
-/// progress.
-fn walk_json(dir: &Path, out: &mut Vec<(PathBuf, u64, std::time::SystemTime)>, total: &mut u64) {
+/// A tool batch awaiting its results during replay: the ids the batch calls,
+/// in tool_calls order (a Vec — iteration order is deterministic), and which
+/// of them already matched a tool result (a HashSet — membership only).
+struct OpenBatch {
+    ids: Vec<String>,
+    matched: HashSet<String>,
+}
+
+/// Close a dangling batch: every requested call that never got a result is
+/// patched in memory with `Error: interrupted` (ADR-0009 D3) — in history
+/// order relative to the results that did arrive — and the batch is cleared.
+fn close_batch(batch: &mut Option<OpenBatch>, messages: &mut Vec<Message>, repaired: &mut usize) {
+    let Some(open) = batch.take() else {
+        return;
+    };
+    for id in &open.ids {
+        if !open.matched.contains(id) {
+            messages.push(Message::tool_result(id.clone(), "Error: interrupted"));
+            *repaired += 1;
+        }
+    }
+}
+
+/// True when `bytes` (a log's raw contents) replay to at least one assistant
+/// message record. Lenient like load: lines are parsed independently and bad
+/// lines are skipped. A zero-byte file or a missing/malformed header is "no
+/// assistant" (crash residue).
+fn replays_to_assistant(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    let mut lines = text.lines();
+    let Some(header) = lines
+        .next()
+        .and_then(|l| serde_json::from_str::<LogHeader>(l).ok())
+    else {
+        return false;
+    };
+    if header.kind != "session" {
+        return false;
+    }
+    lines.any(|line| {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            return false;
+        };
+        value.get("type").and_then(Value::as_str) == Some("message")
+            && value.pointer("/message/role").and_then(Value::as_str) == Some("assistant")
+    })
+}
+
+/// Collect every session file under `dir` (recursing into subdirectories) as
+/// `(path, size, mtime)`; `total` accumulates the byte sum. Both `.jsonl` logs
+/// and legacy `.json` sessions count (ADR-0009 D1). mtime read failures are
+/// treated as the oldest (evicted first) so a quota run still makes progress.
+fn walk_store_files(
+    dir: &Path,
+    out: &mut Vec<(PathBuf, u64, std::time::SystemTime)>,
+    total: &mut u64,
+) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            walk_json(&path, out, total);
+            walk_store_files(&path, out, total);
             continue;
         }
-        if !is_session_file(&path) {
+        if !(is_log_file(&path) || is_legacy_json_file(&path)) {
             continue;
         }
         if let Ok(meta) = fs::metadata(&path) {
@@ -337,12 +705,75 @@ fn remove_empty_subdirs(base: &Path) {
 mod tests {
     use super::*;
     use crate::testutil::unique_temp_dir;
+    use slimcode_agent::session::{MessageStopReason, Part, ToolCall};
     use std::time::Duration;
 
     /// Unique temp dir per test (tests run in parallel and must not share).
     fn temp_dir() -> PathBuf {
         unique_temp_dir("slimcode-session-test")
     }
+
+    /// A store scoped to `proj-a` under `base`, with a synthetic project home.
+    fn store(base: &Path) -> SessionStore {
+        SessionStore::new(base, "proj-a", base.join("home"))
+    }
+
+    /// A minimal session with the given id and one user message.
+    fn session_with(id: &str) -> Session {
+        Session {
+            id: id.to_string(),
+            created_at: now_rfc3339(),
+            title: None,
+            messages: vec![Message::text(Role::User, "hi")],
+        }
+    }
+
+    /// The raw header line a store would write for `id`/`created_at`.
+    fn raw_header(id: &str, created: &str) -> String {
+        serde_json::to_string(&LogHeader {
+            kind: "session".to_string(),
+            v: 1,
+            id: id.to_string(),
+            created_at: created.to_string(),
+            project_home: "/synthetic/proj".to_string(),
+        })
+        .unwrap()
+    }
+
+    /// A message record line.
+    fn msg_line(m: &Message) -> String {
+        serde_json::to_string(&LogRecord::Message { message: m }).unwrap()
+    }
+
+    /// A title record line.
+    fn title_line(title: &str) -> String {
+        serde_json::to_string(&LogRecord::Title { title }).unwrap()
+    }
+
+    /// Write a log file from raw lines (each gets a trailing newline).
+    fn write_raw(path: &Path, lines: &[&str]) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut content = String::new();
+        for l in lines {
+            content.push_str(l);
+            content.push('\n');
+        }
+        fs::write(path, content).unwrap();
+    }
+
+    /// Write `contents` to `path` with an mtime `age` in the past.
+    fn write_aged(path: &Path, contents: &[u8], age: Duration) {
+        fs::write(path, contents).unwrap();
+        let mtime = SystemTime::now() - age;
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+    }
+
+    // --- metadata (unchanged behaviors) ------------------------------------
 
     #[test]
     fn unix_epoch_formats_rfc3339() {
@@ -393,7 +824,7 @@ mod tests {
 
     #[test]
     fn new_id_is_unique_and_prefixed() {
-        let s = SessionStore::new(std::env::temp_dir(), "proj-test");
+        let s = SessionStore::new(std::env::temp_dir(), "proj-test", std::env::temp_dir());
         let a = s.new_id();
         let b = s.new_id();
         assert_ne!(a, b);
@@ -402,7 +833,7 @@ mod tests {
 
     #[test]
     fn new_session_has_fresh_id_and_empty_messages() {
-        let s = SessionStore::new(std::env::temp_dir(), "proj-test");
+        let s = SessionStore::new(std::env::temp_dir(), "proj-test", std::env::temp_dir());
         let session = s.new_session();
         assert!(session.id.starts_with("slimcode-"));
         assert!(session.messages.is_empty());
@@ -411,132 +842,19 @@ mod tests {
     }
 
     #[test]
-    fn session_round_trips_through_store() {
-        let dir = temp_dir();
-        let store = SessionStore::new(&dir, "proj-test");
-        let mut session = Session {
-            id: store.new_id(),
-            created_at: now_rfc3339(),
-            title: Some("hello".to_string()),
-            messages: vec![
-                Message::text(Role::System, "be helpful"),
-                Message::text(Role::User, "hi"),
-                Message::text(Role::Assistant, "hey!"),
-            ],
-        };
-        let path = store.save(&session).unwrap();
-        assert!(path.exists());
-        let loaded = store.load(&session.id).unwrap();
-        assert_eq!(loaded.messages, session.messages);
-        // mutate and reload from disk
-        session.messages.push(Message::text(Role::User, "again"));
-        store.save(&session).unwrap();
-        let loaded2 = store.load(&session.id).unwrap();
-        assert_eq!(loaded2.messages.len(), 4);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn list_returns_sorted_ids() {
-        let dir = temp_dir();
-        let store = SessionStore::new(&dir, "proj-test");
-        let s1 = Session {
-            id: "slimcode-1-a".to_string(),
-            created_at: now_rfc3339(),
-            title: None,
-            messages: vec![],
-        };
-        let s2 = Session {
-            id: "slimcode-2-b".to_string(),
-            created_at: now_rfc3339(),
-            title: None,
-            messages: vec![],
-        };
-        store.save(&s1).unwrap();
-        store.save(&s2).unwrap();
-        let ids = store.list().unwrap();
-        assert_eq!(ids, vec!["slimcode-1-a", "slimcode-2-b"]);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn list_empty_when_dir_missing() {
-        let dir = temp_dir();
-        let store = SessionStore::new(&dir, "proj-test");
-        assert!(store.list().unwrap().is_empty());
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn invalid_id_rejected() {
-        let store = SessionStore::new(std::env::temp_dir(), "proj-test");
-        assert!(store.session_path("../evil").is_err());
-        assert!(store.session_path("a/b").is_err());
-        assert!(store.session_path("").is_err());
-    }
-
-    // --- ticket 01: project-scoped layout + isolation ----------------------
-
-    /// A minimal session with the given id, ready to save.
-    fn session_with(id: &str) -> Session {
-        Session {
-            id: id.to_string(),
-            created_at: now_rfc3339(),
-            title: None,
-            messages: vec![Message::text(Role::User, "hi")],
-        }
-    }
-
-    /// An empty session (no messages) with the given id.
-    fn empty_session(id: &str) -> Session {
-        Session {
-            id: id.to_string(),
-            created_at: now_rfc3339(),
-            title: None,
-            messages: vec![],
-        }
+        let s = SessionStore::new(std::env::temp_dir(), "proj-test", std::env::temp_dir());
+        assert!(s.session_path("../evil").is_err());
+        assert!(s.session_path("a/b").is_err());
+        assert!(s.session_path("").is_err());
     }
 
     #[test]
-    fn save_writes_into_project_subdirectory() {
+    fn session_path_points_at_jsonl_not_json() {
         let dir = temp_dir();
-        let store = SessionStore::new(&dir, "proj-a");
-        let path = store.save(&session_with("slimcode-1-a")).unwrap();
-        assert_eq!(path, dir.join("proj-a/slimcode-1-a.json"));
-        assert!(dir.join("proj-a/slimcode-1-a.json").exists());
-        // No root-level file: the store never scatters sessions at the base.
-        assert!(!dir.join("slimcode-1-a.json").exists());
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn load_is_isolated_to_current_project() {
-        let dir = temp_dir();
-        // Legacy root-level file (old flat layout) must not be loadable.
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("slimcode-old-1.json"), "{}").unwrap();
-        // Another project's file must not be loadable either.
-        let other = SessionStore::new(&dir, "proj-b");
-        other.save(&session_with("slimcode-2-b")).unwrap();
-        // The current project's own file loads fine.
-        let store = SessionStore::new(&dir, "proj-a");
-        store.save(&session_with("slimcode-3-a")).unwrap();
-        assert!(store.load("slimcode-3-a").is_ok());
-        assert!(store.load("slimcode-old-1").is_err());
-        assert!(store.load("slimcode-2-b").is_err());
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn list_only_current_project() {
-        let dir = temp_dir();
-        let a = SessionStore::new(&dir, "proj-a");
-        let b = SessionStore::new(&dir, "proj-b");
-        a.save(&session_with("slimcode-1-a")).unwrap();
-        b.save(&session_with("slimcode-2-b")).unwrap();
-        a.save(&session_with("slimcode-3-a")).unwrap();
-        assert_eq!(a.list().unwrap(), vec!["slimcode-1-a", "slimcode-3-a"]);
-        assert_eq!(b.list().unwrap(), vec!["slimcode-2-b"]);
+        let store = store(&dir);
+        let path = store.session_path("slimcode-1").unwrap();
+        assert_eq!(path.file_name().unwrap(), "slimcode-1.jsonl");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -573,10 +891,208 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    // --- append: lazy exclusive creation (ticket 01) ------------------------
+
+    #[test]
+    fn append_before_first_assistant_writes_no_file() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let mut session = store.new_session();
+        let sys = Message::text(Role::System, "be helpful");
+        let user = Message::text(Role::User, "hi");
+        session.messages.push(sys.clone());
+        assert!(store.append(&session, &sys).unwrap().is_none());
+        session.messages.push(user.clone());
+        assert!(store.append(&session, &user).unwrap().is_none());
+        // No file exists before the first assistant message.
+        assert!(!store.session_path(&session.id).unwrap().exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn first_assistant_creates_log_with_header_title_and_backlog() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let session = Session {
+            id: "slimcode-1".to_string(),
+            created_at: "2026-08-29T00:00:00Z".to_string(),
+            title: Some("hello".to_string()),
+            messages: vec![
+                Message::text(Role::System, "be helpful"),
+                Message::text(Role::User, "hi"),
+                Message::text(Role::Assistant, "hey!"),
+            ],
+        };
+        let asst = session.messages.last().unwrap().clone();
+        let created = store.append(&session, &asst).unwrap().unwrap();
+        assert_eq!(created, store.session_path("slimcode-1").unwrap());
+        let text = fs::read_to_string(&created).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        // header + title + the whole message backlog
+        assert_eq!(lines.len(), 1 + 1 + 3);
+        let v: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(v["type"], "session");
+        assert_eq!(v["v"], 1);
+        assert_eq!(v["id"], "slimcode-1");
+        assert_eq!(v["created_at"], "2026-08-29T00:00:00Z");
+        assert!(
+            v["project_home"]
+                .as_str()
+                .unwrap()
+                .contains("slimcode-session-test")
+        );
+        assert_eq!(lines[1], title_line("hello"));
+        for (i, expected) in session.messages.iter().enumerate() {
+            assert_eq!(lines[2 + i], msg_line(expected));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_adds_one_record_line_per_message_after_creation() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let mut session = Session {
+            id: "slimcode-1".to_string(),
+            created_at: "2026-08-29T00:00:00Z".to_string(),
+            title: None,
+            messages: vec![
+                Message::text(Role::System, "sys"),
+                Message::text(Role::User, "hi"),
+                Message::text(Role::Assistant, "first reply"),
+            ],
+        };
+        let asst = session.messages[2].clone();
+        store.append(&session, &asst).unwrap();
+        let m4 = Message::text(Role::User, "again");
+        session.messages.push(m4.clone());
+        store.append(&session, &m4).unwrap();
+        let m5 = Message::text(Role::Assistant, "second reply");
+        session.messages.push(m5.clone());
+        store.append(&session, &m5).unwrap();
+        let lines: Vec<String> = fs::read_to_string(store.session_path("slimcode-1").unwrap())
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        // header + one line per message, exactly
+        assert_eq!(lines.len(), 1 + 5);
+        assert_eq!(lines[1], msg_line(&session.messages[0]));
+        assert_eq!(lines[4], msg_line(&m4));
+        assert_eq!(lines[5], msg_line(&m5));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_title_writes_a_title_record_and_load_takes_the_last() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let mut session = session_with("slimcode-1");
+        let asst = Message::text(Role::Assistant, "hi");
+        session.messages.push(asst.clone());
+        store.append(&session, &asst).unwrap();
+        store.append_title(&session, "first title").unwrap();
+        store.append_title(&session, "second title").unwrap();
+        let outcome = store.load("slimcode-1").unwrap();
+        // The latest title record wins.
+        assert_eq!(outcome.session.title.as_deref(), Some("second title"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_title_errors_before_the_log_exists() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let session = session_with("slimcode-1");
+        let err = store.append_title(&session, "hi").unwrap_err();
+        assert!(err.contains("slimcode-1"), "err: {err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- load: lenient replay (ticket 01) -----------------------------------
+
+    #[test]
+    fn load_round_trips_appended_messages() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let mut session = Session {
+            id: "slimcode-1".to_string(),
+            created_at: "2026-08-29T00:00:00Z".to_string(),
+            title: None,
+            messages: vec![
+                Message::text(Role::System, "sys"),
+                Message::text(Role::User, "hi"),
+            ],
+        };
+        let asst = Message::text(Role::Assistant, "hello");
+        session.messages.push(asst.clone());
+        store.append(&session, &asst).unwrap();
+        let outcome = store.load("slimcode-1").unwrap();
+        assert_eq!(outcome.session.messages, session.messages);
+        assert_eq!(outcome.session.created_at, "2026-08-29T00:00:00Z");
+        assert_eq!(outcome.skipped_records, 0);
+        assert_eq!(outcome.repaired_tool_calls, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_skips_malformed_and_unknown_records_with_count() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let path = store.session_path("slimcode-1").unwrap();
+        write_raw(
+            &path,
+            &[
+                &raw_header("slimcode-1", "2026-08-29T00:00:00Z"),
+                &msg_line(&Message::text(Role::User, "hi")),
+                "{ not json",                        // malformed
+                r#"{"type":"future_record","x":1}"#, // unknown type
+                &msg_line(&Message::text(Role::Assistant, "hello")),
+            ],
+        );
+        let outcome = store.load("slimcode-1").unwrap();
+        assert_eq!(outcome.skipped_records, 2);
+        assert_eq!(outcome.session.messages.len(), 2);
+        assert_eq!(outcome.session.messages[1].text_content(), "hello");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_missing_or_malformed_header_errors() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let path = store.session_path("slimcode-1").unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "not json at all\n").unwrap();
+        let err = store.load("slimcode-1").unwrap_err();
+        assert!(err.contains("header"), "err: {err}");
+        // A header of a different kind is rejected too.
+        fs::write(
+            &path,
+            r#"{"type":"other","v":1,"id":"x","created_at":"c","project_home":"p"}"#,
+        )
+        .unwrap();
+        let err = store.load("slimcode-1").unwrap_err();
+        assert!(err.contains("not a session log"), "err: {err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_empty_log_errors() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let path = store.session_path("slimcode-1").unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "").unwrap();
+        let err = store.load("slimcode-1").unwrap_err();
+        assert!(err.contains("empty"), "err: {err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn load_missing_id_reports_project_scope() {
         let dir = temp_dir();
-        let store = SessionStore::new(&dir, "proj-a");
+        let store = store(&dir);
         let err = store.load("slimcode-absent").unwrap_err();
         assert!(err.contains("slimcode-absent"), "err: {err}");
         assert!(err.contains("proj-a"), "err: {err}");
@@ -584,106 +1100,350 @@ mod tests {
     }
 
     #[test]
+    fn load_drops_a_torn_tail_and_seals_it() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let path = store.session_path("slimcode-1").unwrap();
+        let partial = format!(
+            "{}\n{}\n{}\n{{\"type\":\"mess",
+            raw_header("slimcode-1", "2026-08-29T00:00:00Z"),
+            msg_line(&Message::text(Role::User, "hi")),
+            msg_line(&Message::text(Role::Assistant, "hello")),
+        );
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, partial).unwrap();
+        let outcome = store.load("slimcode-1").unwrap();
+        assert_eq!(outcome.session.messages.len(), 2);
+        assert_eq!(outcome.skipped_records, 0);
+        // The torn tail was sealed with a newline so a later append stays
+        // aligned on its own line.
+        assert!(fs::read_to_string(&path).unwrap().ends_with('\n'));
+        let m = Message::text(Role::Assistant, "after");
+        let mut sess = outcome.session.clone();
+        sess.messages.push(m.clone());
+        store.append(&sess, &m).unwrap();
+        let outcome2 = store.load("slimcode-1").unwrap();
+        assert_eq!(outcome2.session.messages.len(), 3);
+        assert_eq!(outcome2.session.messages[2].text_content(), "after");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_keeps_a_complete_json_torn_tail_and_seals_it() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let path = store.session_path("slimcode-1").unwrap();
+        // The final record is complete JSON but lacks the trailing newline
+        // (the crash hit between the record and the newline): it is kept.
+        let content = format!(
+            "{}\n{}\n{}",
+            raw_header("slimcode-1", "2026-08-29T00:00:00Z"),
+            msg_line(&Message::text(Role::User, "hi")),
+            msg_line(&Message::text(Role::Assistant, "hello")),
+        );
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, content).unwrap();
+        let outcome = store.load("slimcode-1").unwrap();
+        assert_eq!(outcome.session.messages.len(), 2);
+        assert_eq!(outcome.skipped_records, 0);
+        assert!(fs::read_to_string(&path).unwrap().ends_with('\n'));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_repairs_dangling_tool_batches_in_memory_only() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let path = store.session_path("slimcode-1").unwrap();
+        let mut asst = Message::text(Role::Assistant, "");
+        asst.tool_calls = vec![
+            ToolCall {
+                id: "call_a".to_string(),
+                name: "t".to_string(),
+                arguments: "{}".to_string(),
+            },
+            ToolCall {
+                id: "call_b".to_string(),
+                name: "t".to_string(),
+                arguments: "{}".to_string(),
+            },
+            ToolCall {
+                id: "call_c".to_string(),
+                name: "t".to_string(),
+                arguments: "{}".to_string(),
+            },
+            ToolCall {
+                id: "call_d".to_string(),
+                name: "t".to_string(),
+                arguments: "{}".to_string(),
+            },
+        ];
+        write_raw(
+            &path,
+            &[
+                &raw_header("slimcode-1", "2026-08-29T00:00:00Z"),
+                &msg_line(&Message::text(Role::System, "sys")),
+                &msg_line(&Message::text(Role::User, "hi")),
+                &msg_line(&asst),
+                &msg_line(&Message::tool_result("call_a", "{\"a\":1}")),
+                &msg_line(&Message::tool_result("call_c", "{\"c\":1}")),
+                // An orphan result: no batch ever requested this id — dropped.
+                &msg_line(&Message::tool_result("call_orphan", "x")),
+            ],
+        );
+        let before = fs::read(&path).unwrap();
+        let outcome = store.load("slimcode-1").unwrap();
+        assert_eq!(outcome.repaired_tool_calls, 2);
+        assert_eq!(outcome.skipped_records, 0);
+        // sys, user, asst, tool(a), tool(c), tool(b interrupted), tool(d
+        // interrupted) — the missing results land in history order after the
+        // results that did arrive, and the two repairs are in tool_calls
+        // order (deterministic: same file replays to the same history, ADR-0009
+        // D3).
+        let msgs = &outcome.session.messages;
+        assert_eq!(msgs.len(), 7);
+        assert_eq!(msgs[3].role, Role::Tool);
+        assert_eq!(msgs[3].tool_call_id.as_deref(), Some("call_a"));
+        assert_eq!(msgs[4].tool_call_id.as_deref(), Some("call_c"));
+        assert_eq!(msgs[5].tool_call_id.as_deref(), Some("call_b"));
+        assert_eq!(msgs[5].text_content(), "Error: interrupted");
+        assert_eq!(msgs[6].tool_call_id.as_deref(), Some("call_d"));
+        assert_eq!(msgs[6].text_content(), "Error: interrupted");
+        // Repair is in memory only: the log bytes are untouched.
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_closes_a_dangling_batch_at_the_next_boundary() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let path = store.session_path("slimcode-1").unwrap();
+        let mut asst = Message::text(Role::Assistant, "");
+        asst.tool_calls = vec![ToolCall {
+            id: "call_a".to_string(),
+            name: "t".to_string(),
+            arguments: "{}".to_string(),
+        }];
+        write_raw(
+            &path,
+            &[
+                &raw_header("slimcode-1", "2026-08-29T00:00:00Z"),
+                &msg_line(&Message::text(Role::User, "hi")),
+                &msg_line(&asst),
+                // The next assistant message closes the dangling batch before
+                // it is replayed itself.
+                &msg_line(&Message::text(Role::Assistant, "hello")),
+            ],
+        );
+        let outcome = store.load("slimcode-1").unwrap();
+        assert_eq!(outcome.repaired_tool_calls, 1);
+        // user, asst, tool(interrupted), assistant(hello)
+        assert_eq!(outcome.session.messages.len(), 4);
+        assert_eq!(
+            outcome.session.messages[2].tool_call_id.as_deref(),
+            Some("call_a")
+        );
+        assert_eq!(outcome.session.messages[3].text_content(), "hello");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn closing_message_round_trips_through_the_log() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let mut session = session_with("slimcode-1");
+        let user = session.messages[0].clone();
+        store.append(&session, &user).unwrap(); // no-op pre-assistant
+        let closing = Message {
+            role: Role::Assistant,
+            parts: vec![Part::Text {
+                text: "The turn ended with an error: boom".to_string(),
+            }],
+            tool_calls: vec![],
+            tool_call_id: None,
+            stop_reason: Some(MessageStopReason::Error),
+            error: Some("boom".to_string()),
+        };
+        session.messages.push(closing.clone());
+        store.append(&session, &closing).unwrap();
+        let outcome = store.load("slimcode-1").unwrap();
+        assert_eq!(outcome.session.messages, session.messages);
+        let loaded = &outcome.session.messages[1];
+        assert_eq!(loaded.role, Role::Assistant);
+        assert_eq!(loaded.stop_reason, Some(MessageStopReason::Error));
+        assert_eq!(loaded.error.as_deref(), Some("boom"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- listing + isolation ------------------------------------------------
+
+    #[test]
+    fn list_only_current_project() {
+        let dir = temp_dir();
+        let a = store(&dir);
+        let b = SessionStore::new(&dir, "proj-b", dir.join("home"));
+        let mut s1 = session_with("slimcode-1-a");
+        let asst = Message::text(Role::Assistant, "hi");
+        s1.messages.push(asst.clone());
+        a.append(&s1, &asst).unwrap();
+        let mut s2 = session_with("slimcode-2-b");
+        let asst = Message::text(Role::Assistant, "hi");
+        s2.messages.push(asst.clone());
+        b.append(&s2, &asst).unwrap();
+        let mut s3 = session_with("slimcode-3-a");
+        let asst = Message::text(Role::Assistant, "hi");
+        s3.messages.push(asst.clone());
+        a.append(&s3, &asst).unwrap();
+        assert_eq!(a.list().unwrap(), vec!["slimcode-1-a", "slimcode-3-a"]);
+        assert_eq!(b.list().unwrap(), vec!["slimcode-2-b"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_is_isolated_to_current_project() {
+        let dir = temp_dir();
+        // Legacy root-level file (old flat layout) must not be loadable.
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("slimcode-old-1.json"), "{}").unwrap();
+        // Another project's file must not be loadable either.
+        let other = SessionStore::new(&dir, "proj-b", dir.join("home"));
+        let mut s2 = session_with("slimcode-2-b");
+        let asst = Message::text(Role::Assistant, "hi");
+        s2.messages.push(asst.clone());
+        other.append(&s2, &asst).unwrap();
+        // The current project's own file loads fine.
+        let store = store(&dir);
+        let mut s3 = session_with("slimcode-3-a");
+        let asst = Message::text(Role::Assistant, "hi");
+        s3.messages.push(asst.clone());
+        store.append(&s3, &asst).unwrap();
+        assert!(store.load("slimcode-3-a").is_ok());
+        assert!(store.load("slimcode-old-1").is_err());
+        assert!(store.load("slimcode-2-b").is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn list_ignores_a_directory_named_like_a_session_file() {
         let dir = temp_dir();
-        let store = SessionStore::new(&dir, "proj-a");
-        store.save(&session_with("slimcode-real")).unwrap();
-        // A directory whose name ends in `.json` must not be listed as a
-        // session (it could not be loaded anyway).
-        fs::create_dir_all(dir.join("proj-a/slimcode-fake.json")).unwrap();
+        let store = store(&dir);
+        let mut s = session_with("slimcode-real");
+        let asst = Message::text(Role::Assistant, "hi");
+        s.messages.push(asst.clone());
+        store.append(&s, &asst).unwrap();
+        // A directory whose name ends in `.jsonl` must not be listed.
+        fs::create_dir_all(dir.join("proj-a/slimcode-fake.jsonl")).unwrap();
         assert_eq!(store.list().unwrap(), vec!["slimcode-real"]);
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // --- ticket 02: startup empty-session cleanup --------------------------
+    #[test]
+    fn list_ignores_legacy_json_files() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let mut s = session_with("slimcode-jsonl");
+        let asst = Message::text(Role::Assistant, "hi");
+        s.messages.push(asst.clone());
+        store.append(&s, &asst).unwrap();
+        // A legacy whole-file session stays invisible to the listing.
+        fs::write(dir.join("proj-a/slimcode-legacy.json"), "{}").unwrap();
+        assert_eq!(store.list().unwrap(), vec!["slimcode-jsonl"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- startup empty-log cleanup (ticket 01) ------------------------------
 
     #[test]
-    fn cleanup_empty_removes_empty_zero_byte_and_corrupt_but_keeps_nonempty() {
+    fn cleanup_empty_removes_zero_byte_and_assistantless_logs_but_keeps_live() {
         let dir = temp_dir();
-        let store = SessionStore::new(&dir, "proj-a");
-        store.save(&empty_session("slimcode-empty-1")).unwrap();
-        store.save(&session_with("slimcode-keep-1")).unwrap();
-        // Zero-byte and corrupt JSON files written directly.
+        let store = store(&dir);
         let proj = dir.join("proj-a");
-        fs::write(proj.join("slimcode-zerobyte.json"), "").unwrap();
-        fs::write(proj.join("slimcode-corrupt.json"), "{ not json").unwrap();
+        fs::create_dir_all(&proj).unwrap();
+        // A live log with an assistant message.
+        let mut live = session_with("slimcode-live");
+        let asst = Message::text(Role::Assistant, "hello");
+        live.messages.push(asst.clone());
+        store.append(&live, &asst).unwrap();
+        // A zero-byte log and a header-only residue (crash during creation).
+        fs::write(proj.join("slimcode-zero.jsonl"), "").unwrap();
+        fs::write(
+            proj.join("slimcode-residue.jsonl"),
+            format!("{}\n", raw_header("slimcode-residue", "c")),
+        )
+        .unwrap();
         let removed = store.cleanup_empty().unwrap();
-        assert_eq!(removed, 3);
-        assert!(!proj.join("slimcode-empty-1.json").exists());
-        assert!(!proj.join("slimcode-zerobyte.json").exists());
-        assert!(!proj.join("slimcode-corrupt.json").exists());
-        assert!(proj.join("slimcode-keep-1.json").exists());
+        assert_eq!(removed, 2);
+        assert!(!proj.join("slimcode-zero.jsonl").exists());
+        assert!(!proj.join("slimcode-residue.jsonl").exists());
+        assert!(proj.join("slimcode-live.jsonl").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn cleanup_empty_scopes_to_current_project() {
+    fn cleanup_empty_scopes_to_current_project_and_skips_legacy() {
         let dir = temp_dir();
-        let a = SessionStore::new(&dir, "proj-a");
-        let b = SessionStore::new(&dir, "proj-b");
-        a.save(&empty_session("slimcode-empty-a")).unwrap();
-        b.save(&session_with("slimcode-keep-b")).unwrap();
-        // Legacy root-level file must be untouched by this pass.
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("slimcode-old-empty.json"), "{}").unwrap();
+        let a = store(&dir);
+        let b = SessionStore::new(&dir, "proj-b", dir.join("home"));
+        fs::create_dir_all(dir.join("proj-a")).unwrap();
+        fs::write(dir.join("proj-a/slimcode-empty-a.jsonl"), "").unwrap();
+        // A live log in another project must be untouched.
+        let mut live = session_with("slimcode-keep-b");
+        let asst = Message::text(Role::Assistant, "hello");
+        live.messages.push(asst.clone());
+        b.append(&live, &asst).unwrap();
+        // Legacy whole-file sessions are out of scope too.
+        fs::write(dir.join("proj-a/slimcode-legacy.json"), "{}").unwrap();
         let removed = a.cleanup_empty().unwrap();
         assert_eq!(removed, 1);
-        assert!(!dir.join("proj-a/slimcode-empty-a.json").exists());
-        assert!(dir.join("proj-b/slimcode-keep-b.json").exists());
-        assert!(dir.join("slimcode-old-empty.json").exists());
+        assert!(!dir.join("proj-a/slimcode-empty-a.jsonl").exists());
+        assert!(dir.join("proj-a/slimcode-legacy.json").exists());
+        assert!(dir.join("proj-b/slimcode-keep-b.jsonl").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn cleanup_empty_is_noop_when_dir_missing() {
         let dir = temp_dir();
-        let store = SessionStore::new(&dir, "proj-a");
+        let store = store(&dir);
         assert_eq!(store.cleanup_empty().unwrap(), 0);
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // --- ticket 03: quota eviction on save ---------------------------------
-
-    /// Write `contents` to `path` with an mtime `age` in the past.
-    fn write_aged(path: &Path, contents: &[u8], age: Duration) {
-        fs::write(path, contents).unwrap();
-        let mtime = SystemTime::now() - age;
-        fs::File::options()
-            .write(true)
-            .open(path)
-            .unwrap()
-            .set_modified(mtime)
-            .unwrap();
-    }
+    // --- quota eviction on append (ticket 01) -------------------------------
 
     #[test]
     fn evict_deletes_oldest_first_down_to_half_and_keeps_active() {
         let dir = temp_dir();
-        let store = SessionStore::new(&dir, "proj-a").with_max_bytes(1000);
+        let store = store(&dir).with_max_bytes(1000);
         let proj = dir.join("proj-a");
         fs::create_dir_all(&proj).unwrap();
         write_aged(
-            &proj.join("slimcode-old1.json"),
+            &proj.join("slimcode-old1.jsonl"),
             &[b'x'; 450],
             Duration::from_secs(3 * 3600),
         );
         write_aged(
-            &proj.join("slimcode-old2.json"),
+            &proj.join("slimcode-old2.jsonl"),
             &[b'x'; 450],
             Duration::from_secs(2 * 3600),
         );
         write_aged(
-            &proj.join("slimcode-old3.json"),
+            &proj.join("slimcode-old3.jsonl"),
             &[b'x'; 100],
             Duration::from_secs(3600),
         );
-        store.save(&session_with("slimcode-new")).unwrap(); // triggers eviction
+        // A create-triggering append enforces the quota.
+        let mut session = session_with("slimcode-new");
+        let asst = Message::text(Role::Assistant, "hi");
+        session.messages.push(asst.clone());
+        store.append(&session, &asst).unwrap();
         // Oldest two (450+450) evicted to get the total ≤ half (500); the
-        // smallest old file and the just-saved active session survive.
-        assert!(!proj.join("slimcode-old1.json").exists());
-        assert!(!proj.join("slimcode-old2.json").exists());
-        assert!(proj.join("slimcode-old3.json").exists());
-        assert!(proj.join("slimcode-new.json").exists());
+        // smallest old file and the just-created active session survive.
+        assert!(!proj.join("slimcode-old1.jsonl").exists());
+        assert!(!proj.join("slimcode-old2.jsonl").exists());
+        assert!(proj.join("slimcode-old3.jsonl").exists());
+        assert!(proj.join("slimcode-new.jsonl").exists());
         let total: u64 = fs::read_dir(&proj)
             .unwrap()
             .flatten()
@@ -694,14 +1454,42 @@ mod tests {
     }
 
     #[test]
+    fn evict_counts_legacy_json_and_jsonl_together() {
+        let dir = temp_dir();
+        let store = store(&dir).with_max_bytes(1000);
+        let proj = dir.join("proj-a");
+        fs::create_dir_all(&proj).unwrap();
+        write_aged(
+            &proj.join("slimcode-legacy.json"),
+            &[b'x'; 500],
+            Duration::from_secs(3600),
+        );
+        write_aged(
+            &proj.join("slimcode-old.jsonl"),
+            &[b'x'; 500],
+            Duration::from_secs(2 * 3600),
+        );
+        let mut session = session_with("slimcode-new");
+        let asst = Message::text(Role::Assistant, "hi");
+        session.messages.push(asst.clone());
+        store.append(&session, &asst).unwrap();
+        // Oldest first across both formats: the .jsonl (2h) then the legacy
+        // .json (1h) are evicted; only the active session survives.
+        assert!(!proj.join("slimcode-old.jsonl").exists());
+        assert!(!proj.join("slimcode-legacy.json").exists());
+        assert!(proj.join("slimcode-new.jsonl").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn evict_cleans_legacy_root_files_and_removes_emptied_project_dirs() {
         let dir = temp_dir();
-        let store = SessionStore::new(&dir, "proj-a").with_max_bytes(1000);
+        let store = store(&dir).with_max_bytes(1000);
         // Another project with a single old file, and a legacy root-level file.
         let proj_b = dir.join("proj-b");
         fs::create_dir_all(&proj_b).unwrap();
         write_aged(
-            &proj_b.join("slimcode-b.json"),
+            &proj_b.join("slimcode-b.jsonl"),
             &[b'x'; 600],
             Duration::from_secs(5 * 3600),
         );
@@ -710,21 +1498,24 @@ mod tests {
             &[b'x'; 600],
             Duration::from_secs(4 * 3600),
         );
-        // Current project: one old file, then a save triggers eviction.
+        // Current project: one old file, then an append triggers eviction.
         let proj_a = dir.join("proj-a");
         fs::create_dir_all(&proj_a).unwrap();
         write_aged(
-            &proj_a.join("slimcode-a-old.json"),
+            &proj_a.join("slimcode-a-old.jsonl"),
             &[b'x'; 600],
             Duration::from_secs(3 * 3600),
         );
-        store.save(&session_with("slimcode-a-new")).unwrap();
+        let mut session = session_with("slimcode-a-new");
+        let asst = Message::text(Role::Assistant, "hi");
+        session.messages.push(asst.clone());
+        store.append(&session, &asst).unwrap();
         // All three old files (1800 bytes) are evicted, the active one stays,
         // and the emptied proj-b directory is removed.
-        assert!(!proj_b.join("slimcode-b.json").exists());
+        assert!(!proj_b.join("slimcode-b.jsonl").exists());
         assert!(!dir.join("slimcode-legacy.json").exists());
-        assert!(!proj_a.join("slimcode-a-old.json").exists());
-        assert!(proj_a.join("slimcode-a-new.json").exists());
+        assert!(!proj_a.join("slimcode-a-old.jsonl").exists());
+        assert!(proj_a.join("slimcode-a-new.jsonl").exists());
         assert!(
             !proj_b.exists(),
             "emptied project directory should be removed"
@@ -735,28 +1526,34 @@ mod tests {
     #[test]
     fn evict_skips_when_under_threshold() {
         let dir = temp_dir();
-        let store = SessionStore::new(&dir, "proj-a").with_max_bytes(10_000);
+        let store = store(&dir).with_max_bytes(10_000);
         let proj = dir.join("proj-a");
         fs::create_dir_all(&proj).unwrap();
         write_aged(
-            &proj.join("slimcode-old.json"),
+            &proj.join("slimcode-old.jsonl"),
             &[b'x'; 100],
             Duration::from_secs(3600),
         );
-        store.save(&session_with("slimcode-new")).unwrap();
-        assert!(proj.join("slimcode-old.json").exists());
-        assert!(proj.join("slimcode-new.json").exists());
+        let mut session = session_with("slimcode-new");
+        let asst = Message::text(Role::Assistant, "hi");
+        session.messages.push(asst.clone());
+        store.append(&session, &asst).unwrap();
+        assert!(proj.join("slimcode-old.jsonl").exists());
+        assert!(proj.join("slimcode-new.jsonl").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn evict_never_deletes_the_active_session_even_when_over() {
         let dir = temp_dir();
-        // The smallest session JSON is already larger than this threshold, so
-        // every save overshoots; the active session must still be kept.
-        let store = SessionStore::new(&dir, "proj-a").with_max_bytes(100);
-        store.save(&session_with("slimcode-new")).unwrap();
-        assert!(dir.join("proj-a/slimcode-new.json").exists());
+        // The smallest log is already larger than this threshold, so every
+        // append overshoots; the active session must still be kept.
+        let store = store(&dir).with_max_bytes(100);
+        let mut session = session_with("slimcode-new");
+        let asst = Message::text(Role::Assistant, "hi");
+        session.messages.push(asst.clone());
+        store.append(&session, &asst).unwrap();
+        assert!(dir.join("proj-a/slimcode-new.jsonl").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -2,14 +2,14 @@
 
 一个用 Rust 编写的 AI coding agent CLI。输入一条 prompt，agent 会在目标目录内运行
 `read` / `write` / `edit` / `bash` / `grep` / `find` / `ls` 七种工具循环完成任务，
-支持流式输出、token 用量统计与可保存/恢复的会话。
+支持流式输出、token 用量统计与可恢复的会话（追加式 JSONL 会话日志，ADR-0009）。
 
 ## 特性
 
 - 单次非交互模式：`slimcode "为 README 补一段简介"`
-- 交互式 REPL：`/help`、`/new`、`/load`、`/save`、`/usage`、`/history` 等命令，
+- 交互式 REPL：`/help`、`/new`、`/load`、`/usage`、`/history` 等命令，
   未知 `/` 命令给出预测提示（前缀匹配建议）
-- 流式渲染 agent 输出，会话每轮自动保存
+- 流式渲染 agent 输出，会话按消息逐条追加保存
 - 基于 DashScope（百炼）OpenAI 兼容接口，默认使用 `qwen-plus` 模型
 - 多行 prompt（以 `\` 结尾续行）与跨运行输入历史
 - 前端无关的命令注册表与预测逻辑（`slimcode-commands`）与公共应用模块（`slimcode-common`），可供其它前端复用
@@ -88,12 +88,13 @@ slimcode --cwd /path/to/repo "运行 cargo test 并修复失败用例"
 slimcode --model qwen-max "为 README 补一段简介"
 ```
 
-运行结束后打印 token 用量与本次会话的保存路径。
+运行结束后打印 token 用量（一次性 CLI 不落盘会话）。
 
 ### 交互式 REPL
 
-不带参数启动即进入 REPL，会话在每一轮后自动保存到
-`~/.slimcode/sessions/<project-key>/<id>.json`：
+不带参数启动即进入 REPL，会话以追加式 JSONL 日志逐条写入
+`~/.slimcode/sessions/<project-key>/<id>.jsonl`（首个 assistant 消息出现时才
+创建文件，之后每条进入历史的消息各占一行）：
 
 ```bash
 slimcode
@@ -107,7 +108,6 @@ slimcode
 | `/load <id>` | 从磁盘恢复一个已保存会话（`/resume` 同义） |
 | `/sessions` | 列出已保存会话 id |
 | `/usage` | 显示累计 token 用量 |
-| `/save` | 显式保存当前会话 |
 | `/history` | 列出输入历史（最近 20 条、最新在前、带编号） |
 | `/!!` | 重跑最近一条 prompt |
 | `/!N` | 重跑编号 N 的 prompt |

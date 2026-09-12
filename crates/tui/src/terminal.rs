@@ -27,8 +27,8 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use slimcode_agent::agent::{CancelToken, RunConfig, Tool};
-use slimcode_agent::session::{Message, Session};
+use slimcode_agent::agent::{CancelToken, RunConfig, StopReason, Tool};
+use slimcode_agent::session::{Message, MessageStopReason, Part, Role, Session};
 use slimcode_ai::{BailianConfig, BailianProvider};
 use slimcode_common::context::{ContextBuilder, Environment};
 use slimcode_common::context_files::ContextFile;
@@ -99,6 +99,17 @@ pub fn run(
 /// title"). Best-effort: a title failure must not kill the TUI.
 fn set_title(session_id: &str, cwd: &Path) {
     let _ = execute!(stdout(), SetTitle(terminal_title(session_id, cwd)));
+}
+
+/// What a turn's worker produced: the session at the log's position (the
+/// pre-turn session plus every message that entered history), the turn result
+/// with its stop reason, how many messages were appended to the log, and any
+/// append failures the worker collected (persistence is best-effort).
+struct TurnOutcome {
+    session: Session,
+    result: Result<(Vec<Message>, StopReason), String>,
+    appended: usize,
+    append_errors: Vec<String>,
 }
 
 /// The full TUI session state. Owns the pure [`App`] and everything the loop
@@ -254,19 +265,27 @@ impl<'a> Tui<'a> {
                 Ok(())
             }
             Effect::LoadSession(id) => {
-                let loaded = self.store.load(&id)?;
-                if let Some(title) = &loaded.title {
+                let outcome = self.store.load(&id)?;
+                if let Some(title) = &outcome.session.title {
                     self.app.push_notice(format!("  title: {title}"));
                 }
-                self.session = loaded;
+                // Lenient replay surfaced something (ADR-0009 D3): say so.
+                if outcome.skipped_records > 0 {
+                    self.app.push_notice(format!(
+                        "  skipped {} unreadable record(s)",
+                        outcome.skipped_records
+                    ));
+                }
+                if outcome.repaired_tool_calls > 0 {
+                    self.app.push_notice(format!(
+                        "  repaired {} interrupted tool call(s)",
+                        outcome.repaired_tool_calls
+                    ));
+                }
+                self.session = outcome.session;
                 self.app.apply_loaded_session(&self.session.id);
                 self.app.set_branch(current_branch(&self.cwd));
                 set_title(&self.session.id, &self.cwd);
-                Ok(())
-            }
-            Effect::SaveSession => {
-                let path = self.store.save(&self.session)?;
-                self.app.push_notice(format!("saved: {}", path.display()));
                 Ok(())
             }
             Effect::ListSessions => {
@@ -315,11 +334,16 @@ impl<'a> Tui<'a> {
 
     /// Run a prompt as a fresh turn. `record` controls whether the raw prompt
     /// is appended to input history (true for typed prompts, false for
-    /// replays and skill triggers). The context is built from a clone of the
-    /// session messages so a failed turn leaves the conversation intact (the
-    /// session is persisted either way, see [`Tui::finish_turn`]).
+    /// replays and skill triggers). This turn's new messages (the first-turn
+    /// system message plus the user prompt) enter the session history first,
+    /// and each is appended to the session log as it enters memory — the
+    /// append is a no-op before the first assistant message, so no file exists
+    /// until the model replies (ADR-0009 D5). The context sent to the runner
+    /// is built from that same history, so memory, log and context are one
+    /// message sequence.
     fn submit_prompt(&mut self, prompt: String, record: bool) -> Result<(), String> {
         let skills = self.skills.list().unwrap_or_default();
+        let first_turn = self.session.messages.is_empty();
         let context = ContextBuilder::new()
             .with_environment(self.environment.clone())
             .with_context_files(&self.context_files)
@@ -327,6 +351,15 @@ impl<'a> Tui<'a> {
             .with_history(self.session.messages.clone())
             .with_user_prompt(&prompt)
             .build()?;
+        // This turn's new messages are the tail of the context: the system
+        // message on the first turn only, then the user prompt.
+        let new_count = if first_turn { 2 } else { 1 };
+        for msg in &context[context.len() - new_count..] {
+            self.session.messages.push(msg.clone());
+            if let Err(e) = self.store.append(&self.session, msg) {
+                self.app.push_notice(format!("session log: {e}"));
+            }
+        }
         let record = if record { Some(prompt.as_str()) } else { None };
         self.finish_turn(context, record)
     }
@@ -344,13 +377,16 @@ impl<'a> Tui<'a> {
         self.submit_prompt(prompt.to_string(), false)
     }
 
-    /// Trigger a skill as a fresh turn; never recorded in input history.
+    /// Trigger a skill as a fresh turn; never recorded in input history. The
+    /// skill's system message (first turn only) and the user prompt enter the
+    /// session history and log first, mirroring [`Tui::submit_prompt`].
     fn trigger_skill(&mut self, name: &str, arg: Option<&str>) -> Result<(), String> {
         let skills = self.skills.list().unwrap_or_default();
         let Some(skill) = find_skill(&skills, name) else {
             self.app.push_error(format!("no such skill: /{name}"));
             return Ok(());
         };
+        let first_turn = self.session.messages.is_empty();
         let context = ContextBuilder::new()
             .with_environment(self.environment.clone())
             .with_context_files(&self.context_files)
@@ -358,52 +394,116 @@ impl<'a> Tui<'a> {
             .with_history(self.session.messages.clone())
             .with_skill(skill, arg)
             .build()?;
+        let new_count = if first_turn { 2 } else { 1 };
+        for msg in &context[context.len() - new_count..] {
+            self.session.messages.push(msg.clone());
+            if let Err(e) = self.store.append(&self.session, msg) {
+                self.app.push_notice(format!("session log: {e}"));
+            }
+        }
         self.finish_turn(context, None)
     }
 
     /// Shared tail of a prompt/skill turn: infer the title, record history
     /// (before the turn, so a failed turn still records what was typed),
-    /// stream the turn live into the transcript, persist the session (even on
-    /// a failed turn, per spec), and feed the footer usage totals.
+    /// stream the turn live into the transcript, adopt the worker's session
+    /// (memory reaches the log's position), and feed the footer usage totals.
+    /// A turn that failed or was cancelled after its first assistant message
+    /// closes the log with a short assistant message (`stop_reason` =
+    /// `error`/`aborted`); a turn that never produced an assistant message
+    /// leaves no log at all (ADR-0009 D5).
     fn finish_turn(&mut self, context: Vec<Message>, record: Option<&str>) -> Result<(), String> {
-        if self.session.title.is_none() {
+        let title_was_none = self.session.title.is_none();
+        if title_was_none {
             self.session.title = infer_title(&context);
+        }
+        // A title that only became known now (e.g. a restored session whose
+        // earlier turn had an empty prompt) must reach the log: the log may
+        // already exist, and then the title cannot ride the creation header
+        // block any more — it needs its own record. If the log does not exist
+        // yet, the title rides the header block at creation instead
+        // (ADR-0009 D1).
+        if title_was_none
+            && let Some(title) = self.session.title.as_ref()
+            && let Ok(path) = self.store.session_path(&self.session.id)
+            && path.exists()
+            && let Err(e) = self.store.append_title(&self.session, title)
+        {
+            self.app.push_notice(format!("session log: {e}"));
         }
         if let Some(prompt) = record
             && let Err(e) = self.history.append(prompt)
         {
             self.app.push_notice(format!("history: {e}"));
         }
-        let updated = self.drive_turn(context);
-        let updated = match updated {
-            Ok(updated) => updated,
-            Err(e) => {
-                // Spec: a failed turn still leaves the session persisted, with
-                // its prior messages intact (the context was built from a
-                // clone, so `session.messages` was never emptied).
-                if let Err(save_err) = self.store.save(&self.session) {
-                    self.app
-                        .push_notice(format!("session save failed: {save_err}"));
+        let outcome = self.drive_turn(context)?;
+        // Adopt the worker's session: memory and the log now agree.
+        self.session = outcome.session;
+        for e in &outcome.append_errors {
+            self.app.push_notice(format!("session log: {e}"));
+        }
+        match outcome.result {
+            Ok((_, StopReason::Completed)) => {}
+            Ok((_, StopReason::Cancelled)) => {
+                // Esc: the partial turn is adopted; the log is closed on an
+                // assistant boundary so it never ends on a dangling tool
+                // batch or a trailing tool result (ADR-0009 D3).
+                if outcome.appended > 0 {
+                    self.close_turn(MessageStopReason::Aborted, None);
                 }
-                return Err(e);
             }
-        };
-        self.session.messages = updated;
-        self.store.save(&self.session)?;
+            Err(e) => {
+                // A failed turn still leaves the session persisted, with its
+                // prior messages intact; the failure closes the log on an
+                // assistant boundary (or leaves no file at all if nothing was
+                // appended). The failure reason still shows in the transcript.
+                if outcome.appended > 0 {
+                    self.close_turn(MessageStopReason::Error, Some(e.clone()));
+                }
+                self.app.push_error(e);
+            }
+        }
         self.app.set_usage(FooterUsage::from(&self.total_usage()));
         Ok(())
     }
 
+    /// Close the log after a failed/cancelled turn: an assistant message with
+    /// a short, non-empty text and the failure's `stop_reason` enters memory
+    /// and is appended, so the live session adopts the partial turn and the
+    /// log ends on an assistant boundary (ADR-0009 D3).
+    fn close_turn(&mut self, reason: MessageStopReason, error: Option<String>) {
+        let text = match &error {
+            Some(e) => format!("The turn ended with an error: {e}"),
+            None => "The turn was cancelled.".to_string(),
+        };
+        let message = Message {
+            role: Role::Assistant,
+            parts: vec![Part::Text { text }],
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            stop_reason: Some(reason),
+            error,
+        };
+        self.session.messages.push(message.clone());
+        if let Err(e) = self.store.append(&self.session, &message) {
+            self.app.push_notice(format!("session log: {e}"));
+        }
+    }
+
     /// Drive one turn on a worker thread (ADR-0006 D6). The worker runs the
     /// shared runner against the moved provider + tools, streaming every
-    /// `DisplayItem` over an mpsc channel; this UI loop polls terminal events
-    /// and the channel at [`FRAME_MS`], draining items into the app and
-    /// redrawing so the spinner animates. Ctrl+C/Ctrl+D record quit-after-turn
-    /// (the turn keeps streaming); bare Esc cancels the running turn (ticket
-    /// 07 — the token is reset here so every turn starts uncancelled); all
-    /// other keys are ignored while running. The provider and tools are always
-    /// restored before returning.
-    fn drive_turn(&mut self, messages: Vec<Message>) -> Result<Vec<Message>, String> {
+    /// `DisplayItem` over an mpsc channel; every message that enters history
+    /// is forwarded to a sink that appends it to the session log and to a
+    /// session clone, so the log grows per message as the turn runs and the
+    /// clone mirrors memory (ADR-0009 D2/D5). `thread::scope` lets the worker
+    /// borrow the store; the UI loop polls terminal events and the channel at
+    /// [`FRAME_MS`], draining items into the app and redrawing so the spinner
+    /// animates. Ctrl+C/Ctrl+D record quit-after-turn (the turn keeps
+    /// streaming); bare Esc cancels the running turn (ticket 07 — the token is
+    /// reset here so every turn starts uncancelled); all other keys are
+    /// ignored while running. The provider and tools are always restored
+    /// before returning.
+    fn drive_turn(&mut self, messages: Vec<Message>) -> Result<TurnOutcome, String> {
         self.cancel.reset();
         self.app.set_running(true);
         let cfg = RunConfig::default();
@@ -411,59 +511,98 @@ impl<'a> Tui<'a> {
         let mut provider = self.provider.take().expect("provider present while idle");
         let tools = std::mem::take(&mut self.tools);
         let cancel = self.cancel.clone();
-        let handle = thread::spawn(move || {
-            let result = slimcode_common::runner::run_turn(
-                &mut provider,
-                &tools,
-                messages,
-                &cfg,
-                &cancel,
-                &mut ChannelRenderer { tx },
-            );
-            (result, provider, tools)
-        });
+        let store = self.store;
+        let mut session_clone = self.session.clone();
+        let mut appended = 0usize;
+        let mut append_errors: Vec<String> = Vec::new();
 
-        // The UI loop runs until the worker finishes. A terminal/UI error is
-        // remembered but the loop still drains the channel and joins, so the
-        // provider is always restored and the turn result is never lost.
-        let mut ui_error: Option<String> = None;
-        let mut quit_after_turn = false;
-        let (result, provider, tools) = loop {
-            // Polling is also the frame timer (~80ms); on a failed poll once
-            // an error is recorded we still sleep so the loop is not hot.
-            match event::poll(Duration::from_millis(FRAME_MS)) {
-                Ok(true) => match event::read() {
-                    Ok(Event::Key(key)) if ui_error.is_none() => {
-                        match self.app.handle_key_running(key) {
-                            Some(Effect::QuitAfterTurn) => quit_after_turn = true,
-                            // Esc: abort the in-flight request / tool at the
-                            // next runner boundary; the worker drains and
-                            // joins as usual and the turn ends Cancelled.
-                            Some(Effect::CancelRunning) => self.cancel.cancel(),
-                            _ => {}
+        let worker = thread::scope(|scope| {
+            let handle = scope.spawn(move || {
+                let result = slimcode_common::runner::run_turn(
+                    &mut provider,
+                    &tools,
+                    messages,
+                    &cfg,
+                    &cancel,
+                    &mut ChannelRenderer { tx },
+                    &mut |msg: &Message| -> Result<(), String> {
+                        // The message entered history: mirror it into the
+                        // session clone and append it to the log. Persistence
+                        // is best-effort — a storage hiccup must not abort the
+                        // turn, so failures are collected and reported as
+                        // notices after the turn.
+                        session_clone.messages.push(msg.clone());
+                        appended += 1;
+                        if let Err(e) = store.append(&session_clone, msg) {
+                            append_errors.push(e);
                         }
-                    }
-                    Ok(_) => {}
-                    Err(e) if ui_error.is_none() => ui_error = Some(format!("event: {e}")),
-                    Err(_) => {}
-                },
-                Ok(false) => {}
-                Err(e) if ui_error.is_none() => ui_error = Some(format!("event poll: {e}")),
-                Err(_) => {}
-            }
-            drain_channel(&rx, &mut self.app, &mut ui_error)?;
-            if handle.is_finished() {
-                drain_channel(&rx, &mut self.app, &mut ui_error)?;
-                break handle
-                    .join()
-                    .map_err(|_| "turn worker panicked".to_string())?;
-            }
-            if ui_error.is_none() {
-                self.draw()?;
-            }
-            self.app.tick();
-        };
+                        Ok(())
+                    },
+                );
+                (
+                    result,
+                    provider,
+                    tools,
+                    session_clone,
+                    appended,
+                    append_errors,
+                )
+            });
 
+            // The UI loop runs until the worker finishes. A terminal/UI error
+            // is remembered but the loop still drains the channel and joins,
+            // so the provider is always restored and the turn result is never
+            // lost. The closure returns a Result so a mid-loop terminal
+            // failure propagates exactly like the pre-scope code did; a join
+            // panic is the same unrecoverable worker loss as before.
+            let mut ui_error: Option<String> = None;
+            let mut quit_after_turn = false;
+            let joined = loop {
+                // Polling is also the frame timer (~80ms); on a failed poll
+                // once an error is recorded we still sleep so the loop is not
+                // hot.
+                match event::poll(Duration::from_millis(FRAME_MS)) {
+                    Ok(true) => match event::read() {
+                        Ok(Event::Key(key)) if ui_error.is_none() => {
+                            match self.app.handle_key_running(key) {
+                                Some(Effect::QuitAfterTurn) => quit_after_turn = true,
+                                // Esc: abort the in-flight request / tool at
+                                // the next runner boundary; the worker drains
+                                // and joins as usual and the turn ends
+                                // Cancelled.
+                                Some(Effect::CancelRunning) => self.cancel.cancel(),
+                                _ => {}
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) if ui_error.is_none() => ui_error = Some(format!("event: {e}")),
+                        Err(_) => {}
+                    },
+                    Ok(false) => {}
+                    Err(e) if ui_error.is_none() => ui_error = Some(format!("event poll: {e}")),
+                    Err(_) => {}
+                }
+                // Drain failures are recorded into `ui_error` by the drainer
+                // itself; nothing further to propagate here.
+                let _ = drain_channel(&rx, &mut self.app, &mut ui_error);
+                if handle.is_finished() {
+                    let _ = drain_channel(&rx, &mut self.app, &mut ui_error);
+                    break handle
+                        .join()
+                        .map_err(|_| "turn worker panicked".to_string())?;
+                }
+                if ui_error.is_none() {
+                    self.draw()?;
+                }
+                self.app.tick();
+            };
+            Ok::<_, String>((joined, ui_error, quit_after_turn))
+        })?;
+        let (
+            (result, provider, tools, session_clone, appended, append_errors),
+            ui_error,
+            quit_after_turn,
+        ) = worker;
         self.quit_after_turn |= quit_after_turn;
         self.provider = Some(provider);
         self.tools = tools;
@@ -471,7 +610,12 @@ impl<'a> Tui<'a> {
         if let Some(err) = ui_error {
             return Err(err);
         }
-        result
+        Ok(TurnOutcome {
+            session: session_clone,
+            result,
+            appended,
+            append_errors,
+        })
     }
 
     /// Draw one frame.
@@ -635,6 +779,7 @@ mod tests {
                 &cfg,
                 &cancel,
                 &mut ChannelRenderer { tx },
+                &mut |_| Ok(()),
             );
             (result, provider.calls)
         });
@@ -644,7 +789,7 @@ mod tests {
             items.push(item);
         }
         let (result, calls) = handle.join().unwrap();
-        let updated = result.expect("turn succeeds");
+        let (updated, _) = result.expect("turn succeeds");
 
         // The ordered stream the UI loop would apply: two turn markers, the
         // streamed text fragments (each delta its own item), the tool

@@ -9,7 +9,7 @@ A single user input submitted to the agent for one turn. A prompt may span multi
 _Avoid_: input, question
 
 **Command**:
-A `/xxx` control instruction in an interactive frontend (currently the TUI), e.g. `/save`, `/load`; distinct from a Prompt.
+A `/xxx` control instruction in an interactive frontend (currently the TUI), e.g. `/load`, `/sessions`; distinct from a Prompt.
 _Avoid_: slash-command
 
 **Skill**:
@@ -32,13 +32,38 @@ finds the instructions in the earlier message instead of reloading.
 _Avoid_: plugin, extension
 
 **Session**:
-A conversation with a stable id, timestamp, messages, and optional title; persisted as JSON and restorable via `/load`.
+A conversation with a stable id, timestamp, message history, and optional title; persisted as an
+append-only session log and restorable via `/load`.
 _Avoid_: conversation (used interchangeably)
+
+**Session log**:
+One Session's `<id>.jsonl` file: a log header line followed by one record per line
+(`{"type":"message","message":{…}}`, `{"type":"title","title":…}`), appended as messages enter
+history and never rewritten — the only writes are the header-plus-backlog write that creates the
+log, one record per message after that, and the sealing newline a lenient load may add to a torn
+tail. A record whose `type` is unknown is ignored, so new record kinds stay compatible with older
+readers. The title is a record, never a header field.
+_Avoid_: session file (ambiguous with the legacy `<id>.json`), dump, snapshot
+
+**Log header**:
+The first line of a session log —
+`{"type":"session","v":1,"id":…,"created_at":…,"project_home":…}` — carrying the Session's
+immutable identity, the log format version, and the project home it was created under
+(informational: the project-key directory, not the header, decides where a session is found).
+_Avoid_: metadata, front matter
+
+**Dangling tool batch**:
+A read state in which an assistant message's `tool_calls` have no matching tool results (a crash or
+cancel mid-batch), or a tool result has no matching `tool_calls`. Repaired in memory on load —
+missing results filled in with an `Error: interrupted` tool result, orphan results dropped — so the
+replayed message history always pairs every `tool_call_id`; the log itself is never rewritten.
+_Avoid_: broken tool call, incomplete turn
 
 **Session store**:
 The project-scoped place sessions are persisted: one directory per project
-(`<home>/sessions/<project-key>/`) holding one JSON file per Session. `/load` and
-`/sessions` see only the current project's directory.
+(`<home>/sessions/<project-key>/`) holding one session log per Session; `/load` and `/sessions` see
+only the current project's directory, and legacy `<id>.json` files in it are neither listed nor
+loaded (they still count toward the storage quota).
 _Avoid_: sessions dir, archive
 
 **Project key**:
@@ -53,10 +78,11 @@ distinct from any single session's size.
 _Avoid_: size limit, cache
 
 **Eviction**:
-Removing Session files once the session store exceeds the storage quota: oldest-first by
-mtime, down to half the quota, never the active session. An **empty session** (no
-messages, zero-byte, or unparseable JSON) is removed by a separate startup sweep that
-touches only the current project.
+Removing session logs once the session store exceeds the storage quota: oldest-first by mtime, down
+to half the quota, never the active session; legacy `<id>.json` files are invisible to `/load` but
+still counted, so they disappear through eviction rather than migration. An **empty session log**
+(zero-byte, or replaying to no assistant record — residue of a crash during log creation) is
+removed by a separate startup sweep that touches only the current project.
 _Avoid_: cleanup, pruning, GC
 
 **Message history**:

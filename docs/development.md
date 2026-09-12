@@ -83,9 +83,12 @@ cargo workspace，六个 crate：
 
 ### crates/agent 会话模型（`session`）
 
-消息/会话数据模型，折入自 ticket 04：
+消息/会话数据模型，折入自 ticket 04（ADR-0009 起扩展了日志专用字段）：
 
-- `Message { role, parts: Vec<Part>, tool_calls, tool_call_id }`，role 序列化小写；
+- `Message { role, parts: Vec<Part>, tool_calls, tool_call_id, stop_reason, error }`，
+  role 序列化小写；`stop_reason`（`stop`/`tool_calls`/`error`/`aborted`）与 `error`
+  是日志专用字段（`skip_serializing_if` 省略、不出现在 LLM wire 上），普通消息的
+  序列化字节与旧 JSON 完全一致；
 - `Part::Text { text }`（parts 抽象，v1 默认/唯一变体），JSON 形状 `{"type":"text","text":"..."}`；
 - `ToolCall { id, name, arguments }`，`arguments` 存模型原始 JSON 串、执行时才 parse；
 - `Session { id, created_at, messages, title }` 包一层元数据（为 `~/.slimcode/sessions/` 准备）；
@@ -149,13 +152,17 @@ cargo workspace，六个 crate：
   `~/.slimcode`；会话配额只走文件与默认两层：`[sessions] max_mb`（`FileSessions.max_mb`，
   默认 `DEFAULT_MAX_MB = 500` MiB，无 env/CLI 覆盖）→ `resolve_max_mb(file_toml)` +
   `max_mb_to_bytes(mb)` 换算为字节；
-- `session`：项目分区的 `SessionStore`（`~/.slimcode/sessions/<project-key>/<id>.json`），
-  project key = project home 的 basename + 全路径 FNV-1a hash 前 12 hex（`project_key()`，
-  无外部依赖、跨版本稳定）；id `slimcode-<unix>-<pid>-<n>`、created_at RFC3339 UTC
-  （无 chrono 依赖）、标题取首条用户消息截断 48 字符；`save`/`load`/`list` 只作用于
-  当前项目子目录；`save` 后 `evict_over_quota` 以 mtime 最旧优先删到配额一半
-  （`DEFAULT_MAX_BYTES`，`with_max_bytes` 覆盖，跳过当前 session，删空目录，尽力而为），
-  `cleanup_empty` 在启动时静默清理当前项目的空/损坏会话；
+- `session`：项目分区的 `SessionStore`（`~/.slimcode/sessions/<project-key>/<id>.jsonl`，
+  ADR-0009 追加式 JSONL 日志），project key = project home 的 basename + 全路径
+  FNV-1a hash 前 12 hex（`project_key()`，无外部依赖、跨版本稳定）；id
+  `slimcode-<unix>-<pid>-<n>`、created_at RFC3339 UTC（无 chrono 依赖）、标题取首条
+  用户消息截断 48 字符；`append`（首个 assistant 消息时独占建日志：头 + title + 全量
+  backlog，此后每条一行的追加，之前为 no-op）、`append_title`、宽容的 `load`
+  （未知/损坏记录跳过并计数、残缺尾行丢弃并补换行、悬空的工具调用批次在内存补
+  `Error: interrupted`，磁盘字节不改写）、`list` 只作用于当前项目子目录；每次追加后
+  `evict_over_quota` 以 mtime 最旧优先删到配额一半（`.jsonl` 与遗留 `.json` 一起计数，
+  `DEFAULT_MAX_BYTES`，`with_max_bytes` 覆盖，跳过当前 session，删空目录，尽力而为），
+  `cleanup_empty` 在启动时静默清理当前项目内重放不到任何 assistant 消息的 `.jsonl`；
 - `history`：`HistoryStore`（`~/.slimcode/history.json`，JSON 数组，上限 500 条丢最旧）
   记录 `input history`（仅普通 prompt，不含 `/` 命令），与会话 `message history` 严格区分
   （见 CONTEXT.md）；
@@ -179,7 +186,7 @@ cargo workspace，六个 crate：
 - `/` 补全（ADR-0005）：`CompletionItem { value, description }` + `complete(input,
   skills) -> Vec<CompletionItem>`——把 `slimcode-commands` 的每个命令拼写（规范名 + 别名）
   与每个已安装 skill 合成候选池，用 `fuzzy::fuzzy_match` 模糊排序（裸 `/` 按注册表顺序列全部，
-  命令在前、skill 在后；非 `/` 输入返回空）；候选 `value` 是命令的裸拼写（`/save`、`/resume`）
+  命令在前、skill 在后；非 `/` 输入返回空）；候选 `value` 是命令的裸拼写（`/usage`、`/resume`）
   与 skill 的规范触发 `/skill:name`，**不含** `usage` 的参数占位符，提交时经
   `find`/`find_skill` 可解析；skill 只按**裸名字**参与模糊打分（`/skill:` 前缀是纯拼写，
   若一起打分会让 `s`/`k`/`i`/`l` 等前缀字母命中所有 skill、并淹没名字自身的边界奖励），
@@ -222,8 +229,11 @@ cargo workspace，六个 crate：
   `Renderer` trait 消费 `DisplayItem`，每个前端只实现自己的渲染器（cli 的文本行、
   tui 的 widget 状态）。
 - `runner`：共享 turn runner `run_turn(provider, tools, messages, &RunConfig,
-  &mut dyn Renderer) -> Result<Vec<Message>, String>`，逐事件流式回调渲染器，返回
-  更新后的消息历史。cli 与 tui 共用同一 turn 循环，行为不漂移。
+  &mut dyn Renderer, &mut dyn FnMut(&Message))
+  -> Result<(Vec<Message>, StopReason), String>`（ADR-0009 D5 加 `on_message` 回调与
+  `StopReason` 返回值）：逐事件流式回调渲染器，每条进历史的消息（assistant 回复、
+  每个工具结果）同步回调一次 sink（TUI 借此实时追加日志），返回更新后的消息历史与
+  终止原因（`Completed`/`Cancelled`）。cli 与 tui 共用同一 turn 循环，行为不漂移。
 - `setup`：`setup(cwd, config) -> (BailianProvider, Vec<Tool>)` 共享 seam，cli 与
   tui 用同一套 provider + 工具构造，两端不会各自实现而漂移。
 
@@ -292,7 +302,14 @@ reducer + draw）、`terminal`（薄壳 + worker-thread runner）。分层：
   bash 子进程组；以 `StopReason::Cancelled` 静默结束、已流式内容保留、不进历史）；
   Ctrl+C / Ctrl+D → `Effect::QuitAfterTurn`，其它按键忽略。`handle.is_finished()` 门控
   join，任何路径都先 join 再 restore provider/工具（不变量：provider 总被归还）。turn
-  结束自动保存会话；turn 报错内联进 transcript 并回到输入框。TUI 用 `setup_with_cancel`
+  结束后 worker 返回会话克隆（每轮起点 + 本轮进入历史的消息），TUI 采纳；turn 报错内联进
+  transcript 并回到输入框。会话持久化改为**每条消息实时追加**（ADR-0009 D5）：worker 的
+  `on_message` sink 把进入历史的每条消息同时推进 session 克隆并 `store.append`（追加失败
+  收集为 notice、不打断 turn）；TUI 在 `submit_prompt`/`trigger_skill` 把本轮新消息
+  （首轮 system + user）先进历史并 append（首个 assistant 前是 no-op、不建文件）；失败/
+  取消且本轮已 append 过时，`close_turn` 追加一条带 `stop_reason`（`error`/`aborted`）与
+  短文本的 assistant 消息收尾，保证日志不悬在工具批次上；一轮在首个 assistant 前失败则
+  不产生任何文件。`/save` 已随整文件保存一并移除。TUI 用 `setup_with_cancel`
   （bash 为可取消变体，进程组 SIGKILL、~50ms 轮询）；CLI one-shot 用普通 `setup` +
   从不置位的 token。
 - **测试 seam**：决定逻辑都在 `app` 纯 core 与 `footer`/`git` 纯函数里（帧缓冲测试、
@@ -321,7 +338,8 @@ reducer + draw）、`terminal`（薄壳 + worker-thread runner）。分层：
   `--base-url <url>`、`--api-key <key>`）经共享 `ContextBuilder` 组装消息列表（新会话首轮前置系统
   提示并广告可自动调用 skill；开头的 `/skill:name` 会先被 `normalize_skill_trigger`
   改写为 `/{name}`，因为 one-shot 没有命令解析器），经共享 `run_turn` 跑一轮七工具循环、流式渲染事件、
-  打印 token 用量并保存会话；
+  打印 token 用量；**不落盘会话**（ADR-0009 D5：无 `/load`/`/sessions` 工作流，与 TUI
+  「首个 assistant 前失败不建文件」规则一致；`main` 里的启动 `cleanup_empty` 仍执行）；
 - **chmod 提示**：`load_app_config` 之后，若 `ApiKeySource::File` 且（Unix）
   `config.toml` 权限 `mode & 0o077 != 0`，stderr 打印 `chmod 600 <path>` 提示（one-shot
   与 TUI 共用此打印点，TUI 进 alternate screen 前已打过）；非 Unix 跳过；

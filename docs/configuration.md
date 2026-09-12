@@ -83,12 +83,15 @@ export SLIMCODE_HOME=/path/to/custom/slimcode
 max_mb = 500
 ```
 
-每次保存会话后，slimcode 统计 `sessions/` 下所有会话文件（含各项目子目录）的总字节数；
+每次追加会话记录后，slimcode 统计 `sessions/` 下所有会话文件（各项目的 `.jsonl`
+日志 + 遗留的旧 `.json` 整文件，含各项目子目录）的总字节数；
 超过 `max_mb` 时按文件 mtime **从最旧**删除，直到总占用降到阈值的一半（默认 250 MiB），
-并跳过当前正在使用的会话；删空的项目目录一并移除。清理是尽力而为的：失败不会让保存失败。
-启动时还会静默清理当前项目内的空会话（无消息、0 字节或损坏的 JSON）。
+并跳过当前正在使用的会话；删空的项目目录一并移除。清理是尽力而为的：失败不会影响会话。
+启动时还会静默清理当前项目内重放不到任何 assistant 消息的 `.jsonl` 日志（0 字节、
+日志头损坏、或只有头的崩溃残留）；遗留的 `.json` 只计入配额，不参与启动清理。
 详见 [user-manual.md](./user-manual.md) 的「会话文件」节与
-[ADR-0008](./adr/0008-project-scoped-sessions-with-quota-eviction.md)。
+[ADR-0008](./adr/0008-project-scoped-sessions-with-quota-eviction.md)（配额机制）和
+[ADR-0009](./adr/0009-appended-jsonl-session-log.md)（JSONL 日志格式）。
 
 ### Skill 目录（非 config.toml）
 

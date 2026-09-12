@@ -1,5 +1,13 @@
 # Project-scoped session storage with quota eviction
 
+> **Superseded in part by [ADR-0009](./0009-appended-jsonl-session-log.md)**
+> (2026): the on-disk format moved from whole-file JSON (`<id>.json`) to an
+> append-only JSONL log (`<id>.jsonl`), `/save` and `Effect::SaveSession` are
+> gone, empty-session startup cleanup now means "replays to no assistant
+> message", and quota eviction now runs after each append. The **per-project
+> partitioning** (D1) and the **quota-with-oldest-first-eviction** mechanism
+> (D2) are unchanged.
+
 Sessions were persisted flat at `~/.slimcode/sessions/<id>.json`, so every project's
 conversations piled into one directory: `/load` and `/sessions` showed a global grab-bag,
 cross-project mix-ups were one keystroke away, and nothing ever removed old files. This ADR

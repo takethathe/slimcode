@@ -613,6 +613,28 @@ mod tests {
     }
 
     #[test]
+    fn message_to_wire_ignores_log_only_fields() {
+        // `stop_reason` and `error` are log-schema fields (ADR-0009 D5): they
+        // must never leak onto the provider wire. The failure-closing assistant
+        // message still goes out as plain assistant text.
+        use slimcode_agent::session::MessageStopReason;
+        let mut m = Message::text(Role::Assistant, "The turn ended with an error: boom");
+        m.stop_reason = Some(MessageStopReason::Error);
+        m.error = Some("boom".to_string());
+        let w = message_to_wire(&m, false);
+        assert_eq!(w.role, "assistant");
+        assert_eq!(
+            w.content,
+            Some(WireContent::Text(
+                "The turn ended with an error: boom".to_string()
+            ))
+        );
+        let json = serde_json::to_value(&w).unwrap();
+        assert!(json.get("stop_reason").is_none());
+        assert!(json.get("error").is_none());
+    }
+
+    #[test]
     fn tool_to_wire_shapes_function() {
         let t = Tool::new(
             "get_weather",

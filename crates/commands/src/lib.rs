@@ -91,7 +91,6 @@ pub const COMMANDS: &[Command] = &[
     Command::aliased("/load", &["/resume"], "/load <id>", "load a saved session"),
     Command::new("/sessions", "/sessions", "list saved sessions"),
     Command::new("/usage", "/usage", "show token usage"),
-    Command::new("/save", "/save", "save the current session"),
     Command::new("/history", "/history", "list input history"),
     Command::new("/skills", "/skills", "list installed skills"),
     Command::new(
@@ -166,9 +165,9 @@ mod tests {
 
     #[test]
     fn suggest_exact_spelling() {
-        let got = suggest("/save");
+        let got = suggest("/usage");
         let names: Vec<_> = got.iter().map(|c| c.name).collect();
-        assert_eq!(names, vec!["/save"]);
+        assert_eq!(names, vec!["/usage"]);
     }
 
     #[test]
