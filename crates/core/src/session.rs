@@ -96,6 +96,16 @@ impl AgentMessage {
             Self::Llm(message) => message.tool_call_id.as_deref(),
         }
     }
+
+    /// The single mutation entry point (ADR-0015 D3): run hooks rewrite the
+    /// wire message a run is about to store. Only the LLM variant exists
+    /// today, so this cannot fail; a future session-only variant would decide
+    /// how a rewrite applies (or refuse it).
+    pub fn llm_mut(&mut self) -> &mut Message {
+        match self {
+            Self::Llm(message) => message,
+        }
+    }
 }
 
 /// Prepending the system message to the `to_llm`-converted history is the only

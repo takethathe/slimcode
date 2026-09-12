@@ -194,13 +194,30 @@ mod tests {
         messages: Vec<AgentMessage>,
     ) -> Result<(Vec<AgentMessage>, StopReason, Vec<AgentEvent>), String> {
         let mut events: Vec<AgentEvent> = Vec::new();
+        // The sink's borrow of `events` ends when the collect helper returns,
+        // so the Vec can be moved out afterwards (the runner's drop glue
+        // would keep the borrow alive otherwise).
+        let (messages, stop) =
+            run_agent_collect(provider, tools, cfg, cancel, system, messages, &mut events)?;
+        Ok((messages, stop, events))
+    }
+
+    /// The same loop with a caller-owned event collector.
+    fn run_agent_collect(
+        provider: &mut impl Provider,
+        tools: &[Tool],
+        cfg: RunConfig,
+        cancel: &CancelToken,
+        system: &Message,
+        messages: Vec<AgentMessage>,
+        events: &mut Vec<AgentEvent>,
+    ) -> Result<(Vec<AgentMessage>, StopReason), String> {
         let mut sink = |e: AgentEvent| {
             events.push(e);
             Ok(())
         };
         let mut runner = AgentRunner::new(tools, cfg, cancel, &mut sink);
-        let (messages, stop) = runner.run(provider, system, messages)?;
-        Ok((messages, stop, events))
+        runner.run(provider, system, messages)
     }
 
     // --- behavior -----------------------------------------------------------

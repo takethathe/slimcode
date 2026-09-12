@@ -3,6 +3,7 @@
 //! Shape locked by `.scratch/slimcode-v1` ticket 04:
 //! - the loop is a value, [`AgentRunner`] (ADR-0011 D1): one run's tools,
 //!   config, cancel token and event subscription, with `run` driving the loop;
+//!   ADR-0015 adds the optional hook seam ([`RunHooks`]) on top of it;
 //! - loop: model response with `tool_calls` → execute tools → append tool
 //!   results → loop, until the model stops calling tools;
 //! - stop conditions: no tool_calls → `Completed`; user interrupt (cancel
@@ -94,6 +95,19 @@ pub enum StopReason {
     Cancelled,
 }
 
+/// What a [`RunHooks::before_tool`] hook decides for one call: run it, or
+/// skip execution and supply the result the model will see (ADR-0015 D4). A
+/// skip still yields a tool result, because every `tool_call` must be paired
+/// with one on the next provider request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolDecision {
+    /// Execute the tool.
+    Run,
+    /// Do not execute; use this result instead. `Err` becomes the `Error: …`
+    /// shape tool failures already use.
+    Skip(Result<String, String>),
+}
+
 /// Every observable thing the runtime emits during a run — the CLI renders this.
 #[derive(Clone, Debug)]
 pub enum AgentEvent {
@@ -156,145 +170,53 @@ fn dispatch(tools: &[Tool], tc: &ToolCall) -> Result<String, String> {
 /// it is produced. `Err` aborts the loop (used to propagate renderer errors).
 pub type EventSink<'a> = &'a mut dyn FnMut(AgentEvent) -> Result<(), String>;
 
-/// Emit the `ToolStart`/`ToolResult` pair for one finished call. Called in
-/// **completion order** so the frontends see results as they land; the
-/// history entry is pushed separately, in model order.
-fn emit_tool_events(
-    tc: &ToolCall,
-    res: &Result<String, String>,
-    on_event: EventSink<'_>,
-) -> Result<(), String> {
-    let (ok, result) = match res {
-        Ok(body) => (true, body.clone()),
-        Err(err) => (false, err.clone()),
-    };
-    on_event(AgentEvent::ToolStart {
-        tool_call_id: tc.id.clone(),
-        name: tc.name.clone(),
-        arguments: tc.arguments.clone(),
-    })?;
-    on_event(AgentEvent::ToolResult {
-        tool_call_id: tc.id.clone(),
-        name: tc.name.clone(),
-        ok,
-        result,
-    })?;
-    Ok(())
-}
+/// The optional hook seam (ADR-0015): three callbacks at the loop's
+/// boundaries, all of them unset by default. A hook receives the
+/// Signature of a [`RunHooks::before_tool`] hook: once per call in model
+/// order, with the batch's assistant message to rewrite or skip.
+pub type BeforeToolHook<'a> =
+    Box<dyn FnMut(&mut AgentMessage, usize) -> Result<ToolDecision, String> + 'a>;
 
-/// Append one tool result to history, emitting the per-message event
-/// announcing the history entry (ADR-0009 D2: the session layer persists each
-/// result as it is pushed). `tc` is the tool call this result belongs to.
-fn push_tool_result(
-    tc: &ToolCall,
-    res: Result<String, String>,
-    on_event: EventSink<'_>,
-    messages: &mut Vec<AgentMessage>,
-) -> Result<(), String> {
-    let content = match res {
-        Ok(body) => body,
-        Err(err) => format!("Error: {err}"),
-    };
-    let msg = AgentMessage::tool_result(&tc.id, content);
-    messages.push(msg.clone());
-    on_event(AgentEvent::Message(msg))?;
-    Ok(())
-}
+/// Signature of a [`RunHooks::after_tool`] hook: per finished call (skips
+/// included), with the result message and the `ok` outcome flag.
+pub type AfterToolHook<'a> = Box<dyn FnMut(&mut AgentMessage, bool) -> Result<(), String> + 'a>;
 
-/// Execute tool calls and append their results to `messages`, emitting events
-/// through the sink. Serial mode dispatches and appends one call at a time (so
-/// later tools can observe earlier results in history); parallel mode runs
-/// every call on its own scoped thread, streams tool events in **completion
-/// order**, then appends every result to history in **model order** (the
-/// `tool_calls` order) so the Session log stays deterministic.
-///
-/// Checks the cancel token before each dispatch (and after each result, so a
-/// tool that aborted itself mid-run — e.g. a cancelled bash child — does not
-/// push its aborted result). Returns `Ok(true)` when a cancel stopped the
-/// batch before it finished (results already pushed stay; the caller stops
-/// with [`StopReason::Cancelled`]).
-fn execute_tools(
-    tools: &[Tool],
-    calls: &[ToolCall],
-    parallel: bool,
-    cancel: &CancelToken,
-    on_event: EventSink<'_>,
-    messages: &mut Vec<AgentMessage>,
-) -> Result<bool, String> {
-    if parallel {
-        // True concurrency: each call gets its own scoped thread; completion
-        // order flows back over a channel while the other calls keep running.
-        if cancel.is_cancelled() {
-            return Ok(true);
-        }
-        let mut results: Vec<Option<Result<String, String>>> = calls.iter().map(|_| None).collect();
-        // Completion order of the calls, recorded while draining the channel.
-        let mut completion_order: Vec<usize> = Vec::new();
-        std::thread::scope(|scope| {
-            let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<String, String>)>();
-            for (index, tc) in calls.iter().enumerate() {
-                let tx = tx.clone();
-                let cancel = cancel.clone();
-                scope.spawn(move || {
-                    // A call whose batch was cancelled before it started never
-                    // dispatches (and so never reports).
-                    if cancel.is_cancelled() {
-                        return;
-                    }
-                    let res = dispatch(tools, tc);
-                    let _ = tx.send((index, res));
-                });
-            }
-            drop(tx);
-            for (index, res) in rx {
-                results[index] = Some(res);
-                completion_order.push(index);
-            }
-        });
-        // A cancel anywhere in the batch discards the whole batch, so nothing
-        // is emitted for it: the tool events and the history stay consistent
-        // (the UI never shows a block the Session log did not receive).
-        if cancel.is_cancelled() {
-            return Ok(true);
-        }
-        // Tool events in completion order (a batch's blocks appear in the order
-        // its calls finished)...
-        for &index in &completion_order {
-            if let Some(res) = results[index].as_ref() {
-                emit_tool_events(&calls[index], res, &mut *on_event)?;
-            }
-        }
-        // ...and history entries in model order (index), keeping the Session
-        // log deterministic regardless of which call finished first. A call
-        // with no result (only possible if a tool resets the cancel token
-        // mid-run) is skipped rather than panicking.
-        for (index, tc) in calls.iter().enumerate() {
-            if let Some(res) = results[index].take() {
-                push_tool_result(tc, res, &mut *on_event, messages)?;
-            }
-        }
-    } else {
-        // Serial: dispatch, emit and append one call at a time.
-        for tc in calls {
-            if cancel.is_cancelled() {
-                return Ok(true);
-            }
-            let res = dispatch(tools, tc);
-            if cancel.is_cancelled() {
-                return Ok(true);
-            }
-            emit_tool_events(tc, &res, &mut *on_event)?;
-            push_tool_result(tc, res, &mut *on_event, messages)?;
-        }
-    }
-    Ok(false)
+/// Signature of a [`RunHooks::turn_end`] hook: once at run end (Completed /
+/// Cancelled), with the final history, turn count and stop reason.
+pub type TurnEndHook<'a> =
+    Box<dyn FnMut(&mut Vec<AgentMessage>, usize, &StopReason) -> Result<(), String> + 'a>;
+
+/// The optional hook seam (ADR-0015): three callbacks at the loop's
+/// boundaries, all of them unset by default. A hook receives the
+/// [`AgentMessage`] that is about to enter history and may rewrite it — the
+/// rewrite happens before the events and before the log append, so the model,
+/// the session log and the display all see one text. `Err` from any hook
+/// aborts the run like a provider or sink error.
+#[derive(Default)]
+pub struct RunHooks<'a> {
+    /// Before a Tool batch is dispatched, once per call in model order (all
+    /// of them before anything in the batch runs, even in parallel mode). The
+    /// message is the batch's assistant message: the hook may rewrite a call's
+    /// arguments or return a [`ToolDecision::Skip`]. It may not restructure
+    /// the batch — a vanished call index is an error, not a panic.
+    pub before_tool: Option<BeforeToolHook<'a>>,
+    /// As each tool result is about to enter history, in completion order (a
+    /// skipped call's supplied result is visited too). `ok` reports the tool
+    /// outcome regardless of any rewrite.
+    pub after_tool: Option<AfterToolHook<'a>>,
+    /// Once when the run stops — on `Completed` and `Cancelled` alike, before
+    /// the stop event — with the turn count, the stop reason and the run's
+    /// final history (what it leaves there is what the caller stores). It
+    /// does not run on an errored run.
+    pub turn_end: Option<TurnEndHook<'a>>,
 }
 
 /// The agent loop as a value (ADR-0011 D1): one run's tools, config, cancel
 /// token and event subscription, with [`AgentRunner::run`] driving the loop
 /// over a message history. The event subscription is the sink every
 /// [`AgentEvent`] flows into; `slimcode-app`'s shared turn runner builds one
-/// runner per turn. ADR-0015 adds the optional hook seam on top of this.
+/// runner per turn. The optional hook seam is [`AgentRunner::hooks`]
+/// (ADR-0015).
 pub struct AgentRunner<'a> {
     /// The tools this run may invoke.
     pub tools: &'a [Tool],
@@ -304,6 +226,8 @@ pub struct AgentRunner<'a> {
     pub cancel: &'a CancelToken,
     /// The live event subscription.
     pub on_event: EventSink<'a>,
+    /// The optional hook seam (defaults to all unset).
+    pub hooks: RunHooks<'a>,
 }
 
 impl<'a> AgentRunner<'a> {
@@ -318,6 +242,7 @@ impl<'a> AgentRunner<'a> {
             cfg,
             cancel,
             on_event,
+            hooks: RunHooks::default(),
         }
     }
 
@@ -396,14 +321,7 @@ impl<'a> AgentRunner<'a> {
             match reason {
                 FinishReason::Stop => break 'run StopReason::Completed,
                 FinishReason::ToolCalls => {
-                    let cancelled = execute_tools(
-                        self.tools,
-                        &tool_calls,
-                        self.cfg.parallel_tools,
-                        self.cancel,
-                        &mut *self.on_event,
-                        &mut messages,
-                    )?;
+                    let cancelled = self.execute_tools(&mut messages)?;
                     if cancelled {
                         break 'run StopReason::Cancelled;
                     }
@@ -413,8 +331,201 @@ impl<'a> AgentRunner<'a> {
             }
         };
 
+        // The run-end hook (ADR-0015): the history it leaves here is exactly
+        // what the caller stores. Runs on Completed and Cancelled, before the
+        // stop event; never on the errored path.
+        if let Some(hook) = self.hooks.turn_end.as_mut() {
+            hook(&mut messages, iterations, &stop)?;
+        }
         on_event_call(&mut self.on_event, AgentEvent::Stop(stop.clone()))?;
         Ok((messages, stop))
+    }
+
+    /// Build the tool-result message for a finished call, run the
+    /// `after_tool` hook on it, and emit its `ToolStart`/`ToolResult` events
+    /// (ADR-0015 D3: the hook and the events both happen before the log
+    /// append). Returns the message to be pushed to history.
+    fn build_result(
+        &mut self,
+        tc: &ToolCall,
+        res: Result<String, String>,
+    ) -> Result<AgentMessage, String> {
+        let ok = res.is_ok();
+        let content = match &res {
+            Ok(body) => body.clone(),
+            Err(err) => format!("Error: {err}"),
+        };
+        let mut msg = AgentMessage::tool_result(&tc.id, content);
+        if let Some(hook) = self.hooks.after_tool.as_mut() {
+            hook(&mut msg, ok)?;
+        }
+        // ToolStart carries the (possibly rewritten) arguments the tool ran
+        // with; ToolResult carries the outcome and the final text the UI will
+        // render.
+        on_event_call(
+            &mut self.on_event,
+            AgentEvent::ToolStart {
+                tool_call_id: tc.id.clone(),
+                name: tc.name.clone(),
+                arguments: tc.arguments.clone(),
+            },
+        )?;
+        let text = msg.text_content();
+        on_event_call(
+            &mut self.on_event,
+            AgentEvent::ToolResult {
+                tool_call_id: tc.id.clone(),
+                name: tc.name.clone(),
+                ok,
+                result: text,
+            },
+        )?;
+        Ok(msg)
+    }
+
+    /// Execute the Tool batch carried by the assistant message at
+    /// `messages[asst_index]` and append its results to history, emitting
+    /// events through the subscription. Serial mode dispatches and appends one
+    /// call at a time (so later tools can observe earlier results in history);
+    /// parallel mode runs every call on its own scoped thread, streams tool
+    /// events in **completion order**, then appends every result to history in
+    /// **model order** (the `tool_calls` order) so the Session log stays
+    /// deterministic.
+    ///
+    /// The `before_tool` hook runs for the whole batch first (model order,
+    /// loop thread, before anything dispatches), so it can rewrite a call's
+    /// arguments or skip it; a skipped call yields its supplied result without
+    /// executing, and still produces a result message, events and an
+    /// `after_tool` visit (ADR-0015 D4).
+    ///
+    /// Checks the cancel token before each dispatch (and after each result, so
+    /// a tool that aborted itself mid-run — e.g. a cancelled bash child — does
+    /// not push its aborted result). Returns `Ok(true)` when a cancel stopped
+    /// the batch before it finished (results already pushed stay; the caller
+    /// stops with [`StopReason::Cancelled`]).
+    fn execute_tools(&mut self, messages: &mut Vec<AgentMessage>) -> Result<bool, String> {
+        // The assistant message holding this batch is the last element at
+        // entry; serial finishes push tool results after it, so its index is
+        // captured once and reused for every `before_tool` re-read.
+        let asst_index = messages
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| "execute_tools: no assistant message".to_string())?;
+        let calls: Vec<ToolCall> = messages[asst_index].tool_calls().to_vec();
+        let mut effective: Vec<ToolCall> = calls.clone();
+        let mut decisions: Vec<ToolDecision> = Vec::with_capacity(calls.len());
+
+        // Phase 1 — `before_tool` for the whole batch (model order, loop
+        // thread) before any dispatch. The effective calls are re-read from
+        // the assistant message after each hook call, so a rewrite of a call's
+        // arguments is what gets dispatched.
+        if let Some(hook) = self.hooks.before_tool.as_mut() {
+            for (index, eff) in effective.iter_mut().enumerate() {
+                let asst = messages
+                    .get_mut(asst_index)
+                    .ok_or_else(|| "before_tool: assistant message vanished".to_string())?;
+                let decision = hook(asst, index)?;
+                *eff = asst
+                    .tool_calls()
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| format!("before_tool removed tool call {index}"))?;
+                decisions.push(decision);
+            }
+        } else {
+            decisions = calls.iter().map(|_| ToolDecision::Run).collect();
+        }
+
+        if self.cfg.parallel_tools {
+            // True concurrency: each call gets its own scoped thread; skipped
+            // calls' results are known at phase-1 time, so they complete first
+            // (model order among themselves), then the dispatched results flow
+            // back over a channel in completion order.
+            if self.cancel.is_cancelled() {
+                return Ok(true);
+            }
+            let mut results: Vec<Option<Result<String, String>>> =
+                calls.iter().map(|_| None).collect();
+            let mut completion_order: Vec<usize> = Vec::new();
+            for (index, decision) in decisions.iter().enumerate() {
+                if let ToolDecision::Skip(res) = decision {
+                    results[index] = Some(res.clone());
+                    completion_order.push(index);
+                }
+            }
+            let shared_cancel = self.cancel.clone();
+            let tools = self.tools;
+            std::thread::scope(|scope| {
+                let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<String, String>)>();
+                for (index, tc) in effective.iter().enumerate() {
+                    if matches!(decisions[index], ToolDecision::Skip(_)) {
+                        continue;
+                    }
+                    let tx = tx.clone();
+                    let cancel = shared_cancel.clone();
+                    scope.spawn(move || {
+                        // A call whose batch was cancelled before it started
+                        // never dispatches (and so never reports).
+                        if cancel.is_cancelled() {
+                            return;
+                        }
+                        let res = dispatch(tools, tc);
+                        let _ = tx.send((index, res));
+                    });
+                }
+                drop(tx);
+                for (index, res) in rx {
+                    results[index] = Some(res);
+                    completion_order.push(index);
+                }
+            });
+            // A cancel anywhere in the batch discards the whole batch, so
+            // nothing is emitted for it: the tool events and the history stay
+            // consistent (the UI never shows a block the Session log did not
+            // receive).
+            if self.cancel.is_cancelled() {
+                return Ok(true);
+            }
+            // Tool events (and the after_tool hook) in completion order...
+            let mut final_msgs: Vec<Option<AgentMessage>> = calls.iter().map(|_| None).collect();
+            for &index in &completion_order {
+                let res = results[index]
+                    .take()
+                    .expect("completion order carries a result");
+                final_msgs[index] = Some(self.build_result(&effective[index], res)?);
+            }
+            // ...and history entries in model order (index), keeping the
+            // Session log deterministic regardless of which call finished
+            // first. A call with no result (only possible if a tool resets the
+            // cancel token mid-run) is skipped rather than panicking.
+            for slot in final_msgs.iter_mut() {
+                if let Some(msg) = slot.take() {
+                    messages.push(msg.clone());
+                    on_event_call(&mut self.on_event, AgentEvent::Message(msg))?;
+                }
+            }
+        } else {
+            // Serial: dispatch, hook, emit and append one call at a time.
+            for index in 0..calls.len() {
+                if self.cancel.is_cancelled() {
+                    return Ok(true);
+                }
+                let res = match &decisions[index] {
+                    ToolDecision::Run => {
+                        let res = dispatch(self.tools, &effective[index]);
+                        if self.cancel.is_cancelled() {
+                            return Ok(true);
+                        }
+                        res
+                    }
+                    ToolDecision::Skip(res) => res.clone(),
+                };
+                let msg = self.build_result(&effective[index], res)?;
+                messages.push(msg.clone());
+                on_event_call(&mut self.on_event, AgentEvent::Message(msg))?;
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -424,9 +535,13 @@ fn on_event_call(sink: &mut EventSink<'_>, event: AgentEvent) -> Result<(), Stri
 }
 
 #[cfg(test)]
+// Test hooks are built iteratively (`let mut hooks = default; hooks.x = …`)
+// because a struct literal with three optional closures is unreadable.
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     // --- helpers -----------------------------------------------------------
@@ -455,6 +570,9 @@ mod tests {
     }
     fn done_tools() -> Delta {
         Delta::Done(FinishReason::ToolCalls)
+    }
+    fn default_system() -> Message {
+        Message::text(Role::System, "be helpful")
     }
 
     /// Scripted provider: pops the next delta sequence per call.
@@ -530,9 +648,58 @@ mod tests {
         )
     }
 
-    /// The loop test harness: one run over a scripted provider with a
-    /// collecting event sink. Returns the run's observables so tests assert
-    /// external behaviour only.
+    /// The loop test harness with caller-supplied hooks; events are collected
+    /// into a caller-owned Vec (passed in so the sink's borrow ends when this
+    /// helper returns). The caller's `hooks` is moved into the runner (left
+    /// default after), so recorders inside the hooks stay inspectable via
+    /// shared handles.
+    #[allow(clippy::too_many_arguments)] // a test harness bundling run context
+    fn run_with_hooks_collect<P: Provider>(
+        provider: &mut P,
+        tools: &[Tool],
+        cfg: RunConfig,
+        cancel: &CancelToken,
+        system: &Message,
+        messages: Vec<AgentMessage>,
+        hooks: &mut RunHooks<'static>,
+        events: &mut Vec<AgentEvent>,
+    ) -> Result<(Vec<AgentMessage>, StopReason), String> {
+        let mut sink = |e: AgentEvent| {
+            events.push(e);
+            Ok(())
+        };
+        let mut runner = AgentRunner::new(tools, cfg, cancel, &mut sink);
+        runner.hooks = std::mem::take(hooks);
+        runner.run(provider, system, messages)
+    }
+
+    /// The loop test harness with caller-supplied hooks and a collecting event
+    /// sink. Returns the run's observables so tests assert external behaviour
+    /// only.
+    fn run_with_hooks<P: Provider>(
+        provider: &mut P,
+        tools: &[Tool],
+        cfg: RunConfig,
+        cancel: &CancelToken,
+        system: &Message,
+        messages: Vec<AgentMessage>,
+        hooks: &mut RunHooks<'static>,
+    ) -> Result<(Vec<AgentMessage>, StopReason, Vec<AgentEvent>), String> {
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let (messages, stop) = run_with_hooks_collect(
+            provider,
+            tools,
+            cfg,
+            cancel,
+            system,
+            messages,
+            hooks,
+            &mut events,
+        )?;
+        Ok((messages, stop, events))
+    }
+
+    /// The same harness with no hooks set.
     fn run_with(
         provider: &mut impl Provider,
         tools: &[Tool],
@@ -541,14 +708,8 @@ mod tests {
         system: &Message,
         messages: Vec<AgentMessage>,
     ) -> Result<(Vec<AgentMessage>, StopReason, Vec<AgentEvent>), String> {
-        let mut events: Vec<AgentEvent> = Vec::new();
-        let mut sink = |e: AgentEvent| {
-            events.push(e);
-            Ok(())
-        };
-        let mut runner = AgentRunner::new(tools, cfg, cancel, &mut sink);
-        let (messages, stop) = runner.run(provider, system, messages)?;
-        Ok((messages, stop, events))
+        let mut hooks = RunHooks::default();
+        run_with_hooks(provider, tools, cfg, cancel, system, messages, &mut hooks)
     }
 
     /// The standard one-shot script: system "be helpful", user
@@ -1343,5 +1504,506 @@ mod tests {
         assert_eq!(stop, StopReason::Completed);
         let tool_msg = messages.iter().find(|m| m.role() == &Role::Tool).unwrap();
         assert!(tool_msg.text_content().contains("unknown tool: nope"));
+    }
+
+    // --- Run hooks (ADR-0015) ----------------------------------------------
+
+    #[test]
+    fn before_tool_runs_for_the_whole_batch_before_any_dispatch() {
+        // The whole batch is hooked (model order) before anything dispatches,
+        // even in parallel mode: each hook call must observe dispatch has not
+        // happened yet.
+        let dispatched = Arc::new(AtomicBool::new(false));
+        let order = Arc::new(Mutex::new(Vec::<usize>::new()));
+        let d = dispatched.clone();
+        let flag = Tool::new(
+            "flag_tool",
+            "sets the flag",
+            serde_json::json!({}),
+            move |_| {
+                d.store(true, Ordering::SeqCst);
+                Ok("ran".to_string())
+            },
+        );
+        let script = vec![vec![
+            tc_start(0, "call_0", "flag_tool"),
+            tc_args(0, "{}"),
+            tc_start(1, "call_1", "flag_tool"),
+            tc_args(1, "{}"),
+            done_tools(),
+        ]];
+        let dp = dispatched.clone();
+        let od = order.clone();
+        let mut hooks = RunHooks::default();
+        hooks.before_tool = Some(Box::new(move |_asst: &mut AgentMessage, index: usize| {
+            assert!(
+                !dp.load(Ordering::SeqCst),
+                "dispatch happened before before_tool({index})"
+            );
+            od.lock().unwrap().push(index);
+            Ok(ToolDecision::Run)
+        }));
+        let tools = [flag];
+        let (messages, stop, _) = run_with_hooks(
+            &mut FakeProvider::new(script),
+            &tools,
+            RunConfig::default(),
+            &CancelToken::new(),
+            &default_system(),
+            vec![AgentMessage::text(Role::User, "user")],
+            &mut hooks,
+        )
+        .unwrap();
+        assert_eq!(stop, StopReason::Completed);
+        assert!(dispatched.load(Ordering::SeqCst), "the tool ran");
+        assert_eq!(*order.lock().unwrap(), vec![0, 1]);
+        assert_eq!(
+            messages.iter().filter(|m| m.role() == &Role::Tool).count(),
+            2,
+            "both calls' results are in history"
+        );
+    }
+
+    #[test]
+    fn before_tool_rewrites_arguments_the_tool_then_sees() {
+        // The hook rewrites call 0's arguments; the tool must run with the
+        // rewritten arguments, and the history / events carry the same text.
+        let seen = Arc::new(Mutex::new(String::new()));
+        let s = seen.clone();
+        let echo = Tool::new(
+            "echo",
+            "echoes the city",
+            serde_json::json!({}),
+            move |args: Value| {
+                let city = args
+                    .get("city")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+                    .to_string();
+                *s.lock().unwrap() = city.clone();
+                Ok(city)
+            },
+        );
+        let script = vec![vec![
+            tc_start(0, "call_0", "echo"),
+            tc_args(0, "{\"city\": \"Shanghai\"}"),
+            done_tools(),
+        ]];
+        let mut hooks = RunHooks::default();
+        hooks.before_tool = Some(Box::new(|asst: &mut AgentMessage, _index: usize| {
+            asst.llm_mut().tool_calls[0].arguments = "{\"city\": \"Beijing\"}".to_string();
+            Ok(ToolDecision::Run)
+        }));
+        let tools = [echo];
+        let (messages, _stop, events) = run_with_hooks(
+            &mut FakeProvider::new(script),
+            &tools,
+            RunConfig::default(),
+            &CancelToken::new(),
+            &default_system(),
+            vec![AgentMessage::text(Role::User, "user")],
+            &mut hooks,
+        )
+        .unwrap();
+        assert_eq!(*seen.lock().unwrap(), "Beijing");
+        let tool_msg = messages.iter().find(|m| m.role() == &Role::Tool).unwrap();
+        assert!(tool_msg.text_content().contains("Beijing"));
+        assert!(
+            events.iter().any(
+                |e| matches!(e, AgentEvent::ToolStart { arguments, .. } if arguments.contains("Beijing"))
+            ),
+            "ToolStart carries the rewritten arguments"
+        );
+    }
+
+    #[test]
+    fn skip_supplies_the_result_without_running_the_tool() {
+        // A Skip(Ok) call never dispatches; its supplied result enters history
+        // and still renders as a normal paired block (ToolStart/ToolResult)
+        // and still visits after_tool.
+        let ran = Arc::new(AtomicBool::new(false));
+        let r = ran.clone();
+        let tool = Tool::new(
+            "never_run",
+            "must not run",
+            serde_json::json!({}),
+            move |_| {
+                r.store(true, Ordering::SeqCst);
+                Ok("ran".to_string())
+            },
+        );
+        let script = vec![vec![
+            tc_start(0, "call_0", "never_run"),
+            tc_args(0, "{}"),
+            done_tools(),
+        ]];
+        let visited = Arc::new(Mutex::new(Vec::<(String, bool)>::new()));
+        let v = visited.clone();
+        let mut hooks = RunHooks::default();
+        hooks.before_tool = Some(Box::new(|_asst: &mut AgentMessage, _index: usize| {
+            Ok(ToolDecision::Skip(Ok("denied".to_string())))
+        }));
+        hooks.after_tool = Some(Box::new(move |msg: &mut AgentMessage, ok: bool| {
+            v.lock()
+                .unwrap()
+                .push((msg.tool_call_id().unwrap().to_string(), ok));
+            Ok(())
+        }));
+        let tools = [tool];
+        let (messages, stop, events) = run_with_hooks(
+            &mut FakeProvider::new(script),
+            &tools,
+            RunConfig::default(),
+            &CancelToken::new(),
+            &default_system(),
+            vec![AgentMessage::text(Role::User, "user")],
+            &mut hooks,
+        )
+        .unwrap();
+        assert_eq!(stop, StopReason::Completed);
+        assert!(!ran.load(Ordering::SeqCst), "the tool must not run");
+        assert_eq!(*visited.lock().unwrap(), vec![("call_0".to_string(), true)]);
+        let tool_msgs: Vec<_> = messages
+            .iter()
+            .filter(|m| m.role() == &Role::Tool)
+            .collect();
+        assert_eq!(tool_msgs.len(), 1);
+        assert!(tool_msgs[0].text_content().contains("denied"));
+        assert!(events.iter().any(
+            |e| matches!(e, AgentEvent::ToolStart { tool_call_id, .. } if tool_call_id == "call_0")
+        ));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolResult { tool_call_id, ok: true, .. } if tool_call_id == "call_0"
+        )));
+    }
+
+    #[test]
+    fn skip_err_produces_the_error_result_shape() {
+        // A Skip(Err) is told to the model as the `Error: …` shape tool
+        // failures already use, and after_tool sees `ok == false`.
+        let ran = Arc::new(AtomicBool::new(false));
+        let r = ran.clone();
+        let tool = Tool::new(
+            "never_run",
+            "must not run",
+            serde_json::json!({}),
+            move |_| {
+                r.store(true, Ordering::SeqCst);
+                Ok("ran".to_string())
+            },
+        );
+        let script = vec![vec![
+            tc_start(0, "call_0", "never_run"),
+            tc_args(0, "{}"),
+            done_tools(),
+        ]];
+        let ok_seen = Arc::new(Mutex::new(None::<bool>));
+        let o = ok_seen.clone();
+        let mut hooks = RunHooks::default();
+        hooks.before_tool = Some(Box::new(|_asst: &mut AgentMessage, _index: usize| {
+            Ok(ToolDecision::Skip(Err("not allowed".to_string())))
+        }));
+        hooks.after_tool = Some(Box::new(move |_msg: &mut AgentMessage, ok: bool| {
+            *o.lock().unwrap() = Some(ok);
+            Ok(())
+        }));
+        let tools = [tool];
+        let (messages, stop, _) = run_with_hooks(
+            &mut FakeProvider::new(script),
+            &tools,
+            RunConfig::default(),
+            &CancelToken::new(),
+            &default_system(),
+            vec![AgentMessage::text(Role::User, "user")],
+            &mut hooks,
+        )
+        .unwrap();
+        assert_eq!(stop, StopReason::Completed);
+        assert!(!ran.load(Ordering::SeqCst));
+        let tool_msg = messages.iter().find(|m| m.role() == &Role::Tool).unwrap();
+        assert!(
+            tool_msg.text_content().starts_with("Error: not allowed"),
+            "got: {}",
+            tool_msg.text_content()
+        );
+        assert_eq!(*ok_seen.lock().unwrap(), Some(false));
+    }
+
+    #[test]
+    fn after_tool_rewrite_is_what_history_and_events_carry() {
+        // The hook rewrites the result message; both the returned history and
+        // the ToolResult event carry the rewrite (the display and the log see
+        // one text).
+        let script = vec![vec![
+            tc_start(0, "call_0", "get_weather"),
+            tc_args(0, "{}"),
+            done_tools(),
+        ]];
+        let mut hooks = RunHooks::default();
+        hooks.after_tool = Some(Box::new(|msg: &mut AgentMessage, _ok: bool| {
+            let id = msg.tool_call_id().map(str::to_string);
+            let mut wire = Message::text(Role::Tool, "redacted");
+            wire.tool_call_id = id;
+            *msg = AgentMessage::llm(wire);
+            Ok(())
+        }));
+        let tools = [weather_tool()];
+        let (messages, _stop, events) = run_with_hooks(
+            &mut FakeProvider::new(script),
+            &tools,
+            RunConfig::default(),
+            &CancelToken::new(),
+            &default_system(),
+            vec![AgentMessage::text(Role::User, "user")],
+            &mut hooks,
+        )
+        .unwrap();
+        let tool_msg = messages.iter().find(|m| m.role() == &Role::Tool).unwrap();
+        assert_eq!(tool_msg.text_content(), "redacted");
+        assert!(
+            events.iter().any(
+                |e| matches!(e, AgentEvent::ToolResult { result, .. } if result == "redacted")
+            )
+        );
+    }
+
+    #[test]
+    fn before_tool_removing_a_call_errors() {
+        // A hook may rewrite a call's arguments but not restructure the batch:
+        // a vanished index is an error, not a panic.
+        let mut hooks = RunHooks::default();
+        hooks.before_tool = Some(Box::new(|asst: &mut AgentMessage, _index: usize| {
+            asst.llm_mut().tool_calls.clear();
+            Ok(ToolDecision::Run)
+        }));
+        let script = vec![vec![
+            tc_start(0, "call_0", "get_weather"),
+            tc_args(0, "{}"),
+            done_tools(),
+        ]];
+        let tools = [weather_tool()];
+        let err = run_with_hooks(
+            &mut FakeProvider::new(script),
+            &tools,
+            RunConfig::default(),
+            &CancelToken::new(),
+            &default_system(),
+            vec![AgentMessage::text(Role::User, "user")],
+            &mut hooks,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("before_tool removed tool call 0"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn hook_error_aborts_the_run() {
+        // A hook's `Err` propagates verbatim and no Stop event is emitted.
+        let mut hooks = RunHooks::default();
+        hooks.before_tool = Some(Box::new(|_asst: &mut AgentMessage, _index: usize| {
+            Err("gate".to_string())
+        }));
+        let script = vec![vec![
+            tc_start(0, "call_0", "get_weather"),
+            tc_args(0, "{}"),
+            done_tools(),
+        ]];
+        let tools = [weather_tool()];
+        let err = run_with_hooks(
+            &mut FakeProvider::new(script),
+            &tools,
+            RunConfig::default(),
+            &CancelToken::new(),
+            &default_system(),
+            vec![AgentMessage::text(Role::User, "user")],
+            &mut hooks,
+        )
+        .unwrap_err();
+        assert_eq!(err, "gate");
+    }
+
+    #[test]
+    fn after_tool_receives_the_ok_flag() {
+        // after_tool sees `ok == false` for a tool that failed, regardless of
+        // any rewrite.
+        let script = vec![vec![
+            tc_start(0, "call_1", "fragile_tool"),
+            tc_args(0, "{\"city\": \"Tokyo\"}"),
+            done_tools(),
+        ]];
+        let ok_seen = Arc::new(Mutex::new(None::<bool>));
+        let o = ok_seen.clone();
+        let mut hooks = RunHooks::default();
+        hooks.after_tool = Some(Box::new(move |_msg: &mut AgentMessage, ok: bool| {
+            *o.lock().unwrap() = Some(ok);
+            Ok(())
+        }));
+        let tools = [fragile_tool()];
+        let (_, stop, _) = run_with_hooks(
+            &mut FakeProvider::new(script),
+            &tools,
+            RunConfig::default(),
+            &CancelToken::new(),
+            &default_system(),
+            vec![AgentMessage::text(Role::User, "user")],
+            &mut hooks,
+        )
+        .unwrap();
+        assert_eq!(stop, StopReason::Completed);
+        assert_eq!(*ok_seen.lock().unwrap(), Some(false));
+    }
+
+    #[test]
+    fn turn_end_runs_on_completed_with_the_final_history() {
+        let script = vec![vec![t("done"), done_stop()]];
+        let seen = Arc::new(Mutex::new(None::<(usize, StopReason)>));
+        let s = seen.clone();
+        let mut hooks = RunHooks::default();
+        hooks.turn_end = Some(Box::new(
+            move |msgs: &mut Vec<AgentMessage>, turns: usize, stop: &StopReason| {
+                *s.lock().unwrap() = Some((turns, stop.clone()));
+                msgs.push(AgentMessage::text(Role::User, "sealed"));
+                Ok(())
+            },
+        ));
+        let tools: [Tool; 0] = [];
+        let (messages, stop, _) = run_with_hooks(
+            &mut FakeProvider::new(script),
+            &tools,
+            RunConfig::default(),
+            &CancelToken::new(),
+            &default_system(),
+            vec![AgentMessage::text(Role::User, "user")],
+            &mut hooks,
+        )
+        .unwrap();
+        assert_eq!(stop, StopReason::Completed);
+        assert_eq!(*seen.lock().unwrap(), Some((1, StopReason::Completed)));
+        assert_eq!(messages.last().unwrap().text_content(), "sealed");
+    }
+
+    #[test]
+    fn turn_end_runs_on_cancelled() {
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let seen = Arc::new(Mutex::new(None::<(usize, StopReason)>));
+        let s = seen.clone();
+        let mut hooks = RunHooks::default();
+        hooks.turn_end = Some(Box::new(
+            move |_msgs: &mut Vec<AgentMessage>, turns: usize, stop: &StopReason| {
+                *s.lock().unwrap() = Some((turns, stop.clone()));
+                Ok(())
+            },
+        ));
+        let tools: [Tool; 0] = [];
+        let (_, stop, _) = run_with_hooks(
+            &mut FakeProvider::new(vec![vec![t("never"), done_stop()]]),
+            &tools,
+            RunConfig::default(),
+            &cancel,
+            &default_system(),
+            vec![AgentMessage::text(Role::User, "user")],
+            &mut hooks,
+        )
+        .unwrap();
+        assert_eq!(stop, StopReason::Cancelled);
+        assert_eq!(*seen.lock().unwrap(), Some((0, StopReason::Cancelled)));
+    }
+
+    #[test]
+    fn turn_end_does_not_run_when_the_run_errors() {
+        struct ErrProvider;
+        impl Provider for ErrProvider {
+            fn chat(
+                &mut self,
+                _m: &[Message],
+                _t: &[ToolSpec],
+                _c: &CancelToken,
+            ) -> Result<Vec<Delta>, String> {
+                Err("boom".to_string())
+            }
+        }
+        let called = Arc::new(AtomicBool::new(false));
+        let c = called.clone();
+        let mut hooks = RunHooks::default();
+        hooks.turn_end = Some(Box::new(
+            move |_msgs: &mut Vec<AgentMessage>, _turns: usize, _stop: &StopReason| {
+                c.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        ));
+        let tools: [Tool; 0] = [];
+        let err = run_with_hooks(
+            &mut ErrProvider,
+            &tools,
+            RunConfig::default(),
+            &CancelToken::new(),
+            &default_system(),
+            vec![AgentMessage::text(Role::User, "user")],
+            &mut hooks,
+        )
+        .unwrap_err();
+        assert!(err.contains("boom"));
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "turn_end must not run on an errored run"
+        );
+    }
+
+    #[test]
+    fn skipped_calls_report_before_dispatched_ones_in_parallel_mode() {
+        // In parallel mode a skipped call's result is known at phase-1 time,
+        // so it completes before dispatched calls: its ToolResult event comes
+        // first even though the dispatched call finishes later.
+        let slow = Tool::new("slow_tool", "sleeps briefly", serde_json::json!({}), |_| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            Ok("slow".to_string())
+        });
+        let script = vec![vec![
+            tc_start(0, "call_0", "slow_tool"),
+            tc_args(0, "{}"),
+            tc_start(1, "call_1", "slow_tool"),
+            tc_args(1, "{}"),
+            done_tools(),
+        ]];
+        let mut hooks = RunHooks::default();
+        hooks.before_tool = Some(Box::new(|_asst: &mut AgentMessage, index: usize| {
+            if index == 0 {
+                Ok(ToolDecision::Skip(Ok("denied".to_string())))
+            } else {
+                Ok(ToolDecision::Run)
+            }
+        }));
+        let tools = [slow];
+        let (messages, _stop, events) = run_with_hooks(
+            &mut FakeProvider::new(script),
+            &tools,
+            RunConfig {
+                parallel_tools: true,
+            },
+            &CancelToken::new(),
+            &default_system(),
+            vec![AgentMessage::text(Role::User, "user")],
+            &mut hooks,
+        )
+        .unwrap();
+        let results: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolResult { tool_call_id, .. } => Some(tool_call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results, vec!["call_0", "call_1"]);
+        // History keeps model order too (skip first, dispatched second).
+        let history: Vec<&str> = messages
+            .iter()
+            .filter(|m| m.role() == &Role::Tool)
+            .map(|m| m.tool_call_id().unwrap())
+            .collect();
+        assert_eq!(history, vec!["call_0", "call_1"]);
     }
 }
