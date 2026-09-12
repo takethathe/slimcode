@@ -6,7 +6,7 @@
 //! crossterm/ratatui terminal loop that wraps it ([`terminal`]). The pure core
 //! renders through ratatui's `TestBackend` in tests, with no real terminal
 //! required, and depends on the shared renderer/runner seam in
-//! `slimcode-common`.
+//! `slimcode-app`.
 
 pub mod app;
 pub mod footer;

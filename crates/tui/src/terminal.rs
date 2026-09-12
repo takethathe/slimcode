@@ -689,7 +689,9 @@ mod tests {
     use super::*;
     use slimcode_app::render::DisplayItem;
     use slimcode_app::runner::run_turn;
-    use slimcode_core::agent::{Delta, FinishReason, Provider, RunConfig, StopReason, Tool};
+    use slimcode_core::agent::{
+        Delta, FinishReason, Provider, RunConfig, StopReason, Tool, ToolSpec,
+    };
     use slimcode_core::session::{Message, Role};
 
     // A scripted provider, mirroring the agent crate's FakeProvider: each
@@ -703,7 +705,7 @@ mod tests {
         fn chat(
             &mut self,
             _m: &[Message],
-            _tools: &[Tool],
+            _tools: &[ToolSpec],
             _cancel: &slimcode_core::agent::CancelToken,
         ) -> Result<Vec<Delta>, String> {
             let d = self.script.get(self.calls).cloned().unwrap_or_default();

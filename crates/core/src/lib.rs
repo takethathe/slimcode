@@ -1,6 +1,9 @@
-//! slimcode-agent: agent runtime, tools, and session state.
+//! slimcode-core: agent runtime, tools, and session state.
 //!
-//! The tool loop, message model, and session persistence land here after ticket 04.
+//! Owns the agent runtime (ADR-0011 D1): the loop and its `AgentEvent`
+//! stream, hooks seam, executable `Tool { spec, run }`, and the session
+//! message model. It depends only on `slimcode-ai`, which owns the LLM seam
+//! (`Provider` / `Message` / `ToolSpec` / `Delta` / `CancelToken`).
 
 pub mod agent;
 pub mod session;

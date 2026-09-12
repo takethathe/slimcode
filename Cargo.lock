@@ -1372,8 +1372,6 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "slimcode-app",
- "slimcode-core",
 ]
 
 [[package]]
@@ -1398,6 +1396,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "slimcode-ai",
 ]
 
 [[package]]

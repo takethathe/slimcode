@@ -3,7 +3,7 @@
 //! existing file, write it back, and (on Unix) tighten permissions to 0600
 //! when an API key ends up in the file.
 //!
-//! The merge core is a pure function in `slimcode-common::config`
+//! The merge core is a pure function in `slimcode-app::config`
 //! ([`slimcode_app::config::merge_config_toml`]); this module is the thin
 //! I/O shell around it (stdin/stdout prompting + file write + chmod).
 

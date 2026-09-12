@@ -1,10 +1,16 @@
 //! Provider configuration for the Bailian (阿里云百炼) OpenAI-compatible endpoint.
 //!
 //! `BailianConfig` is pure provider data: api key, base URL and model. The
-//! four-layer precedence resolution (frontend overrides > env > `config.toml` >
-//! defaults) — along with the env var names and default values behind it —
-//! lives in `slimcode-common::config`, which is the single owner of those
-//! constants. This crate does not re-read them.
+//! endpoint defaults (`DEFAULT_BASE_URL` / `DEFAULT_MODEL`) are owned here,
+//! next to the provider that talks to that endpoint. The four-layer precedence
+//! resolution (frontend overrides > env > `config.toml` > defaults) — along
+//! with the env var names behind it — lives in `slimcode-app::config`, which
+//! re-exports these defaults. This crate does not read env or files.
+
+/// Default China-station legacy compatible-mode base URL (no WorkspaceId needed).
+pub const DEFAULT_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+/// Recommended default model.
+pub const DEFAULT_MODEL: &str = "qwen-plus";
 
 /// Resolved provider configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,6 +56,15 @@ impl BailianConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoint_defaults_are_the_bailian_station() {
+        assert_eq!(
+            DEFAULT_BASE_URL,
+            "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        );
+        assert_eq!(DEFAULT_MODEL, "qwen-plus");
+    }
 
     #[test]
     fn chat_completions_url_appends_path() {

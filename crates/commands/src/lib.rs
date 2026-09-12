@@ -9,7 +9,7 @@
 //! The crate is pure data + pure functions with no I/O, so any frontend (the
 //! one-shot CLI, the TUI, a web UI, ...) can reuse the same
 //! registry, `/help` text, and prediction logic. Installed *skills* are a
-//! separate, dynamic `/` trigger set (`slimcode-common::skills`); the frontend
+//! separate, dynamic `/` trigger set (`slimcode-app::skills`); the frontend
 //! combines both when predicting partial `/` input.
 
 pub mod fuzzy;

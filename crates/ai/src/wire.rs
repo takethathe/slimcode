@@ -11,9 +11,9 @@
 //!   continuation chunks carry `""` / `null` there.
 
 use serde::{Deserialize, Serialize};
-use slimcode_core::agent::Tool;
-use slimcode_core::agent::{Delta, FinishReason};
-use slimcode_core::session::{Message, Role};
+
+use crate::llm::{Delta, FinishReason, ToolSpec};
+use crate::message::{Message, Role};
 
 // ---------------------------------------------------------------------------
 // Response (streaming chunks)
@@ -272,7 +272,7 @@ pub fn message_to_wire(m: &Message, cache: bool) -> WireMessage<'_> {
     }
 }
 
-pub fn tool_to_wire(t: &Tool) -> WireTool {
+pub fn tool_to_wire(t: &ToolSpec) -> WireTool {
     WireTool {
         kind: "function",
         function: WireToolFunction {
@@ -385,7 +385,7 @@ pub fn parse_stream(body: &str) -> Result<ParsedStream, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use slimcode_core::session::{Role, ToolCall};
+    use crate::message::{MessageStopReason, Role, ToolCall};
 
     const TEXT_STREAM: &str = concat!(
         "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",",
@@ -627,7 +627,6 @@ mod tests {
         // `stop_reason` and `error` are log-schema fields (ADR-0009 D5): they
         // must never leak onto the provider wire. The failure-closing assistant
         // message still goes out as plain assistant text.
-        use slimcode_core::session::MessageStopReason;
         let mut m = Message::text(Role::Assistant, "The turn ended with an error: boom");
         m.stop_reason = Some(MessageStopReason::Error);
         m.error = Some("boom".to_string());
@@ -646,11 +645,10 @@ mod tests {
 
     #[test]
     fn tool_to_wire_shapes_function() {
-        let t = Tool::new(
+        let t = ToolSpec::new(
             "get_weather",
             "Get current weather for a city",
             serde_json::json!({"type": "object"}),
-            |_| Ok("x".to_string()),
         );
         let w = tool_to_wire(&t);
         assert_eq!(w.kind, "function");
@@ -803,11 +801,10 @@ mod tests {
     fn request_serializes_parallel_tool_calls_when_tools_are_present() {
         // With tools declared, the request opts into parallel tool calls so
         // the model may return several independent calls in one response.
-        let tool = Tool::new(
+        let tool = ToolSpec::new(
             "get_weather",
             "Get current weather for a city",
             serde_json::json!({"type": "object"}),
-            |_| Ok(String::new()),
         );
         let req = request_with_tools(Some(vec![tool_to_wire(&tool)]), true);
         let v = serde_json::to_value(&req).unwrap();

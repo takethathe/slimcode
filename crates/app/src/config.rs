@@ -20,10 +20,10 @@
 use serde::Deserialize;
 use slimcode_ai::BailianConfig;
 
-/// Default China-station legacy compatible-mode base URL (no WorkspaceId needed).
-pub const DEFAULT_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
-/// Recommended default model (ticket 01).
-pub const DEFAULT_MODEL: &str = "qwen-plus";
+// The endpoint defaults are owned by the provider layer (`slimcode-ai`); the
+// app layer owns the resolution order and the env var names, and re-exports
+// the defaults so callers keep using one spelling.
+pub use slimcode_ai::config::{DEFAULT_BASE_URL, DEFAULT_MODEL};
 /// Default session quota in MiB (spec: 500).
 pub const DEFAULT_MAX_MB: u64 = 500;
 

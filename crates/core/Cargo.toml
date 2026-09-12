@@ -6,5 +6,6 @@ license.workspace = true
 publish = false
 
 [dependencies]
+slimcode-ai.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -57,9 +57,11 @@ cargo workspace，六个 crate：
 | `crates/tui` | `slimcode-tui` | 交互式全屏 TUI（纯 App core + crossterm/ratatui 终端循环；theme/markdown/toolcall/footer/git 纯函数模块） | v1 完成（pi 对齐：header/blocks/layout/footer/status） |
 | `crates/cli` | `slimcode` | 二进制入口 + 非交互 one-shot 前端（共享 runner + TextRenderer） | v1 完成（render/main） |
 
-### crates/ai Bailian provider
+### crates/ai Bailian provider 与 LLM seam
 
-实现 `core::Provider` seam（ticket 04/05），栈与 serde 容忍清单自 ticket 01/02/05：
+`ai` 拥有 LLM seam（ADR-0011 D1）：wire `Message`（`message` 模块）、`Provider` / `ToolSpec` /
+`Delta` / `FinishReason` / `CancelToken`（`llm` 模块）与 `TokenUsage` / wire 模型（`wire` 模块）。
+`BailianProvider`（`provider` 模块）实现 `Provider` seam，栈与 serde 容忍清单自 ticket 01/02/05：
 
 - **HTTP**：`reqwest 0.13` blocking（features `json` + `blocking` + `rustls`，`default-features=false`）。
   `Provider` trait 是同步 seam，真实阻塞边界收在 provider 内部，不引入 tokio；ticket 02 文档中 `stream` feature
@@ -87,10 +89,11 @@ cargo workspace，六个 crate：
     `*_tokens_details` 等未知字段：直接忽略；
 - **tool_call 拼接**：首片段带 `id`/`name`（`arguments: ""`）→ `ToolCallStart`，续传只有 `index`+`arguments` → `ToolCallArgs`，按 index 拼接；
 - **配置**：`BailianConfig` 为纯 provider 数据（api key / base URL / model / cache，保留
-  `chat_completions_url()`）。四层优先级解析、env 变量名与默认值（`DEFAULT_BASE_URL` /
-  `DEFAULT_MODEL`）的唯一 owner 是 `slimcode-app::config`（frontend overrides > env >
-  `config.toml` > 默认值），产出 `BailianConfig`；ai 不再提供 `from_env`，消除与 cli 重复
-  解析同一组 env/默认值的问题；
+  `chat_completions_url()`）。端点默认值（`DEFAULT_BASE_URL` / `DEFAULT_MODEL`）由本 crate 拥有，
+  与 provider 放在一起；四层优先级解析与 env 变量名的唯一 owner 是 `slimcode-app::config`
+  （frontend overrides > env > `config.toml` > 默认值），它 re-export 这两个默认值再产出
+  `BailianConfig`；ai 不提供 `from_env`、不读 env/文件，因此本 crate 无任何 slimcode 依赖
+  （含 `[dev-dependencies]`：两个 live 冒烟测试自己读 env 名、用本 crate 的默认值）；
 - 两个 `#[ignore]` 冒烟测试（文本 + 工具调用）需真实 key + 网络，默认跳过，一次性手动验证已通过。
 
 ### crates/core 工具
@@ -105,9 +108,10 @@ cargo workspace，六个 crate：
 
 ### crates/core 会话模型（`session`）
 
-消息/会话数据模型，折入自 ticket 04（ADR-0009 起扩展了日志专用字段）：
+wire 消息模型（`Message` / `Role` / `Part` / `ToolCall` / `MessageStopReason`）已归 `slimcode-ai`
+（ADR-0011 D1），本模块只保留会话包装并 re-export 消息类型：
 
-- `Message { role, parts: Vec<Part>, tool_calls, tool_call_id, stop_reason, error }`，
+- `Message { role, parts: Vec<Part>, tool_calls, tool_call_id, stop_reason, error }`（owner：`ai`），
   role 序列化小写；`stop_reason`（`stop`/`tool_calls`/`error`/`aborted`）与 `error`
   是日志专用字段（`skip_serializing_if` 省略、不出现在 LLM wire 上），普通消息的
   序列化字节与旧 JSON 完全一致；
@@ -131,9 +135,13 @@ cargo workspace，六个 crate：
   检查，已 push 的结果保留、未应用的不追加。`RunConfig.parallel_tools` 默认 `true`，
   串行路径保留给显式 `parallel_tools: false` 的场景（串行语义测试）；`Tool.run` 约束为 `Fn + Send + Sync`
   （工作线程共享同一组工具只读调用）；
+- 工具对 provider 只是 schema：`Provider::chat(&[Message], &[ToolSpec], &CancelToken)`（ADR-0011 D1）；
+  `core::Tool { spec: ToolSpec, run }` 是带执行闭包的包装，`Tool::new(name, description, parameters, run)`
+  照旧；loop 在每次 run 开头构建一次 `Vec<ToolSpec>`（非每请求）并交给所有 `chat` 调用；
 - 工具事件（`ToolStart`/`ToolResult`）携带 `tool_call_id`，渲染端据此配对同名工具的多次调用；
 - 工具报错以 `Error: …` 前缀作 `role: tool` 内容进 history，模型自然恢复；
-- `Provider` trait 是 crates/ai 已实现的 seam（当前同步、无 async 依赖，真实 provider 内部处理阻塞边界）；
+- `Provider` trait 归 `slimcode-ai` 拥有（同步、无 async 依赖，真实 provider 内部处理阻塞边界），
+  `core` 只 re-export 它的 seam 类型；运行时只依赖 `ai`（ADR-0011 D1/D4）；
 - 流式 delta（`Reasoning`/`Text`/`ToolCallStart`/`ToolCallArgs`/`Done`）镜像 ticket 05 实测 wire 形状，`assemble` 负责拼接。
 
 ### crates/commands 命令注册表（`slimcode-commands`）

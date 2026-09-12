@@ -9,7 +9,7 @@
 //! Structural lines always start on their own row, even when the preceding
 //! streamed line didn't end with a newline. Raw `ToolCallStart`/
 //! `ToolCallArgs`/`Done` deltas never reach a renderer — they are suppressed by
-//! `map_event` in `slimcode-common`.
+//! `map_event` in `slimcode-app`.
 
 use std::io::Write;
 

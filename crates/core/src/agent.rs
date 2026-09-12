@@ -15,82 +15,23 @@
 //!   `content`; a tool call starts with `ToolCallStart` (id + name) followed by
 //!   `ToolCallArgs` fragments; `assemble` re-joins them.
 //!
-//! The `Provider` trait is the seam crates/ai will implement against the real
-//! Bailian/OpenAI-compatible endpoint. It is synchronous for now so the loop
-//! stays dependency-free and testable; the async boundary lives inside the
+//! The `Provider` trait (in `slimcode-ai`) is the seam the Bailian/
+//! OpenAI-compatible provider implements. It is synchronous so the loop stays
+//! testable; the async boundary lives inside the
 //! provider implementation (a blocking call / runtime handle).
 
 pub use crate::session::{Message, Role, ToolCall};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
-/// A shared cancellation handle threaded through a run (ticket 07, spec R3):
-/// one `Arc<AtomicBool>` observed by the runner boundaries, the provider's
-/// interruptible body read, and cancellable tool executions (bash). Cloning
-/// shares the same flag; the TUI `reset()`s it at the start of every turn and
-/// `cancel()`s it when the user presses Esc.
-#[derive(Clone, Debug, Default)]
-pub struct CancelToken {
-    flag: Arc<AtomicBool>,
-}
+// The LLM seam types are owned by `slimcode-ai` (ADR-0011 D1) and re-exported
+// here so callers can keep importing them from the runtime module.
+pub use slimcode_ai::llm::{CancelToken, Delta, FinishReason, Provider, ToolSpec};
 
-impl CancelToken {
-    /// A fresh, uncancelled token.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set the flag: every boundary and interruptible read notices on its
-    /// next check.
-    pub fn cancel(&self) {
-        self.flag.store(true, Ordering::SeqCst);
-    }
-
-    /// Clear the flag (the TUI does this before each new turn).
-    pub fn reset(&self) {
-        self.flag.store(false, Ordering::SeqCst);
-    }
-
-    /// Whether a cancel has been requested.
-    pub fn is_cancelled(&self) -> bool {
-        self.flag.load(Ordering::SeqCst)
-    }
-}
-
-/// Why a turn of generation ended.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum FinishReason {
-    Stop,
-    ToolCalls,
-}
-
-/// One streaming delta from the provider — the unit surfaced to the CLI.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Delta {
-    /// Thinking tokens (qwen-style `reasoning_content`).
-    Reasoning(String),
-    /// Assistant text fragment.
-    Text(String),
-    /// First fragment of a tool call: carries `id` + `name` (and `index`).
-    ToolCallStart {
-        index: usize,
-        id: String,
-        name: String,
-    },
-    /// Subsequent fragment: only an arguments slice (id/name are empty on the
-    /// wire for these).
-    ToolCallArgs { index: usize, fragment: String },
-    /// End-of-turn marker.
-    Done(FinishReason),
-}
-
-/// A registered tool the agent can invoke.
+/// A registered tool the agent can invoke: the schema the provider sees plus
+/// the closure that executes it.
 pub struct Tool {
-    pub name: String,
-    pub description: String,
-    pub parameters: Value,
+    pub spec: ToolSpec,
     /// Runs the tool against parsed JSON arguments. `Err` becomes an
     /// `Error: …` tool message in history. `Send + Sync` so one batch of
     /// calls can share the same tools across the worker threads of a
@@ -106,29 +47,10 @@ impl Tool {
         run: impl Fn(Value) -> Result<String, String> + Send + Sync + 'static,
     ) -> Self {
         Self {
-            name: name.into(),
-            description: description.into(),
-            parameters,
+            spec: ToolSpec::new(name, description, parameters),
             run: Box::new(run),
         }
     }
-}
-
-/// The provider seam. crates/ai implements this against the real endpoint.
-pub trait Provider {
-    /// One turn of generation over `messages` with `tools` available.
-    /// Returns the raw delta stream for this turn.
-    ///
-    /// `cancel` lets an in-flight request interrupt itself: the provider
-    /// checks it between body chunks and aborts the read as soon as it is
-    /// set (returning an error the runner maps to a silent
-    /// [`StopReason::Cancelled`]).
-    fn chat(
-        &mut self,
-        messages: &[Message],
-        tools: &[Tool],
-        cancel: &CancelToken,
-    ) -> Result<Vec<Delta>, String>;
 }
 
 /// Reassemble an assistant message from a delta stream (provider-agnostic).
@@ -225,7 +147,7 @@ pub struct RunResult {
 }
 
 fn dispatch(tools: &[Tool], tc: &ToolCall) -> Result<String, String> {
-    match tools.iter().find(|t| t.name == tc.name) {
+    match tools.iter().find(|t| t.spec.name == tc.name) {
         Some(t) => {
             let args: Value = serde_json::from_str(&tc.arguments)
                 .map_err(|e| format!("invalid tool arguments for {}: {e}", tc.name))?;
@@ -411,6 +333,10 @@ fn run_loop<P: Provider>(
 ) -> Result<(Vec<Message>, usize, StopReason), String> {
     let mut iterations = 0usize;
 
+    // The provider sees tools as a schema only: build the `ToolSpec` list once
+    // per run (not per request) and hand it to every `chat` call (ADR-0011 D1).
+    let tool_specs: Vec<ToolSpec> = tools.iter().map(|t| t.spec.clone()).collect();
+
     // Unbounded loop: a coding agent runs until the model stops calling tools
     // (`FinishReason::Stop`), the caller cancels, or the provider errors.
     // There is intentionally no iteration cap — ending a run is the model's
@@ -426,7 +352,7 @@ fn run_loop<P: Provider>(
         let turn = iterations;
         on_event(AgentEvent::Turn { turn })?;
 
-        let deltas = match provider.chat(&messages, tools, cancel) {
+        let deltas = match provider.chat(&messages, &tool_specs, cancel) {
             Ok(deltas) => deltas,
             // A provider error that landed together with a cancel (its
             // interruptible read aborted) is a silent cancelled stop, not an
@@ -479,7 +405,7 @@ fn run_loop<P: Provider>(
 /// The agent loop over an existing message history (already including the
 /// latest user message), streaming every event to `on_event` live and
 /// returning the updated message history together with the stop reason. Used
-/// by `slimcode-common`'s shared runner to render live through a `Renderer`.
+/// by `slimcode-app`'s shared runner to render live through a `Renderer`.
 pub fn run_agent_from_messages_sink<P: Provider>(
     provider: &mut P,
     tools: &[Tool],
@@ -521,6 +447,8 @@ pub fn run_agent_from_messages<P: Provider>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     // --- helpers -----------------------------------------------------------
 
@@ -581,7 +509,7 @@ mod tests {
         fn chat(
             &mut self,
             _messages: &[Message],
-            _tools: &[Tool],
+            _tools: &[ToolSpec],
             _cancel: &CancelToken,
         ) -> Result<Vec<Delta>, String> {
             self.calls += 1;
@@ -1077,7 +1005,7 @@ mod tests {
             fn chat(
                 &mut self,
                 _m: &[Message],
-                _t: &[Tool],
+                _t: &[ToolSpec],
                 _c: &CancelToken,
             ) -> Result<Vec<Delta>, String> {
                 Err("provider exploded".to_string())
@@ -1159,7 +1087,7 @@ mod tests {
             fn chat(
                 &mut self,
                 _m: &[Message],
-                _t: &[Tool],
+                _t: &[ToolSpec],
                 _c: &CancelToken,
             ) -> Result<Vec<Delta>, String> {
                 Err("request cancelled".to_string())

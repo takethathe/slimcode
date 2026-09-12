@@ -1,5 +1,5 @@
 //! Shared turn runner (ADR-0004, spec §Implementation Decisions): drives the
-//! existing agent loop through `slimcode-agent`'s live event sink, mapping
+//! existing agent loop through `slimcode-core`'s live event sink, mapping
 //! every event through [`map_event`] and streaming it to a [`Renderer`] as the
 //! loop runs. This is the single turn loop both frontends share, so their
 //! behavior cannot drift.
@@ -69,7 +69,7 @@ mod tests {
     use super::*;
     use crate::render::DisplayItem;
     use serde_json::Value;
-    use slimcode_core::agent::{Delta, FinishReason, StopReason};
+    use slimcode_core::agent::{Delta, FinishReason, StopReason, ToolSpec};
     use slimcode_core::session::{Message, Role};
 
     // --- helpers (the agent crate's scripted FakeProvider pattern) ----------
@@ -117,7 +117,7 @@ mod tests {
         fn chat(
             &mut self,
             _messages: &[Message],
-            _tools: &[Tool],
+            _tools: &[ToolSpec],
             _cancel: &CancelToken,
         ) -> Result<Vec<Delta>, String> {
             let d = self.script.get(self.calls).cloned().unwrap_or_default();
@@ -434,7 +434,7 @@ mod tests {
             fn chat(
                 &mut self,
                 _m: &[Message],
-                _t: &[Tool],
+                _t: &[ToolSpec],
                 _c: &CancelToken,
             ) -> Result<Vec<Delta>, String> {
                 Err("provider exploded".to_string())
@@ -611,7 +611,7 @@ mod tests {
         fn chat(
             &mut self,
             m: &[Message],
-            t: &[Tool],
+            t: &[ToolSpec],
             _c: &CancelToken,
         ) -> Result<Vec<Delta>, String> {
             self.calls += 1;

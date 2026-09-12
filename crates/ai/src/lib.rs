@@ -1,13 +1,18 @@
 //! slimcode-ai: unified LLM provider layer.
 //!
-//! Implements the `Provider` seam from `slimcode-agent` for the Bailian
-//! (阿里云百炼) OpenAI-compatible endpoint. Stack chosen in ticket 02; wire
-//! behavior verified live in ticket 05's spike.
+//! Owns the LLM seam (ADR-0011 D1): the wire `Message` model, `Provider`,
+//! `ToolSpec`, `Delta`, `FinishReason` and `CancelToken`, plus the Bailian
+//! (阿里云百炼) OpenAI-compatible provider. This crate depends on no other
+//! slimcode crate, so adding a provider never requires the agent runtime.
 
 pub mod config;
+pub mod llm;
+pub mod message;
 pub mod provider;
 pub mod wire;
 
-pub use config::BailianConfig;
+pub use config::{BailianConfig, DEFAULT_BASE_URL, DEFAULT_MODEL};
+pub use llm::{CancelToken, Delta, FinishReason, Provider, ToolSpec};
+pub use message::{Message, MessageStopReason, Part, Role, ToolCall};
 pub use provider::BailianProvider;
 pub use wire::TokenUsage;

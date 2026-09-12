@@ -49,12 +49,12 @@ mod tests {
     fn build_tools_exposes_the_seven_tools() {
         let cwd = std::env::temp_dir();
         let tools = build_tools(&cwd);
-        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        let names: Vec<&str> = tools.iter().map(|t| t.spec.name.as_str()).collect();
         assert_eq!(
             names,
             vec!["read", "write", "edit", "bash", "grep", "find", "ls"]
         );
-        assert!(tools.iter().all(|t| !t.description.is_empty()));
+        assert!(tools.iter().all(|t| !t.spec.description.is_empty()));
     }
 
     #[test]
@@ -65,7 +65,7 @@ mod tests {
         fs::write(dir.join("hello.txt"), "world").unwrap();
 
         let tools = build_tools(&dir);
-        let read = tools.iter().find(|t| t.name == "read").unwrap();
+        let read = tools.iter().find(|t| t.spec.name == "read").unwrap();
         let out = (read.run)(serde_json::json!({"path": "hello.txt"})).unwrap();
         assert_eq!(out, "world");
         let _ = fs::remove_dir_all(&dir);
@@ -79,7 +79,7 @@ mod tests {
         fs::write(dir.join("hello.txt"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
 
         let tools = build_tools(&dir);
-        let read = tools.iter().find(|t| t.name == "read").unwrap();
+        let read = tools.iter().find(|t| t.spec.name == "read").unwrap();
         // Full read is byte-identical to the file.
         let full = (read.run)(serde_json::json!({"path": "hello.txt"})).unwrap();
         assert_eq!(full, "one\ntwo\nthree\nfour\nfive\n");
@@ -97,7 +97,7 @@ mod tests {
         let cwd = std::env::temp_dir();
         let cancel = CancelToken::new();
         let tools = build_tools_with_cancel(&cwd, &cancel);
-        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        let names: Vec<&str> = tools.iter().map(|t| t.spec.name.as_str()).collect();
         assert_eq!(
             names,
             vec!["read", "write", "edit", "bash", "grep", "find", "ls"]
@@ -114,7 +114,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let cancel = CancelToken::new();
         let tools = build_tools_with_cancel(&dir, &cancel);
-        let bash = tools.into_iter().find(|t| t.name == "bash").unwrap();
+        let bash = tools.into_iter().find(|t| t.spec.name == "bash").unwrap();
 
         // Run `sleep 30` on a worker thread; cancel shortly after it starts.
         let handle =
@@ -145,7 +145,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let cancel = CancelToken::new();
         let tools = build_tools_with_cancel(&dir, &cancel);
-        let bash = tools.into_iter().find(|t| t.name == "bash").unwrap();
+        let bash = tools.into_iter().find(|t| t.spec.name == "bash").unwrap();
         let out = (bash.run)(serde_json::json!({ "command": "echo hi" })).unwrap();
         assert_eq!(out.trim(), "hi");
         assert!(!cancel.is_cancelled());

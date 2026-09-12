@@ -1,19 +1,19 @@
-//! `BailianProvider` — implements the agent `Provider` seam against the Bailian
-//! (阿里云百炼) OpenAI-compatible endpoint.
+//! `BailianProvider` — implements the `slimcode-ai` `Provider` seam against the
+//! Bailian (阿里云百炼) OpenAI-compatible endpoint.
 //!
-//! Uses `reqwest::blocking` to keep the sync `Provider` trait seam (ticket 04);
-//! the async boundary is entirely inside this crate. Streaming is used with
+//! Uses `reqwest::blocking` to keep the sync `Provider` trait seam; the async
+//! boundary is entirely inside this crate. Streaming is used with
 //! `stream_options.include_usage=true` (ticket 05 verified usage arrives in the
-//! final chunk with `choices: []`); each SSE chunk maps to agent deltas.
+//! final chunk with `choices: []`); each SSE chunk maps to provider deltas.
 
 use std::io::Read;
 use std::time::Duration;
 
 use crate::config::BailianConfig;
+use crate::llm::{CancelToken, Delta, Provider, ToolSpec};
+use crate::message::Message;
 use crate::wire;
 use crate::wire::{PromptTokensDetails, TokenUsage};
-use slimcode_core::agent::{CancelToken, Delta, Provider, Tool};
-use slimcode_core::session::Message;
 
 /// Sum a usage sample into an accumulator (pure, unit-testable). Cache-hit
 /// details (`prompt_tokens_details`) accumulate alongside the three headline
@@ -118,7 +118,7 @@ impl Provider for BailianProvider {
     fn chat(
         &mut self,
         messages: &[Message],
-        tools: &[Tool],
+        tools: &[ToolSpec],
         cancel: &CancelToken,
     ) -> Result<Vec<Delta>, String> {
         let req = wire::WireRequest {
@@ -188,8 +188,8 @@ impl Provider for BailianProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use slimcode_core::agent::FinishReason;
-    use slimcode_core::session::Role;
+    use crate::llm::FinishReason;
+    use crate::message::Role;
     use std::io::Cursor;
 
     /// A reader handing out at most `chunk_size` bytes per `read` call.
@@ -351,19 +351,21 @@ mod tests {
     }
 
     // --- usage accumulation + live smoke (existing suite) ------------------
-    use slimcode_app::config::{
-        DEFAULT_BASE_URL, DEFAULT_MODEL, ENV_API_KEY, ENV_BASE_URL, ENV_MODEL,
-    };
 
     /// Test-only: build a provider from the live environment. The real
-    /// resolution owner is `slimcode-common::config`; this helper keeps the
-    /// live smoke tests working by referencing the shared constants instead of
-    /// re-inlining them.
+    /// resolution owner is `slimcode-app::config`; this helper keeps the live
+    /// smoke tests working by reading the same env var names and the AI
+    /// crate's own endpoint defaults (this crate depends on no slimcode crate).
     fn provider_from_env() -> Result<BailianProvider, String> {
+        const ENV_API_KEY: &str = "DASHSCOPE_API_KEY";
+        const ENV_BASE_URL: &str = "SLIMCODE_AI_BASE_URL";
+        const ENV_MODEL: &str = "SLIMCODE_AI_MODEL";
         let api_key =
             std::env::var(ENV_API_KEY).map_err(|_| format!("{ENV_API_KEY} is not set"))?;
-        let base_url = std::env::var(ENV_BASE_URL).unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
-        let model = std::env::var(ENV_MODEL).unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+        let base_url = std::env::var(ENV_BASE_URL)
+            .unwrap_or_else(|_| crate::config::DEFAULT_BASE_URL.to_string());
+        let model =
+            std::env::var(ENV_MODEL).unwrap_or_else(|_| crate::config::DEFAULT_MODEL.to_string());
         BailianProvider::new(BailianConfig::new(api_key, base_url, model))
     }
 
@@ -440,9 +442,8 @@ mod tests {
     /// Live smoke test — requires `DASHSCOPE_API_KEY` (and optionally
     /// `SLIMCODE_AI_BASE_URL` / `SLIMCODE_AI_MODEL`). Skipped by default.
     ///
-    /// Test-only env lookup: the production config seam is
-    /// `slimcode-common::config`, which this crate deliberately does not depend
-    /// on, so the live test reads the same variables inline.
+    /// Test-only env lookup: this crate deliberately depends on no slimcode
+    /// crate, so the live test reads the same variables inline.
     #[test]
     #[ignore = "requires live DASHSCOPE_API_KEY and network access"]
     fn live_chat_returns_text_and_done() {
@@ -469,7 +470,7 @@ mod tests {
     #[ignore = "requires live DASHSCOPE_API_KEY and network access"]
     fn live_chat_calls_tool() {
         let mut p = provider_from_env().expect("env config");
-        let tool = Tool::new(
+        let tool = ToolSpec::new(
             "get_weather",
             "Get the current weather for a city",
             serde_json::json!({
@@ -479,7 +480,6 @@ mod tests {
                 },
                 "required": ["city"]
             }),
-            |args| Ok(format!("weather for {args}")),
         );
         let msgs = vec![Message::text(
             Role::User,

@@ -1,4 +1,4 @@
-//! slimcode-common: frontend-agnostic application modules.
+//! slimcode-app: frontend-agnostic application modules.
 //!
 //! Everything here is reusable by any frontend — the one-shot CLI, the TUI,
 //! or a web UI — without depending on the terminal binary.
