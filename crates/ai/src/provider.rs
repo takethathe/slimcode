@@ -6,6 +6,13 @@
 //! `stream_options.include_usage=true` (ticket 05 verified usage arrives in the
 //! final chunk with `choices: []`); each SSE chunk maps to provider deltas.
 //!
+//! The request is read and framed **incrementally** (ADR-0019): every complete
+//! SSE event is parsed the moment it reaches the socket and its deltas are
+//! pushed straight into the `on_delta` sink, so the frontend renders an answer
+//! while the endpoint is still generating it. Nothing accumulates the whole
+//! body first — the reader is interruptible between chunks, and a cancelled
+//! read simply drops the torn tail (whose deltas never counted).
+//!
 //! The provider instance is **stateless** (ADR-0016): construction only builds
 //! the HTTP client, and every `chat` call reads its settings (model, base URL,
 //! API key, cache flag) from the `&ProviderConfig` argument — so one instance
@@ -18,7 +25,7 @@ use crate::config::ProviderConfig;
 use crate::llm::{CancelToken, Delta, Provider, ToolSpec};
 use crate::message::Message;
 use crate::wire;
-use crate::wire::{PromptTokensDetails, TokenUsage};
+use crate::wire::{PromptTokensDetails, SseFramer, TokenUsage};
 
 /// Sum a usage sample into an accumulator (pure, unit-testable). Cache-hit
 /// details (`prompt_tokens_details`) accumulate alongside the three headline
@@ -36,56 +43,61 @@ fn accumulate_usage(total: &mut TokenUsage, sample: TokenUsage) {
     }
 }
 
-/// What an interruptible body read ended with.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ReadOutcome {
-    /// The reader hit EOF: the full body.
-    Complete(Vec<u8>),
-    /// The cancel token flipped while reading (an in-flight request aborted):
-    /// carries the bytes received before the cancel so the provider can
-    /// salvage whatever already streamed.
-    Cancelled(Vec<u8>),
+/// How an interruptible body read ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadEnd {
+    /// The reader hit EOF: the body ended on its own terms.
+    Complete,
+    /// The cancel token flipped mid-read: the read stopped between chunks.
+    Cancelled,
 }
 
-/// Read `reader` to EOF in chunks, checking `cancel` between chunks (ticket
-/// 07): as soon as the flag is set the read stops and reports
-/// [`ReadOutcome::Cancelled`], dropping the connection so the running turn
-/// can end immediately. I/O errors propagate as `Err`; `Interrupted` retries.
-/// A reader that stalls is only bounded by the caller's own timeout — a
-/// flowing stream reacts within one socket chunk.
-pub fn read_body_interruptibly<R: Read>(
+/// Read `reader` chunk by chunk, handing each chunk to `on_chunk` as it
+/// arrives, and stop as soon as `cancel` is set (ADR-0019): an in-flight
+/// request reacts within one socket chunk, and dropping the reader here drops
+/// the connection so the running turn ends immediately. A `on_chunk` error
+/// (a sink/renderer failure) aborts the read the same way and propagates
+/// verbatim; I/O errors propagate as `Err`; `Interrupted` retries. A reader
+/// that stalls is only bounded by the caller's own timeout — blocking reqwest
+/// exposes no per-read timeout.
+pub fn read_stream_interruptibly<R: Read>(
     mut reader: R,
     cancel: &CancelToken,
-) -> Result<ReadOutcome, String> {
-    let mut body = Vec::new();
+    on_chunk: &mut dyn FnMut(&[u8]) -> Result<(), String>,
+) -> Result<ReadEnd, String> {
     let mut chunk = [0u8; 8192];
     loop {
         if cancel.is_cancelled() {
-            return Ok(ReadOutcome::Cancelled(body));
+            return Ok(ReadEnd::Cancelled);
         }
         match reader.read(&mut chunk) {
-            Ok(0) => return Ok(ReadOutcome::Complete(body)),
-            Ok(n) => body.extend_from_slice(&chunk[..n]),
+            Ok(0) => return Ok(ReadEnd::Complete),
+            Ok(n) => on_chunk(&chunk[..n])?,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(format!("read body failed: {e}")),
         }
     }
 }
 
-/// Trim `body` to the last complete SSE event boundary (ticket 07): a
-/// cancelled read may cut a `data:` event mid-line; the torn tail cannot
-/// parse, so it is dropped before salvaging the partial stream.
-fn trim_partial_sse_tail(body: &str) -> &str {
-    if body.is_empty() {
-        return body;
+/// Feed one SSE event's deltas into the sink, recording the usage sample when
+/// the event carries one (only the final chunk does). Shared by the live read
+/// and the EOF flush so a single event is interpreted exactly one way
+/// regardless of which chunk boundary it landed on.
+fn emit_event(
+    event: &str,
+    usage: &mut Option<TokenUsage>,
+    on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
+) -> Result<(), String> {
+    let Some(parsed) = wire::parse_event(event)? else {
+        return Ok(());
+    };
+    if parsed.usage.is_some() {
+        *usage = parsed.usage;
     }
-    if body.ends_with("\n\n") {
-        return body;
+    for delta in parsed.deltas {
+        on_delta(delta)?;
     }
-    match body.rfind("\n\n") {
-        Some(pos) => &body[..pos + 2],
-        None => "",
-    }
+    Ok(())
 }
 
 /// Provider for the Bailian compatible-mode endpoint. Stateless: construction
@@ -133,7 +145,8 @@ impl Provider for BailianProvider {
         tools: &[ToolSpec],
         config: &ProviderConfig,
         cancel: &CancelToken,
-    ) -> Result<Vec<Delta>, String> {
+        on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
+    ) -> Result<(), String> {
         let req = wire::WireRequest {
             model: &config.model,
             messages: wire::messages_to_wire(messages, config.cache),
@@ -161,37 +174,58 @@ impl Provider for BailianProvider {
             .map_err(|e| format!("request failed: {e}"))?;
 
         let status = resp.status();
-        // Chunked body read (ticket 07): blocking reqwest exposes no per-read
-        // timeout, so a silent server stays bounded by the client timeout
-        // (300s); an Esc cancel aborts the read within one socket chunk on a
-        // flowing stream.
-        let body = match read_body_interruptibly(resp, cancel)? {
-            ReadOutcome::Complete(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-            ReadOutcome::Cancelled(partial) => {
-                // The request was aborted mid-stream. Salvage whatever already
-                // arrived: parse the partial body (dropping a torn final SSE
-                // event) so the runner can surface the text that streamed in;
-                // when nothing usable arrived, report the abort (the runner
-                // maps it to a silent cancelled stop).
-                let partial = String::from_utf8_lossy(&partial).into_owned();
-                let trimmed = trim_partial_sse_tail(&partial);
-                if let Ok(parsed) = wire::parse_stream(trimmed)
-                    && !parsed.deltas.is_empty()
-                {
-                    return Ok(parsed.deltas);
-                }
+        // An unsuccessful response carries no deltas: read its body (still
+        // interruptibly — a cancel wins over the error text) and report it.
+        if !status.is_success() {
+            let mut body = Vec::new();
+            let end = read_stream_interruptibly(resp, cancel, &mut |bytes| {
+                body.extend_from_slice(bytes);
+                Ok(())
+            })?;
+            if end == ReadEnd::Cancelled {
                 return Err("request cancelled".to_string());
             }
-        };
-        if !status.is_success() {
-            return Err(format!("Bailian API error {status}: {body}"));
+            return Err(format!(
+                "Bailian API error {status}: {}",
+                String::from_utf8_lossy(&body)
+            ));
         }
-        let parsed = wire::parse_stream(&body)?;
-        self.last_usage = parsed.usage;
-        if let Some(u) = parsed.usage {
+
+        // A successful response is an SSE stream: frame and parse it as it
+        // arrives and hand every delta to the sink immediately (ADR-0019), so
+        // the caller renders the answer while the endpoint is still writing
+        // it. Blocking reqwest exposes no per-read timeout, so a silent server
+        // stays bounded by the client timeout (300s) while a flowing stream
+        // reacts to an Esc cancel within one socket chunk.
+        let mut framer = SseFramer::new();
+        // The last usage sample seen; recorded only when the body ends on its
+        // own terms (a cancelled request never earned its tokens).
+        let mut usage: Option<TokenUsage> = None;
+        let end = {
+            let mut handle = |bytes: &[u8]| -> Result<(), String> {
+                for event in framer.push(bytes) {
+                    emit_event(&event, &mut usage, &mut *on_delta)?;
+                }
+                Ok(())
+            };
+            read_stream_interruptibly(resp, cancel, &mut handle)?
+        };
+        if end == ReadEnd::Cancelled {
+            // The deltas that already arrived streamed out live; the torn tail
+            // (and any usage the final chunk would have carried) is dropped,
+            // and the runner sees the cancel token and ends the turn cancelled.
+            return Ok(());
+        }
+        // EOF: an event whose blank line never landed still counts, matching
+        // the whole-body parser (`SseFramer::finish`).
+        for event in framer.finish() {
+            emit_event(&event, &mut usage, &mut *on_delta)?;
+        }
+        self.last_usage = usage;
+        if let Some(u) = usage {
             accumulate_usage(&mut self.total_usage, u);
         }
-        Ok(parsed.deltas)
+        Ok(())
     }
 }
 
@@ -255,48 +289,63 @@ mod tests {
         }
     }
 
-    // --- read_body_interruptibly ------------------------------------------
+    // --- read_stream_interruptibly ----------------------------------------
 
-    #[test]
-    fn read_body_reads_to_eof_and_completes() {
-        let cancel = CancelToken::new();
-        let outcome = read_body_interruptibly(Cursor::new(b"hello\nworld"), &cancel).unwrap();
-        assert_eq!(outcome, ReadOutcome::Complete(b"hello\nworld".to_vec()));
+    /// Collect every chunk the read hands over, in order.
+    fn chunks_of(reader: impl Read, cancel: &CancelToken) -> (ReadEnd, Vec<u8>) {
+        let mut seen = Vec::new();
+        let end = read_stream_interruptibly(reader, cancel, &mut |bytes| {
+            seen.extend_from_slice(bytes);
+            Ok(())
+        })
+        .unwrap();
+        (end, seen)
     }
 
     #[test]
-    fn read_body_completes_empty_reader() {
+    fn read_stream_hands_every_chunk_over_and_completes() {
         let cancel = CancelToken::new();
-        let outcome = read_body_interruptibly(Cursor::new(b""), &cancel).unwrap();
-        assert_eq!(outcome, ReadOutcome::Complete(Vec::new()));
+        let (end, seen) = chunks_of(Cursor::new(b"hello\nworld"), &cancel);
+        assert_eq!(end, ReadEnd::Complete);
+        assert_eq!(seen, b"hello\nworld");
     }
 
     #[test]
-    fn read_body_cancels_without_reading_when_flag_is_already_set() {
+    fn read_stream_completes_empty_reader() {
+        let cancel = CancelToken::new();
+        let (end, seen) = chunks_of(Cursor::new(b""), &cancel);
+        assert_eq!(end, ReadEnd::Complete);
+        assert!(seen.is_empty());
+    }
+
+    #[test]
+    fn read_stream_cancels_without_reading_when_flag_is_already_set() {
         let cancel = CancelToken::new();
         cancel.cancel();
         let reader = ChunkedReader::new("1234567890", 4);
-        let outcome = read_body_interruptibly(reader, &cancel).unwrap();
-        assert_eq!(outcome, ReadOutcome::Cancelled(Vec::new()));
+        let (end, seen) = chunks_of(reader, &cancel);
+        assert_eq!(end, ReadEnd::Cancelled);
+        assert!(seen.is_empty(), "nothing may be read after a cancel");
     }
 
     #[test]
-    fn read_body_stops_between_chunks_when_flag_flips() {
+    fn read_stream_stops_between_chunks_when_flag_flips() {
         let cancel = CancelToken::new();
         // Chunks of 4: the flag flips as the second read begins. The read in
         // flight may still deliver its chunk, but the loop stops before any
-        // further read — the partial body is the data received so far.
+        // further read — everything already handed over was streamed out.
         let reader = CancelOnRead {
             inner: ChunkedReader::new("abcdefghij", 4),
             flip_on: 2,
             cancel: cancel.clone(),
         };
-        let outcome = read_body_interruptibly(reader, &cancel).unwrap();
-        assert_eq!(outcome, ReadOutcome::Cancelled(b"abcdefgh".to_vec()));
+        let (end, seen) = chunks_of(reader, &cancel);
+        assert_eq!(end, ReadEnd::Cancelled);
+        assert_eq!(seen, b"abcdefgh");
     }
 
     #[test]
-    fn read_body_propagates_io_errors() {
+    fn read_stream_propagates_io_errors() {
         struct Boom;
         impl Read for Boom {
             fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
@@ -304,11 +353,187 @@ mod tests {
             }
         }
         let cancel = CancelToken::new();
-        let err = read_body_interruptibly(Boom, &cancel).unwrap_err();
+        let err = read_stream_interruptibly(Boom, &cancel, &mut |_| Ok(())).unwrap_err();
         assert!(err.contains("socket gone"), "err: {err}");
     }
 
-    // --- trim_partial_sse_tail + salvage -----------------------------------
+    #[test]
+    fn read_stream_propagates_a_sink_failure_and_stops_reading() {
+        // A frontend that cannot render any more aborts the request: the error
+        // travels out verbatim (the runner must surface it, not swallow it as
+        // a silent cancelled stop).
+        let cancel = CancelToken::new();
+        let reader = ChunkedReader::new("abcdefghij", 4);
+        let mut seen = 0usize;
+        let err = read_stream_interruptibly(reader, &cancel, &mut |bytes| {
+            seen += bytes.len();
+            Err("renderer exploded".to_string())
+        })
+        .unwrap_err();
+        assert!(err.contains("renderer exploded"), "err: {err}");
+        assert_eq!(seen, 4, "the first chunk was delivered before the abort");
+    }
+
+    // --- live streaming (ADR-0019) ----------------------------------------
+
+    /// A one-shot SSE server on a random local port: writes each event after
+    /// its own delay, then `[DONE]` and EOF. Returns its base URL.
+    fn spawn_sse_server(events: Vec<(Duration, String)>) -> String {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req = [0u8; 8192];
+            let _ = sock.read(&mut req);
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                        Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+            sock.write_all(head.as_bytes()).unwrap();
+            for (delay, event) in events {
+                std::thread::sleep(delay);
+                let body = format!("data: {event}\n\n");
+                sock.write_all(format!("{:x}\r\n", body.len()).as_bytes())
+                    .unwrap();
+                sock.write_all(body.as_bytes()).unwrap();
+                sock.write_all(b"\r\n").unwrap();
+                sock.flush().unwrap();
+            }
+            let done = b"data: [DONE]\n\n";
+            sock.write_all(format!("{:x}\r\n", done.len()).as_bytes())
+                .unwrap();
+            sock.write_all(done).unwrap();
+            sock.write_all(b"\r\n0\r\n\r\n").unwrap();
+            sock.flush().unwrap();
+        });
+        base
+    }
+
+    /// One text-content chunk, in the live wire shape.
+    fn text_event(text: &str) -> String {
+        format!(
+            "{{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":\
+             [{{\"index\":0,\"delta\":{{\"content\":\"{text}\"}},\"finish_reason\":null}}]}}"
+        )
+    }
+
+    /// Chunk one arrives immediately, chunk two 500ms later: a provider that
+    /// frames the stream as it reads hands the first delta over at once, while
+    /// one that reads the body to EOF first (the pre-ADR-0019 shape) cannot
+    /// deliver anything before the gap is over.
+    #[test]
+    fn chat_delivers_deltas_while_the_response_is_still_streaming() {
+        let base = spawn_sse_server(vec![
+            (Duration::ZERO, text_event("first")),
+            (Duration::from_millis(500), text_event("second")),
+        ]);
+        let mut provider = BailianProvider::new().unwrap();
+        let config = ProviderConfig::new("test-key", base, "test-model");
+        let messages = vec![Message::text(Role::User, "hi")];
+
+        let started = std::time::Instant::now();
+        let mut arrivals: Vec<(Duration, Delta)> = Vec::new();
+        provider
+            .chat(&messages, &[], &config, &CancelToken::new(), &mut |delta| {
+                arrivals.push((started.elapsed(), delta));
+                Ok(())
+            })
+            .expect("chat succeeds");
+
+        let texts: Vec<&str> = arrivals
+            .iter()
+            .filter_map(|(_, d)| match d {
+                Delta::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["first", "second"]);
+        assert!(
+            arrivals[0].0 < Duration::from_millis(250),
+            "the first delta must reach the sink before the second chunk is sent, \
+             but arrived at {:?}",
+            arrivals[0].0
+        );
+    }
+
+    #[test]
+    fn chat_finishes_the_tail_event_and_records_usage() {
+        // The usage chunk is the last event before `[DONE]`; both must be
+        // handled after EOF (finish), exactly like the whole-body parser.
+        let base = spawn_sse_server(vec![
+            (Duration::ZERO, text_event("answer")),
+            (
+                Duration::ZERO,
+                "{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[],\
+             \"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2,\"total_tokens\":9}}"
+                    .to_string(),
+            ),
+        ]);
+        let mut provider = BailianProvider::new().unwrap();
+        let config = ProviderConfig::new("test-key", base, "test-model");
+        let mut texts = String::new();
+        provider
+            .chat(
+                &[Message::text(Role::User, "hi")],
+                &[],
+                &config,
+                &CancelToken::new(),
+                &mut |delta| {
+                    if let Delta::Text(t) = delta {
+                        texts.push_str(&t);
+                    }
+                    Ok(())
+                },
+            )
+            .expect("chat succeeds");
+        assert_eq!(texts, "answer");
+        assert_eq!(provider.last_usage.map(|u| u.total_tokens), Some(9));
+        assert_eq!(provider.total_usage().total_tokens, 9);
+        assert!(provider.total_usage().cached_tokens() == 0);
+    }
+
+    #[test]
+    fn chat_reports_an_http_error_body() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req = [0u8; 8192];
+            let _ = sock.read(&mut req);
+            let body = "{\"error\":\"bad key\"}";
+            let head = format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            sock.write_all(head.as_bytes()).unwrap();
+            sock.write_all(body.as_bytes()).unwrap();
+        });
+
+        let mut provider = BailianProvider::new().unwrap();
+        let config = ProviderConfig::new("test-key", base, "test-model");
+        let mut delivered = 0usize;
+        let err = provider
+            .chat(
+                &[Message::text(Role::User, "hi")],
+                &[],
+                &config,
+                &CancelToken::new(),
+                &mut |_| {
+                    delivered += 1;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        assert!(err.contains("401"), "err: {err}");
+        assert!(err.contains("bad key"), "err: {err}");
+        assert_eq!(delivered, 0, "an error body carries no deltas");
+    }
+
+    // --- cancel mid-stream: what already streamed stays out ---------------
 
     /// A two-event SSE body (each event a reasoning/content chunk).
     const SSE: &str = concat!(
@@ -317,47 +542,35 @@ mod tests {
     );
 
     #[test]
-    fn trim_keeps_a_body_ending_on_an_event_boundary() {
-        assert_eq!(trim_partial_sse_tail(SSE), SSE);
-        assert_eq!(trim_partial_sse_tail(""), "");
-    }
-
-    #[test]
-    fn trim_drops_a_torn_final_event() {
-        // Cut mid-second-event: only the first complete event survives.
-        let torn = format!("{}data: {{chunk", SSE);
-        assert_eq!(trim_partial_sse_tail(&torn), SSE);
-        // Only a torn event (no complete event yet): nothing survives.
-        assert_eq!(trim_partial_sse_tail("data: {partial"), "");
-    }
-
-    #[test]
-    fn partial_stream_salvages_deltas_received_before_the_cancel() {
+    fn a_cancelled_read_keeps_the_deltas_that_already_streamed() {
         // A single read delivers the whole (event-complete) stream while Esc
-        // lands: the read stops before any further chunk and the salvage
-        // parse keeps every event that already arrived.
+        // lands: the read stops before any further chunk, and every event that
+        // already arrived was pushed to the sink (a torn tail simply never
+        // reaches `finish`).
         let cancel = CancelToken::new();
         let reader = CancelOnRead {
             inner: ChunkedReader::new(SSE, SSE.len()),
             flip_on: 1,
             cancel: cancel.clone(),
         };
-        let ReadOutcome::Cancelled(partial) = read_body_interruptibly(reader, &cancel).unwrap()
-        else {
-            panic!("expected a cancel");
-        };
-        let partial = String::from_utf8_lossy(&partial).into_owned();
-        let trimmed = trim_partial_sse_tail(&partial);
-        let parsed = wire::parse_stream(trimmed).unwrap();
-        let text: String = parsed
-            .deltas
-            .iter()
-            .filter_map(|d| match d {
-                Delta::Text(t) => Some(t.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(text, "first second");
+        let mut framer = SseFramer::new();
+        let mut texts = String::new();
+        let end = read_stream_interruptibly(reader, &cancel, &mut |bytes| {
+            for event in framer.push(bytes) {
+                let parsed = wire::parse_event(&event)?.expect("not [DONE]");
+                for delta in parsed.deltas {
+                    if let Delta::Text(t) = delta {
+                        texts.push_str(&t);
+                    }
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(end, ReadEnd::Cancelled);
+        assert_eq!(texts, "first second");
+        // The tail is dropped, not flushed: a torn event must not be parsed.
+        assert!(framer.finish().is_empty());
     }
 
     // --- usage accumulation + live smoke (existing suite) ------------------
@@ -462,9 +675,12 @@ mod tests {
     fn live_chat_returns_text_and_done() {
         let (mut p, config) = provider_from_env().expect("env config");
         let msgs = vec![Message::text(Role::User, "Reply with exactly: pong")];
-        let deltas = p
-            .chat(&msgs, &[], &config, &CancelToken::new())
-            .expect("chat succeeds");
+        let mut deltas: Vec<Delta> = Vec::new();
+        p.chat(&msgs, &[], &config, &CancelToken::new(), &mut |d| {
+            deltas.push(d);
+            Ok(())
+        })
+        .expect("chat succeeds");
         assert!(
             deltas
                 .iter()
@@ -498,9 +714,15 @@ mod tests {
             Role::User,
             "What is the weather in Beijing? Use the get_weather tool.",
         )];
-        let deltas = p
-            .chat(&msgs, &[tool], &config, &CancelToken::new())
+        let deltas = {
+            let mut collected: Vec<Delta> = Vec::new();
+            p.chat(&msgs, &[tool], &config, &CancelToken::new(), &mut |d| {
+                collected.push(d);
+                Ok(())
+            })
             .expect("chat succeeds");
+            collected
+        };
         assert!(
             deltas
                 .iter()

@@ -89,7 +89,8 @@ narrowing of the "bytes differ only by the mark" wording from the originating sp
 - `ProviderConfig` is the sole provider-setting carrier; `RunConfig` is asserted (by test and by
   convention) to hold runtime behavior only.
 - `Provider::chat` takes four arguments and the provider is stateless; every fake provider in the
-  test suite shows the resolved config reaching the seam.
+  test suite shows the resolved config reaching the seam. *(The count is now five — ADR-0019 adds the
+  delta sink; the config still crosses the seam exactly as decided here.)*
 - Cache-off request bytes are byte-identical to the pre-cache client; cache-on bytes are array-form
   throughout with marks on the system message and the last cache-able conversation message.
 - The mark placement strategy is a provider implementation detail: a future provider may place marks

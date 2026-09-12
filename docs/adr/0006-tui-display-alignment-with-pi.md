@@ -122,7 +122,10 @@ Bailian provider replaces the whole-body `resp.text()` with a chunked
 `read_body_interruptibly` (checks the token between chunks, reports `Cancelled` with the
 partial body, and the provider salvages whatever parseable deltas already arrived) — a
 flowing stream reacts within one socket chunk, while a silent server stays bounded by the
-300s client timeout (blocking reqwest exposes no per-read timeout). The only unbounded
+300s client timeout (blocking reqwest exposes no per-read timeout). *(Superseded by
+ADR-0019: the read is now framed and parsed incrementally, so there is no partial body to
+salvage — the complete events already reached the caller's sink and a cancel just drops the
+torn tail. The cancel contract described here still holds.)* The only unbounded
 tool, `bash`, runs cancellable variants (`bash_tool_with_cancel` /
 `build_tools_with_cancel`, used by the TUI): the `sh -c` child is spawned in its own
 process group, polled every ~50ms against the token, and the whole group is SIGKILLed on

@@ -293,23 +293,40 @@ impl<'a> AgentRunner<'a> {
             let turn = iterations;
             on_event_call(&mut self.on_event, AgentEvent::Turn { turn })?;
 
-            let deltas = match provider.chat(
+            // Deltas are surfaced as the provider produces them (ADR-0019):
+            // the sink emits each one the moment the provider parses it off
+            // the wire, and the same list is what `assemble` turns into the
+            // assistant message below — nothing is rendered twice.
+            let mut deltas: Vec<Delta> = Vec::new();
+            // A subscription failure is fatal even when it coincides with a
+            // cancel: this flag keeps it from being swallowed as a silent
+            // cancelled stop (a broken frontend must surface its error).
+            let mut sink_failed = false;
+            let result = provider.chat(
                 &convert(system, &messages),
                 &tool_specs,
                 self.provider_config,
                 self.cancel,
-            ) {
-                Ok(deltas) => deltas,
+                &mut |delta: Delta| {
+                    if let Err(e) =
+                        on_event_call(&mut self.on_event, AgentEvent::Stream(delta.clone()))
+                    {
+                        sink_failed = true;
+                        return Err(e);
+                    }
+                    deltas.push(delta);
+                    Ok(())
+                },
+            );
+            match result {
+                Ok(()) => {}
                 // A provider error that landed together with a cancel (its
                 // interruptible read aborted) is a silent cancelled stop, not
                 // an error.
-                Err(_) if self.cancel.is_cancelled() => break 'run StopReason::Cancelled,
+                Err(_) if self.cancel.is_cancelled() && !sink_failed => {
+                    break 'run StopReason::Cancelled;
+                }
                 Err(e) => return Err(e),
-            };
-            // Anything the provider returned was emitted live during the
-            // request; stream it out as it arrived.
-            for d in &deltas {
-                on_event_call(&mut self.on_event, AgentEvent::Stream(d.clone()))?;
             }
             // A cancel that landed during the request discards the half
             // message: the streamed deltas stay on the transcript, but no
@@ -643,7 +660,8 @@ mod tests {
             _tools: &[ToolSpec],
             _config: &ProviderConfig,
             _cancel: &CancelToken,
-        ) -> Result<Vec<Delta>, String> {
+            on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
+        ) -> Result<(), String> {
             self.calls += 1;
             if let (Some(cancel), Some(n)) = (&self.cancel, self.cancel_on_call)
                 && self.calls == n
@@ -651,7 +669,12 @@ mod tests {
                 cancel.cancel();
             }
             let d = self.script.get(self.calls - 1).cloned().unwrap_or_default();
-            Ok(d)
+            // A scripted provider mirrors the live one (ADR-0019): deltas go
+            // through the sink, in order, as the request produces them.
+            for delta in d {
+                on_delta(delta)?;
+            }
+            Ok(())
         }
     }
 
@@ -939,6 +962,66 @@ mod tests {
     }
 
     #[test]
+    fn deltas_reach_the_sink_before_the_provider_call_returns() {
+        // ADR-0019: the provider pushes deltas into the runner's sink while its
+        // request is still open, so a frontend renders a partial answer instead
+        // of receiving the whole batch after the body ends. The fake sleeps
+        // after its first delta and only then reports the request as over: the
+        // sink must already have seen that delta.
+        struct SlowProvider {
+            returned: Arc<AtomicBool>,
+        }
+        impl Provider for SlowProvider {
+            fn chat(
+                &mut self,
+                _m: &[Message],
+                _t: &[ToolSpec],
+                _cfg: &ProviderConfig,
+                _c: &CancelToken,
+                on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
+            ) -> Result<(), String> {
+                on_delta(t("half "))?;
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                self.returned.store(true, Ordering::SeqCst);
+                on_delta(t("answer"))?;
+                on_delta(done_stop())
+            }
+        }
+
+        let returned = Arc::new(AtomicBool::new(false));
+        let mut provider = SlowProvider {
+            returned: returned.clone(),
+        };
+        let config = ProviderConfig::new("test-key", "https://example.invalid/v1", "test-model");
+        let cancel = CancelToken::new();
+        let tools: [Tool; 0] = [];
+        // `(fragment, had the provider returned yet?)` per streamed delta.
+        let mut seen: Vec<(String, bool)> = Vec::new();
+        {
+            let mut sink = |e: AgentEvent| {
+                if let AgentEvent::Stream(Delta::Text(text)) = &e {
+                    seen.push((text.clone(), returned.load(Ordering::SeqCst)));
+                }
+                Ok(())
+            };
+            let mut runner =
+                AgentRunner::new(&tools, RunConfig::default(), &config, &cancel, &mut sink);
+            runner
+                .run(
+                    &mut provider,
+                    &Message::text(Role::System, "sys"),
+                    vec![AgentMessage::text(Role::User, "hi")],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            seen,
+            vec![("half ".to_string(), false), ("answer".to_string(), true)],
+            "the first fragment must reach the sink before `chat` returns"
+        );
+    }
+
+    #[test]
     fn tool_events_carry_the_tool_call_id() {
         // ToolStart/ToolResult must carry the call's id so renderers can pair
         // them even when the same tool is called several times in one batch
@@ -1212,7 +1295,8 @@ mod tests {
                 _t: &[ToolSpec],
                 _cfg: &ProviderConfig,
                 _c: &CancelToken,
-            ) -> Result<Vec<Delta>, String> {
+                _on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
+            ) -> Result<(), String> {
                 Err("provider exploded".to_string())
             }
         }
@@ -1314,7 +1398,8 @@ mod tests {
                 _t: &[ToolSpec],
                 _cfg: &ProviderConfig,
                 _c: &CancelToken,
-            ) -> Result<Vec<Delta>, String> {
+                _on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
+            ) -> Result<(), String> {
                 Err("request cancelled".to_string())
             }
         }
@@ -2048,7 +2133,8 @@ mod tests {
                 _t: &[ToolSpec],
                 _cfg: &ProviderConfig,
                 _c: &CancelToken,
-            ) -> Result<Vec<Delta>, String> {
+                _on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
+            ) -> Result<(), String> {
                 Err("boom".to_string())
             }
         }

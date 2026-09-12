@@ -50,9 +50,10 @@ cargo workspace，六个 crate，唯一二进制 `slimcode`：
 
 - **HTTP**：`reqwest 0.13` blocking（features `json` + `blocking` + `rustls`，`default-features=false`）。
   `Provider` trait 是同步 seam，真实阻塞边界收在 provider 内部，不引入 tokio；ticket 02 文档中 `stream` feature
-  仅 async 路径需要。body 按 chunk 可中断读取（ticket 07：`read_body_interruptibly` 每块检查 `CancelToken`，
-  中途取消返回 `Cancelled(partial)`，provider 对已收到的完整 SSE 事件做 salvage 解析，把已流式内容交回 runner；
-  阻塞 reqwest 没有 per-read 超时——静默服务器仍由客户端 300s 整体超时兜底）；
+  仅 async 路径需要。响应体按 chunk **增量**读取并**增量**解析（ADR-0019：`read_stream_interruptibly` 每块检查
+  `CancelToken`，`wire::SseFramer` 把每个完整 SSE 事件一凑齐就交给 `on_delta`，因此前端在服务端仍在生成时就能
+  渲染半截答案）；读取中途取消则直接丢弃残缺尾巴（已流出的 deltas 保留、不记 usage），不再有整段 body 的 salvage
+  重解析。阻塞 reqwest 没有 per-read 超时——静默服务器仍由客户端 300s 整体超时兜底；
 - **请求**：`stream: true` + `stream_options.include_usage: true`（ticket 05 实测 usage 只在带 `choices: []` 的最终 chunk 出现）；
   工具用 `role: tool` 消息回传结果；声明了 tools 时额外带 `parallel_tool_calls: true`
   （默认开启，见 ADR-0010），`tools` 为空时该字段省略、请求字节与旧版一致；
@@ -86,7 +87,7 @@ cargo workspace，六个 crate，唯一二进制 `slimcode`：
   `ProviderConfig`；ai 不提供 `from_env`、不读 env/文件，因此本 crate 无任何 slimcode 依赖
   （含 `[dev-dependencies]`：两个 live 冒烟测试自己读 env 名、用本 crate 的默认值）；
 - **无状态 provider + config seam**（cache-last-message-mark）：`BailianProvider::new()` 只构建 HTTP client，
-  不接收配置；`Provider::chat(messages, tools, config: &ProviderConfig, cancel)` 每次调用从入参读取
+  不接收配置；`Provider::chat(messages, tools, config: &ProviderConfig, cancel, on_delta)` 每次调用从入参读取
   model / base URL / api key / cache（ADR-0016）。同一实例可配不同 config 复用（测试、未来配置切换）；
   两个 `#[ignore]` 冒烟测试（文本 + 工具调用）需真实 key + 网络，默认跳过，一次性手动验证已通过。
 
@@ -134,8 +135,9 @@ provider config seam 见 ADR-0016，hook seam 见 ADR-0015）。折入自 ticket
   检查，已 push 的结果保留、未应用的不追加。`RunConfig.parallel_tools` 默认 `true`，
   串行路径保留给显式 `parallel_tools: false` 的场景（串行语义测试）；`Tool.run` 约束为 `Fn + Send + Sync`
   （工作线程共享同一组工具只读调用）；
-- 工具对 provider 只是 schema：`Provider::chat(&[Message], &[ToolSpec], &ProviderConfig, &CancelToken)`
-  （ADR-0011 D1，config 入参见 ADR-0016）；
+- 工具对 provider 只是 schema：`Provider::chat(&[Message], &[ToolSpec], &ProviderConfig, &CancelToken,
+  &mut dyn FnMut(Delta) -> Result<(), String>)`
+  （ADR-0011 D1，config 入参见 ADR-0016，delta sink 见 ADR-0019）；
   `core::Tool { spec: ToolSpec, run }` 是带执行闭包的包装，`Tool::new(name, description, parameters, run)`
   照旧；loop 在每次 run 开头构建一次 `Vec<ToolSpec>`（非每请求）并交给所有 `chat` 调用；
 - 工具事件（`ToolStart`/`ToolResult`）携带 `tool_call_id`，渲染端据此配对同名工具的多次调用；
@@ -144,7 +146,9 @@ provider config seam 见 ADR-0016，hook seam 见 ADR-0015）。折入自 ticket
 - 工具报错以 `Error: …` 前缀作 `role: tool` 内容进 history，模型自然恢复；
 - `Provider` trait 归 `slimcode-ai` 拥有（同步、无 async 依赖，真实 provider 内部处理阻塞边界），
   `core` 只 re-export 它的 seam 类型；运行时只依赖 `ai`（ADR-0011 D1/D4）；
-- 流式 delta（`Reasoning`/`Text`/`ToolCallStart`/`ToolCallArgs`/`Done`）镜像 ticket 05 实测 wire 形状，`assemble` 负责拼接。
+- 流式 delta（`Reasoning`/`Text`/`ToolCallStart`/`ToolCallArgs`/`Done`）镜像 ticket 05 实测 wire 形状，`assemble` 负责拼接；
+  delta **不经过返回值**：provider 在收到时即时 push 进 `on_delta` sink（ADR-0019），runner 边转发
+  `AgentEvent::Stream` 边累积同一份列表交给 `assemble`，因此只有一次投递、不会重复渲染。
 
 ### crates/commands 命令注册表（`slimcode-commands`）
 

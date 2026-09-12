@@ -425,20 +425,82 @@ pub fn tool_to_wire(t: &ToolSpec) -> WireTool {
 /// Split an SSE body into its `data:` event payloads (joined across multi-line
 /// `data:` sequences). `[DONE]` markers are included verbatim.
 pub fn parse_sse_events(body: &str) -> Vec<String> {
-    let mut events = Vec::new();
-    let mut cur: Vec<String> = Vec::new();
-    for line in body.lines() {
+    let mut framer = SseFramer::new();
+    let mut events = framer.push(body.as_bytes());
+    events.extend(framer.finish());
+    events
+}
+
+/// The incremental half of the same framing rules (ADR-0019): feed the raw
+/// bytes as they come off the socket and get each event's payload back the
+/// moment its terminating blank line arrives.
+///
+/// This is what lets the provider hand its caller deltas live instead of after
+/// the body ends: a chunk boundary inside a line, inside a UTF-8 character or
+/// inside an event is buffered, never emitted early and never lost. `finish`
+/// flushes the tail at EOF (an unterminated final line still counts, matching
+/// [`parse_sse_events`]); a cancelled read simply drops it, which is what makes
+/// a torn event disappear without the old trim-the-body step.
+#[derive(Debug, Default)]
+pub struct SseFramer {
+    /// Bytes received but not yet terminated by a newline.
+    pending: Vec<u8>,
+    /// The `data:` lines of the event currently being assembled.
+    cur: Vec<String>,
+}
+
+impl SseFramer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one wire chunk; returns the events it completed, in order.
+    pub fn push(&mut self, chunk: &[u8]) -> Vec<String> {
+        self.pending.extend_from_slice(chunk);
+        let mut events = Vec::new();
+        while let Some(nl) = self.pending.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = self.pending.drain(..=nl).collect();
+            self.line(&decode_line(line, true), &mut events);
+        }
+        events
+    }
+
+    /// Flush at EOF: the unterminated final line, then any event still open
+    /// (a stream whose last event had no trailing blank line).
+    pub fn finish(&mut self) -> Vec<String> {
+        let mut events = Vec::new();
+        if !self.pending.is_empty() {
+            let line = std::mem::take(&mut self.pending);
+            self.line(&decode_line(line, false), &mut events);
+        }
+        if !self.cur.is_empty() {
+            events.push(std::mem::take(&mut self.cur).join("\n"));
+        }
+        events
+    }
+
+    /// One complete line: `data:` accumulates, a blank line closes the event.
+    fn line(&mut self, line: &str, events: &mut Vec<String>) {
         if let Some(data) = line.strip_prefix("data:") {
-            cur.push(data.trim_start().to_string());
-        } else if line.trim().is_empty() && !cur.is_empty() {
-            events.push(cur.join("\n"));
-            cur.clear();
+            self.cur.push(data.trim_start().to_string());
+        } else if line.trim().is_empty() && !self.cur.is_empty() {
+            events.push(std::mem::take(&mut self.cur).join("\n"));
         }
     }
-    if !cur.is_empty() {
-        events.push(cur.join("\n"));
+}
+
+/// Decode one received line. A `terminated` line carries its `\n` (and maybe a
+/// `\r` before it); the unterminated tail flushed by `finish` carries neither.
+/// Invalid UTF-8 inside a line is replaced rather than fatal, matching the
+/// whole-body parser's lossy handling.
+fn decode_line(mut line: Vec<u8>, terminated: bool) -> String {
+    if terminated {
+        line.pop(); // the `\n`
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
     }
-    events
+    String::from_utf8_lossy(&line).into_owned()
 }
 
 /// Map one wire chunk's choices to agent deltas. Empty strings and nulls are
@@ -495,20 +557,40 @@ pub struct ParsedStream {
     pub usage: Option<TokenUsage>,
 }
 
+/// One SSE event's payload: the deltas it carried plus the usage it reported
+/// (only the final chunk carries usage). `[DONE]` yields `None`.
+pub struct ParsedEvent {
+    pub deltas: Vec<Delta>,
+    pub usage: Option<TokenUsage>,
+}
+
+/// Parse one SSE event payload (ADR-0019). Shared by the whole-body
+/// [`parse_stream`] and the provider's live read path, so a single event is
+/// interpreted exactly one way however it reached us.
+pub fn parse_event(event: &str) -> Result<Option<ParsedEvent>, String> {
+    if event == "[DONE]" {
+        return Ok(None);
+    }
+    let chunk: WireChunk =
+        serde_json::from_str(event).map_err(|e| format!("bad chunk: {e}: {event}"))?;
+    Ok(Some(ParsedEvent {
+        deltas: chunk_to_deltas(&chunk),
+        usage: chunk.usage,
+    }))
+}
+
 /// Parse a full SSE stream body into an ordered list of agent deltas.
 pub fn parse_stream(body: &str) -> Result<ParsedStream, String> {
     let mut deltas = Vec::new();
     let mut usage = None;
     for ev in parse_sse_events(body) {
-        if ev == "[DONE]" {
+        let Some(parsed) = parse_event(&ev)? else {
             continue;
+        };
+        deltas.extend(parsed.deltas);
+        if parsed.usage.is_some() {
+            usage = parsed.usage;
         }
-        let chunk: WireChunk =
-            serde_json::from_str(&ev).map_err(|e| format!("bad chunk: {e}: {ev}"))?;
-        if chunk.usage.is_some() {
-            usage = chunk.usage;
-        }
-        deltas.extend(chunk_to_deltas(&chunk));
     }
     Ok(ParsedStream { deltas, usage })
 }
@@ -551,6 +633,75 @@ mod tests {
         let evs = parse_sse_events(TEXT_STREAM);
         assert_eq!(evs.len(), 4);
         assert_eq!(evs[3], "[DONE]");
+    }
+
+    // --- SseFramer: the incremental half of the same framing rules ---------
+
+    /// Feed `body` in fixed-size byte chunks, collecting every event as the
+    /// framer completes it (the live-read path).
+    fn frame_in_chunks(body: &str, chunk: usize) -> Vec<String> {
+        let mut framer = SseFramer::new();
+        let mut evs = Vec::new();
+        for piece in body.as_bytes().chunks(chunk) {
+            evs.extend(framer.push(piece));
+        }
+        evs.extend(framer.finish());
+        evs
+    }
+
+    #[test]
+    fn framer_matches_whole_body_parsing_for_every_chunk_size() {
+        // The incremental framer is the live path; `parse_sse_events` is the
+        // whole-body path tests already pin. Both must agree byte for byte,
+        // whatever the socket chunks look like (including 1-byte chunks).
+        let expected = parse_sse_events(TEXT_STREAM);
+        for chunk in 1..=TEXT_STREAM.len() {
+            assert_eq!(
+                frame_in_chunks(TEXT_STREAM, chunk),
+                expected,
+                "chunk={chunk}"
+            );
+        }
+    }
+
+    #[test]
+    fn framer_emits_an_event_only_after_its_blank_line_arrives() {
+        let mut framer = SseFramer::new();
+        // A complete event arrives: it is emitted immediately.
+        assert_eq!(framer.push(b"data: one\n\n"), vec!["one".to_string()]);
+        // A torn event stays pending — nothing is emitted before its blank
+        // line lands, which is what keeps a partial frame off the wire.
+        assert!(framer.push(b"data: tw").is_empty());
+        assert!(framer.push(b"o\n").is_empty());
+        assert_eq!(framer.push(b"\n"), vec!["two".to_string()]);
+        assert!(framer.finish().is_empty());
+    }
+
+    #[test]
+    fn framer_joins_multi_line_data_and_survives_split_utf8() {
+        let body = "data: ⇢ part\ndata: two\n\ndata: 終わり\n\n";
+        for chunk in 1..=4 {
+            assert_eq!(
+                frame_in_chunks(body, chunk),
+                vec!["⇢ part\ntwo".to_string(), "終わり".to_string()],
+                "chunk={chunk}"
+            );
+        }
+    }
+
+    #[test]
+    fn framer_finishes_a_final_event_without_a_blank_line() {
+        let mut framer = SseFramer::new();
+        assert!(framer.push(b"data: tail").is_empty());
+        assert_eq!(framer.finish(), vec!["tail".to_string()]);
+        assert!(framer.finish().is_empty());
+    }
+
+    #[test]
+    fn framer_ignores_blank_lines_with_no_data_accumulated() {
+        let mut framer = SseFramer::new();
+        assert!(framer.push(b"\n\n: comment\n\n").is_empty());
+        assert_eq!(framer.push(b"data: x\n\n"), vec!["x".to_string()]);
     }
 
     #[test]

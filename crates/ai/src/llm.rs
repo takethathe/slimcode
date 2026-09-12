@@ -100,7 +100,14 @@ impl ToolSpec {
 /// advertised as schemas only.
 pub trait Provider {
     /// One turn of generation over `messages` with `tools` available.
-    /// Returns the raw delta stream for this turn.
+    ///
+    /// Deltas are **pushed into `on_delta` as they come off the wire**
+    /// (ADR-0019): the provider frames its response incrementally and hands
+    /// each delta over the moment it is complete, so a frontend renders a
+    /// partial answer while the endpoint is still generating it. The sink's
+    /// `Err` aborts the request and propagates verbatim (a frontend that can no
+    /// longer render must not keep burning tokens). Nothing is delivered twice:
+    /// whoever assembles the whole turn collects what the sink received.
     ///
     /// `config` carries the provider-owned settings (model, base URL, API key,
     /// the explicit-cache flag) across the seam for this call (ADR-0016): a
@@ -109,14 +116,16 @@ pub trait Provider {
     ///
     /// `cancel` lets an in-flight request interrupt itself: the provider
     /// checks it between body chunks and aborts the read as soon as it is
-    /// set (returning an error the runner maps to a silent cancelled stop).
+    /// set, keeping the deltas that already streamed out (the caller sees the
+    /// token set and ends the turn as cancelled).
     fn chat(
         &mut self,
         messages: &[Message],
         tools: &[ToolSpec],
         config: &ProviderConfig,
         cancel: &CancelToken,
-    ) -> Result<Vec<Delta>, String>;
+        on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
+    ) -> Result<(), String>;
 
     /// Cumulative usage across every request this provider has run.
     ///
@@ -138,8 +147,9 @@ impl<T: Provider + ?Sized> Provider for Box<T> {
         tools: &[ToolSpec],
         config: &ProviderConfig,
         cancel: &CancelToken,
-    ) -> Result<Vec<Delta>, String> {
-        (**self).chat(messages, tools, config, cancel)
+        on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
+    ) -> Result<(), String> {
+        (**self).chat(messages, tools, config, cancel, on_delta)
     }
 
     fn total_usage(&self) -> TokenUsage {

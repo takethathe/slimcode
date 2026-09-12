@@ -143,10 +143,16 @@ mod tests {
             _tools: &[ToolSpec],
             _config: &ProviderConfig,
             _cancel: &CancelToken,
-        ) -> Result<Vec<Delta>, String> {
+            on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
+        ) -> Result<(), String> {
             let d = self.script.get(self.calls).cloned().unwrap_or_default();
             self.calls += 1;
-            Ok(d)
+            // A scripted provider mirrors the live one (ADR-0019): deltas go
+            // through the sink, in order, as the request produces them.
+            for delta in d {
+                on_delta(delta)?;
+            }
+            Ok(())
         }
     }
 
@@ -512,9 +518,11 @@ mod tests {
                 _t: &[ToolSpec],
                 config: &ProviderConfig,
                 _c: &CancelToken,
-            ) -> Result<Vec<Delta>, String> {
+                on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
+            ) -> Result<(), String> {
                 self.seen = Some((config.model.clone(), config.base_url.clone(), config.cache));
-                Ok(vec![text("ok"), done_stop()])
+                on_delta(text("ok"))?;
+                on_delta(done_stop())
             }
         }
         let mut provider = CapturingProvider { seen: None };
@@ -553,7 +561,8 @@ mod tests {
                 _t: &[ToolSpec],
                 _cfg: &ProviderConfig,
                 _c: &CancelToken,
-            ) -> Result<Vec<Delta>, String> {
+                _on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
+            ) -> Result<(), String> {
                 Err("provider exploded".to_string())
             }
         }
@@ -733,12 +742,13 @@ mod tests {
             t: &[ToolSpec],
             config: &ProviderConfig,
             _c: &CancelToken,
-        ) -> Result<Vec<Delta>, String> {
+            on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
+        ) -> Result<(), String> {
             self.calls += 1;
             if self.calls == 1 {
                 self.cancel.cancel();
             }
-            self.inner.chat(m, t, config, &self.cancel)
+            self.inner.chat(m, t, config, &self.cancel, on_delta)
         }
     }
 }

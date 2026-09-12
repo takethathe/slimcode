@@ -866,14 +866,20 @@ mod tests {
             _tools: &[slimcode_core::agent::ToolSpec],
             _config: &ProviderConfig,
             _cancel: &CancelToken,
-        ) -> Result<Vec<Delta>, String> {
+            on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
+        ) -> Result<(), String> {
             if self.fail_at == Some(self.calls) {
                 return Err("boom".to_string());
             }
             let batch = self.script.get(self.calls).cloned().unwrap_or_default();
             self.calls += 1;
             self.usage = self.usage.saturating_add(&self.per_call);
-            Ok(batch)
+            // A scripted provider mirrors the live one (ADR-0019): deltas go
+            // through the sink, in order, as the request produces them.
+            for delta in batch {
+                on_delta(delta)?;
+            }
+            Ok(())
         }
 
         fn total_usage(&self) -> TokenUsage {
