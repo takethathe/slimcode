@@ -32,7 +32,7 @@ cargo workspace，六个 crate，唯一二进制 `slimcode`：
 | crate | 包名 | 职责（对外界面） | 依赖 |
 | --- | --- | --- | --- |
 | `crates/ai` | `slimcode-ai` | LLM 层：`Message`（wire 消息）/ `Provider` / `ToolSpec` / `Delta` / `FinishReason` / `CancelToken` / `TokenUsage` / wire 模型 | 无 slimcode 依赖 |
-| `crates/core` | `slimcode-core` | agent 运行时：`AgentEvent` / `AgentRunner`（借用式 per-run 值：tools/cfg/cancel/事件订阅，`run(provider, system, messages)`，ADR-0015 加可选 hook 字段）/ `AgentMessage`(+`to_llm`) / `convert` / `Tool{spec,run}` / `RunConfig` / `StopReason` | → ai |
+| `crates/core` | `slimcode-core` | agent 运行时：`AgentEvent` / `AgentRunner`（借用式 per-run 值：tools/cfg/`&ProviderConfig`/cancel/事件订阅，`run(provider, system, messages)`，ADR-0015 加可选 hook 字段）/ `AgentMessage`(+`to_llm`) / `convert` / `Tool{spec,run}` / `RunConfig` / `StopReason` | → ai |
 | `crates/app` | `slimcode-app` | 前端无关应用层：`DisplayItem` / `map_event` / `Renderer` / `usage_summary` / `ContextBuilder`→`Context{system,messages}` / 会话与输入历史持久化 / skills / context_files / 七工具 / setup / `run_turn` | → ai, core, commands |
 | `crates/commands` | `slimcode-commands` | `/` 命令注册表 + fuzzy 预测（纯数据 + 纯函数，无 I/O） | 无 |
 | `crates/tui` | `slimcode-tui` | 终端图形库：`RenderItem` / `Effect` / `App`(new/apply/draw/handle_key) / `run(terminal, app, handler)` / `UiHandler` / 组件（theme/markdown/toolcall/footer/text/git） | **无 slimcode 依赖** |
@@ -56,11 +56,17 @@ cargo workspace，六个 crate，唯一二进制 `slimcode`：
 - **请求**：`stream: true` + `stream_options.include_usage: true`（ticket 05 实测 usage 只在带 `choices: []` 的最终 chunk 出现）；
   工具用 `role: tool` 消息回传结果；声明了 tools 时额外带 `parallel_tool_calls: true`
   （默认开启，见 ADR-0010），`tools` 为空时该字段省略、请求字节与旧版一致；
-- **显式上下文缓存**（llm-cache）：`BailianConfig.cache`（默认 `true`，`with_cache(bool)` 建造式 setter）。
-  开启时 system 消息的 `content` 序列化为单元素块数组
-  `[{"type":"text","text":"…","cache_control":{"type":"ephemeral"}}]`，把稳定前缀交给端点缓存；
-  关闭时字节与未开启缓存的客户端完全一致。`message_to_wire(m, cache)` 只对 system（且文本非空）加标记，
-  assistant 工具调用空 content、tool 必带 content、空文本省略等既有语义不变；
+- **显式上下文缓存**（llm-cache + cache-last-message-mark）：开关位于 `ProviderConfig.cache`
+  （默认 `true`，`with_cache(bool)` 建造式 setter，随 `chat` 跨 seam 传递，见 ADR-0016）。
+  开启时 system 消息与自尾部扫描到的最后一条「非空文本的 user/assistant/tool」消息都把 `content`
+  序列化为单元素块数组 `[{"type":"text","text":"…","cache_control":{"type":"ephemeral"}}]`，
+  让「system 前缀」与「完整对话前缀」都交给端点缓存；尾部空文本（assistant 工具调用 / 空 tool 结果）
+  跳过并向前找。百炼只在数组形态 content 上接受 `cache_control`，且按 content 块匹配前缀，因此开启缓存时
+  **所有非空文本消息一律用数组形态**（唯一差异是是否带 mark），message 从「末尾带 mark」变成「历史不带
+  mark」时字节除 mark 外不变、前缀匹配不破（ADR-0016 D6）。关闭缓存时所有消息回到旧的字符串形态，字节与未开启
+  缓存的客户端完全一致。`message_to_wire(m, cache)` 处理单条，公开的 `messages_to_wire(msgs, cache)`
+  负责尾部扫描并 mark 最后一条可缓存消息；assistant 工具调用空 content、tool 必带 content、空文本省略
+  等既有语义不变；工具定义不加 mark（`cache_control` 只加在 content）；
 - **usage 缓存统计**（llm-cache）：`TokenUsage` 新增可选嵌套 `prompt_tokens_details`
   （`cached_tokens` / `cache_creation_input_tokens`，缺省视为 0；整块缺省为 None），
   访问器 `cached_tokens()` / `cache_creation_tokens()` 缺省返回 0；`accumulate_usage` 把两个缓存字段
@@ -73,13 +79,16 @@ cargo workspace，六个 crate，唯一二进制 `slimcode`：
   - `prompt_tokens_details`：可选嵌套，缺省视为 0（未命中/未开缓存时端点可能不带该块）；其它
     `*_tokens_details` 等未知字段：直接忽略；
 - **tool_call 拼接**：首片段带 `id`/`name`（`arguments: ""`）→ `ToolCallStart`，续传只有 `index`+`arguments` → `ToolCallArgs`，按 index 拼接；
-- **配置**：`BailianConfig` 为纯 provider 数据（api key / base URL / model / cache，保留
+- **配置**：`ProviderConfig` 为纯 provider 数据（api key / base URL / model / cache，保留
   `chat_completions_url()`）。端点默认值（`DEFAULT_BASE_URL` / `DEFAULT_MODEL`）由本 crate 拥有，
   与 provider 放在一起；四层优先级解析与 env 变量名的唯一 owner 是 `slimcode-app::config`
   （frontend overrides > env > `config.toml` > 默认值），它 re-export 这两个默认值再产出
-  `BailianConfig`；ai 不提供 `from_env`、不读 env/文件，因此本 crate 无任何 slimcode 依赖
+  `ProviderConfig`；ai 不提供 `from_env`、不读 env/文件，因此本 crate 无任何 slimcode 依赖
   （含 `[dev-dependencies]`：两个 live 冒烟测试自己读 env 名、用本 crate 的默认值）；
-- 两个 `#[ignore]` 冒烟测试（文本 + 工具调用）需真实 key + 网络，默认跳过，一次性手动验证已通过。
+- **无状态 provider + config seam**（cache-last-message-mark）：`BailianProvider::new()` 只构建 HTTP client，
+  不接收配置；`Provider::chat(messages, tools, config: &ProviderConfig, cancel)` 每次调用从入参读取
+  model / base URL / api key / cache（ADR-0016）。同一实例可配不同 config 复用（测试、未来配置切换）；
+  两个 `#[ignore]` 冒烟测试（文本 + 工具调用）需真实 key + 网络，默认跳过，一次性手动验证已通过。
 
 ### crates/core 工具
 
@@ -110,9 +119,9 @@ tool_call_id，已不含日志专用字段），`core` 拥有会话单元 `Agent
 
 ### crates/core 运行时循环（`core`）
 
-循环是一个值：`AgentRunner`（借用式 per-run：tools / `RunConfig` / `CancelToken` / 事件订阅，
+循环是一个值：`AgentRunner`（借用式 per-run：tools / `RunConfig` / `&ProviderConfig` / `CancelToken` / 事件订阅，
 `run(provider, system, messages)` 驱动，返回更新后的 history 与 stop reason；ADR-0011 D1，
-hook seam 见 ADR-0015）。折入自 ticket 04 原型，决策：
+provider config seam 见 ADR-0016，hook seam 见 ADR-0015）。折入自 ticket 04 原型，决策：
 
 - 循环：模型带 `tool_calls` 的响应 → 执行工具 → 追加 `role: tool` 结果 → 循环，直到模型不再调工具；
 - 停止：无 tool_calls → `Completed`（coding agent 无迭代上限，何时结束由模型决定）；
@@ -125,7 +134,8 @@ hook seam 见 ADR-0015）。折入自 ticket 04 原型，决策：
   检查，已 push 的结果保留、未应用的不追加。`RunConfig.parallel_tools` 默认 `true`，
   串行路径保留给显式 `parallel_tools: false` 的场景（串行语义测试）；`Tool.run` 约束为 `Fn + Send + Sync`
   （工作线程共享同一组工具只读调用）；
-- 工具对 provider 只是 schema：`Provider::chat(&[Message], &[ToolSpec], &CancelToken)`（ADR-0011 D1）；
+- 工具对 provider 只是 schema：`Provider::chat(&[Message], &[ToolSpec], &ProviderConfig, &CancelToken)`
+  （ADR-0011 D1，config 入参见 ADR-0016）；
   `core::Tool { spec: ToolSpec, run }` 是带执行闭包的包装，`Tool::new(name, description, parameters, run)`
   照旧；loop 在每次 run 开头构建一次 `Vec<ToolSpec>`（非每请求）并交给所有 `chat` 调用；
 - 工具事件（`ToolStart`/`ToolResult`）携带 `tool_call_id`，渲染端据此配对同名工具的多次调用；
@@ -169,7 +179,7 @@ hook seam 见 ADR-0015）。折入自 ticket 04 原型，决策：
   `SLIMCODE_AI_CACHE`（`true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`，大小写不敏感，非法值启动报错
   指明变量名）> `config.toml [ai] cache` > 默认 `true`（默认开启）；与 `base_url`/`model`
   逐项独立回落；
-  `resolve(file_toml, env, overrides)` 纯解析核心（返回 `(BailianConfig, ApiKeySource)`）
+  `resolve(file_toml, env, overrides)` 纯解析核心（返回 `(ProviderConfig, ApiKeySource)`）
   + `load_app_config(overrides)` I/O 包装，产出 `AppConfig { provider, api_key_source,
   sessions_max_bytes }`；provider 携带 `ApiKeySource`（Cli | Env | File）标记；API key 三来源
   优先级 `--api-key`（`Overrides.api_key`）> `DASHSCOPE_API_KEY` > `[ai] api_key`
@@ -262,14 +272,15 @@ hook seam 见 ADR-0015）。折入自 ticket 04 原型，决策：
   与缓存命中百分比）的共享措辞，cli 汇总与 TUI `/usage` 都消费它；
   `Renderer` trait 消费 `DisplayItem`，每个前端只实现自己的渲染器（cli 的文本行、
   tui 的 widget 状态）。
-- `runner`：共享 turn runner `run_turn(provider, tools, context: Context, &RunConfig,
-  &mut dyn Renderer, &mut dyn FnMut(&AgentMessage))
+- `runner`：共享 turn runner `run_turn(provider, tools, context: Context, &RunConfig, &ProviderConfig,
+  &CancelToken, &mut dyn Renderer, &mut dyn FnMut(&AgentMessage))
   -> Result<(Vec<AgentMessage>, StopReason), String>`（ADR-0012 D3 改为收 `Context`，ADR-0009 D5 加
-  `on_message` 回调与 `StopReason` 返回值）：逐事件流式回调渲染器，每条进历史的消息（assistant 回复、
+  `on_message` 回调与 `StopReason` 返回值，ADR-0016 加 `&ProviderConfig`）：逐事件流式回调渲染器，每条进历史的消息（assistant 回复、
   每个工具结果）同步回调一次 sink（TUI 借此实时追加日志），返回更新后的消息历史与
   终止原因（`Completed`/`Cancelled`）。cli 与 tui 共用同一 turn 循环，行为不漂移。
-- `setup`：`setup(cwd, config) -> (BailianProvider, Vec<Tool>)` 共享 seam，cli 与
-  tui 用同一套 provider + 工具构造，两端不会各自实现而漂移。
+- `setup`：`setup(cwd) -> (BailianProvider, Vec<Tool>)` 共享 seam，cli 与
+  tui 用同一套 provider + 工具构造，两端不会各自实现而漂移；provider 无状态（ADR-0016），
+  故构造不再收 config，`&ProviderConfig` 由各前端在每轮 turn 传入。
 
 ### crates/tui 终端库（`slimcode-tui`）
 

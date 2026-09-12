@@ -18,7 +18,7 @@
 //! crate re-parses the same env variables and defaults.
 
 use serde::Deserialize;
-use slimcode_ai::BailianConfig;
+use slimcode_ai::ProviderConfig;
 
 // The endpoint defaults are owned by the provider layer (`slimcode-ai`); the
 // app layer owns the resolution order and the env var names, and re-exports
@@ -139,7 +139,7 @@ fn resolve(
     file_toml: Option<&str>,
     env: &dyn Fn(&str) -> Option<String>,
     overrides: &Overrides,
-) -> Result<(BailianConfig, ApiKeySource), String> {
+) -> Result<(ProviderConfig, ApiKeySource), String> {
     let file = match file_toml {
         Some(s) if !s.trim().is_empty() => {
             let parsed: FileConfig = toml::from_str(s).map_err(|e| format!("config.toml: {e}"))?;
@@ -209,7 +209,7 @@ fn resolve(
     };
 
     Ok((
-        BailianConfig::new(api_key, base_url, model).with_cache(cache),
+        ProviderConfig::new(api_key, base_url, model).with_cache(cache),
         api_key_source,
     ))
 }
@@ -235,7 +235,7 @@ pub fn resolve_max_mb(file_toml: Option<&str>) -> u64 {
 /// The resolved, non-secret application settings handed to frontends: the AI
 /// provider config plus the session storage quota in bytes.
 pub struct AppConfig {
-    pub provider: BailianConfig,
+    pub provider: ProviderConfig,
     pub api_key_source: ApiKeySource,
     pub sessions_max_bytes: u64,
 }
@@ -350,7 +350,7 @@ mod tests {
         file: Option<&str>,
         env: &dyn Fn(&str) -> Option<String>,
         overrides: &Overrides,
-    ) -> BailianConfig {
+    ) -> ProviderConfig {
         resolve(file, env, overrides).unwrap().0
     }
 

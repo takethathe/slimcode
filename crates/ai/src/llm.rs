@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::Value;
 
+use crate::config::ProviderConfig;
 use crate::message::Message;
 use crate::wire::TokenUsage;
 
@@ -101,6 +102,11 @@ pub trait Provider {
     /// One turn of generation over `messages` with `tools` available.
     /// Returns the raw delta stream for this turn.
     ///
+    /// `config` carries the provider-owned settings (model, base URL, API key,
+    /// the explicit-cache flag) across the seam for this call (ADR-0016): a
+    /// provider instance is stateless and reusable with different configs, so
+    /// the same instance can serve tests and live runs.
+    ///
     /// `cancel` lets an in-flight request interrupt itself: the provider
     /// checks it between body chunks and aborts the read as soon as it is
     /// set (returning an error the runner maps to a silent cancelled stop).
@@ -108,6 +114,7 @@ pub trait Provider {
         &mut self,
         messages: &[Message],
         tools: &[ToolSpec],
+        config: &ProviderConfig,
         cancel: &CancelToken,
     ) -> Result<Vec<Delta>, String>;
 
@@ -129,9 +136,10 @@ impl<T: Provider + ?Sized> Provider for Box<T> {
         &mut self,
         messages: &[Message],
         tools: &[ToolSpec],
+        config: &ProviderConfig,
         cancel: &CancelToken,
     ) -> Result<Vec<Delta>, String> {
-        (**self).chat(messages, tools, cancel)
+        (**self).chat(messages, tools, config, cancel)
     }
 
     fn total_usage(&self) -> TokenUsage {

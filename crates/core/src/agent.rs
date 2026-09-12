@@ -30,6 +30,7 @@ use std::collections::BTreeMap;
 
 // The LLM seam types are owned by `slimcode-ai` (ADR-0011 D1) and re-exported
 // here so callers can keep importing them from the runtime module.
+pub use slimcode_ai::config::ProviderConfig;
 pub use slimcode_ai::llm::{CancelToken, Delta, FinishReason, Provider, ToolSpec};
 
 /// A registered tool the agent can invoke: the schema the provider sees plus
@@ -220,6 +221,10 @@ pub struct AgentRunner<'a> {
     pub tools: &'a [Tool],
     /// The run's configuration (parallel vs serial tool dispatch).
     pub cfg: RunConfig,
+    /// The provider-owned settings handed to every `chat` call (ADR-0016): the
+    /// runner borrows the resolved config and passes it across the seam, so
+    /// the provider instance itself stays stateless.
+    pub provider_config: &'a ProviderConfig,
     /// The caller's cancellation handle.
     pub cancel: &'a CancelToken,
     /// The live event subscription.
@@ -232,12 +237,14 @@ impl<'a> AgentRunner<'a> {
     pub fn new(
         tools: &'a [Tool],
         cfg: RunConfig,
+        provider_config: &'a ProviderConfig,
         cancel: &'a CancelToken,
         on_event: EventSink<'a>,
     ) -> Self {
         Self {
             tools,
             cfg,
+            provider_config,
             cancel,
             on_event,
             hooks: RunHooks::default(),
@@ -286,8 +293,12 @@ impl<'a> AgentRunner<'a> {
             let turn = iterations;
             on_event_call(&mut self.on_event, AgentEvent::Turn { turn })?;
 
-            let deltas = match provider.chat(&convert(system, &messages), &tool_specs, self.cancel)
-            {
+            let deltas = match provider.chat(
+                &convert(system, &messages),
+                &tool_specs,
+                self.provider_config,
+                self.cancel,
+            ) {
                 Ok(deltas) => deltas,
                 // A provider error that landed together with a cancel (its
                 // interruptible read aborted) is a silent cancelled stop, not
@@ -630,6 +641,7 @@ mod tests {
             &mut self,
             _messages: &[Message],
             _tools: &[ToolSpec],
+            _config: &ProviderConfig,
             _cancel: &CancelToken,
         ) -> Result<Vec<Delta>, String> {
             self.calls += 1;
@@ -676,6 +688,9 @@ mod tests {
     /// helper returns). The caller's `hooks` is moved into the runner (left
     /// default after), so recorders inside the hooks stay inspectable via
     /// shared handles.
+    ///
+    /// The harness runs with a fixed test config: these loop tests exercise
+    /// the agent loop, not config resolution (that lives in `slimcode-app`).
     #[allow(clippy::too_many_arguments)] // a test harness bundling run context
     fn run_with_hooks_collect<P: Provider>(
         provider: &mut P,
@@ -687,11 +702,12 @@ mod tests {
         hooks: &mut RunHooks<'static>,
         events: &mut Vec<AgentEvent>,
     ) -> Result<(Vec<AgentMessage>, StopReason), String> {
+        let config = ProviderConfig::new("test-key", "https://example.invalid/v1", "test-model");
         let mut sink = |e: AgentEvent| {
             events.push(e);
             Ok(())
         };
-        let mut runner = AgentRunner::new(tools, cfg, cancel, &mut sink);
+        let mut runner = AgentRunner::new(tools, cfg, &config, cancel, &mut sink);
         runner.hooks = std::mem::take(hooks);
         runner.run(provider, system, messages)
     }
@@ -1194,6 +1210,7 @@ mod tests {
                 &mut self,
                 _m: &[Message],
                 _t: &[ToolSpec],
+                _cfg: &ProviderConfig,
                 _c: &CancelToken,
             ) -> Result<Vec<Delta>, String> {
                 Err("provider exploded".to_string())
@@ -1295,6 +1312,7 @@ mod tests {
                 &mut self,
                 _m: &[Message],
                 _t: &[ToolSpec],
+                _cfg: &ProviderConfig,
                 _c: &CancelToken,
             ) -> Result<Vec<Delta>, String> {
                 Err("request cancelled".to_string())
@@ -2028,6 +2046,7 @@ mod tests {
                 &mut self,
                 _m: &[Message],
                 _t: &[ToolSpec],
+                _cfg: &ProviderConfig,
                 _c: &CancelToken,
             ) -> Result<Vec<Delta>, String> {
                 Err("boom".to_string())

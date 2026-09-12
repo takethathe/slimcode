@@ -149,19 +149,24 @@ pub struct WireStreamOptions {
 pub enum WireContent {
     /// Plain string content (unchanged wire shape).
     Text(String),
-    /// One text block carrying `cache_control` (explicit cache marker). Only
-    /// emitted for the system message when caching is on.
+    /// One text block array (Bailian's array-form content, required to carry
+    /// `cache_control`). Emitted for every non-empty-text message when caching
+    /// is on; the `cache_control` field is present only on marked blocks.
     Blocks(Vec<WireContentBlock>),
 }
 
-/// A text content block. `cache_control` marks the block as a cache-able
-/// prefix for Bailian's explicit context caching.
+/// A text content block. `cache_control` — the explicit-cache marker — is
+/// only present on marked blocks (the system prefix and the last cache-able
+/// conversation message); every other block omits it, so a message that stops
+/// being "last" keeps byte-identical content and the cached prefix keeps
+/// hitting.
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct WireContentBlock {
     #[serde(rename = "type")]
     pub kind: &'static str,
     pub text: String,
-    pub cache_control: WireCacheControl,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<WireCacheControl>,
 }
 
 /// The explicit-cache marker (`{"type": "ephemeral"}`).
@@ -223,31 +228,91 @@ pub fn role_to_wire(role: &Role) -> &'static str {
     }
 }
 
-/// Map one agent message to the wire shape. With `cache` on, the system
-/// message's content is serialized as a one-block array carrying
-/// `cache_control` so the stable "system prompt + tool definitions" prefix is
-/// cached by the endpoint; every other message keeps the plain-string shape.
-/// With `cache` off the bytes are identical to the pre-cache client.
+/// Map one agent message to the wire shape. With `cache` on, every message
+/// carrying non-empty text serializes as a one-block array so the prefix bytes
+/// stay stable across turns; the system message's block always carries
+/// `cache_control` (Bailian only accepts the marker on array-form content, and
+/// its explicit cache matches by content block).
+///
+/// Prefer [`messages_to_wire`] for a full conversation: this single-message
+/// mapper never marks a conversation message as the last one.
 pub fn message_to_wire(m: &Message, cache: bool) -> WireMessage<'_> {
+    message_to_wire_inner(m, cache, false)
+}
+
+/// Whether a conversation message can carry a cache mark, mirroring pi's
+/// `addCacheControlToTextContent`: the message's wire text must be non-empty.
+/// Tool-call assistant messages (empty content on the wire), empty tool
+/// results and any other empty text are skipped, so the tail scan walks past
+/// them to the last cache-able message. Tool messages are only cache-able
+/// when their result text is non-empty.
+fn is_cache_markable(m: &Message) -> bool {
+    let role = role_to_wire(&m.role);
+    if role == "system" || (role == "assistant" && !m.tool_calls.is_empty()) {
+        return false;
+    }
+    !m.text_content().is_empty()
+}
+
+/// Map an agent message list to the wire shape (pi's
+/// `addCacheControlToLastConversationMessage` pattern, adapted for Bailian):
+/// with `cache` on, the system message and the **last** cache-able
+/// conversation message (a user/assistant/tool message whose wire text is
+/// non-empty) both serialize as one-block arrays carrying `cache_control`, so
+/// the stable system prefix and the full conversation prefix are cached by
+/// the endpoint; the tail scan skips empty-text messages (tool-call assistant
+/// messages, empty tool results) and walks to the first cache-able one. Tool
+/// definitions carry no mark (existing decision: `cache_control` only on
+/// content — tools ride the system prefix). With `cache` off no message
+/// carries a mark and the bytes are identical to the pre-cache client.
+pub fn messages_to_wire(messages: &[Message], cache: bool) -> Vec<WireMessage<'_>> {
+    let last_mark = if cache {
+        messages.iter().rposition(is_cache_markable)
+    } else {
+        None
+    };
+    messages
+        .iter()
+        .enumerate()
+        .map(|(i, m)| message_to_wire_inner(m, cache, Some(i) == last_mark))
+        .collect()
+}
+
+/// The single-message mapper shared by [`message_to_wire`] and
+/// [`messages_to_wire`]. `mark_last` marks this message as the conversation's
+/// last cache-able message — the caller (the tail scan) decides which one
+/// that is, so the scan result always matches the wire output.
+///
+/// With `cache` on, every message that carries non-empty text serializes its
+/// content as a one-block array (Bailian's explicit cache compares messages
+/// as content blocks, and a message whose form changed between turns — e.g.
+/// from marked array to plain string — breaks the prefix match); the system
+/// message and the last cache-able conversation message additionally carry
+/// `cache_control`, a comparison-exempt marker. Empty-text messages keep the
+/// pre-cache shapes (omitted content, empty string for tool-call assistant
+/// messages and empty tool results), and with `cache` off the bytes are
+/// identical to the pre-cache client.
+fn message_to_wire_inner(m: &Message, cache: bool, mark_last: bool) -> WireMessage<'_> {
     let role = role_to_wire(&m.role);
     let text = m.text_content();
     let has_tool_calls = !m.tool_calls.is_empty();
     let content = if role == "assistant" && has_tool_calls {
         // Tool-call assistant messages carry an empty content on the wire.
         Some(WireContent::Text(String::new()))
-    } else if role == "tool" {
+    } else if role == "tool" && text.is_empty() {
         // Tool messages must carry content on the wire; an empty result still
         // sends an empty string rather than omitting the field (400 risk).
-        Some(WireContent::Text(text))
+        Some(WireContent::Text(String::new()))
     } else if text.is_empty() {
         None
-    } else if cache && role == "system" {
-        // Explicit cache marker on the system prefix (only when enabled and
-        // the text is non-empty).
+    } else if cache {
+        // Array form for every message that carries text (stable across
+        // turns); only the marked ones carry `cache_control`.
+        let mark = role == "system" || mark_last;
         Some(WireContent::Blocks(vec![WireContentBlock {
             kind: "text",
             text,
-            cache_control: WireCacheControl { kind: "ephemeral" },
+            cache_control: mark.then_some(WireCacheControl { kind: "ephemeral" }),
         }]))
     } else {
         Some(WireContent::Text(text))
@@ -743,15 +808,29 @@ mod tests {
     }
 
     #[test]
-    fn message_to_wire_non_system_ignores_cache_flag() {
-        // cache=true only ever touches the system message; user messages stay
-        // plain strings.
+    fn message_to_wire_non_system_with_cache_uses_array_without_mark() {
+        // cache=true + a non-system message: Bailian's explicit cache compares
+        // messages as content blocks, so the content must serialize as a
+        // one-block array (string form would break the prefix match when a
+        // message stops being "last"). The block carries no `cache_control`
+        // unless the caller marks it as last.
         let m = Message::text(Role::User, "hello");
         let w = message_to_wire(&m, true);
-        assert_eq!(w.content, Some(WireContent::Text("hello".to_string())));
+        assert_eq!(
+            w.content,
+            Some(WireContent::Blocks(vec![WireContentBlock {
+                kind: "text",
+                text: "hello".to_string(),
+                cache_control: None,
+            }]))
+        );
         let json = serde_json::to_string(&w).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["content"], "hello");
+        assert_eq!(
+            v["content"],
+            serde_json::json!([{"type": "text", "text": "hello"}])
+        );
+        assert!(v["content"][0].get("cache_control").is_none());
     }
 
     #[test]
@@ -775,17 +854,19 @@ mod tests {
         assert_eq!(w.content, None);
     }
 
-    // --- parallel tool calls (parallel-tool-calls ticket 02) --------------
+    // --- last-message cache mark (cache-last-message-mark ticket 01) ------
 
-    /// Build a request with the given tools and parallel flag for the
-    /// serialization tests.
-    fn request_with_tools<'a>(
+    /// Build the wire request shape the provider posts, for the byte-level
+    /// tests below. `parallel_tool_calls` follows whether tools are declared,
+    /// matching the provider.
+    fn wire_request<'a>(
+        messages: Vec<WireMessage<'a>>,
         tools: Option<Vec<WireTool>>,
-        parallel_tool_calls: bool,
     ) -> WireRequest<'a> {
+        let parallel_tool_calls = tools.is_some();
         WireRequest {
-            model: "m",
-            messages: Vec::new(),
+            model: "qwen-plus",
+            messages,
             tools,
             parallel_tool_calls,
             stream: true,
@@ -794,6 +875,242 @@ mod tests {
             },
         }
     }
+
+    /// A three-message conversation: system + user + assistant reply.
+    fn conversation() -> Vec<Message> {
+        vec![
+            Message::text(Role::System, "You are slimcode."),
+            Message::text(Role::User, "hello"),
+            Message::text(Role::Assistant, "hi there"),
+        ]
+    }
+
+    #[test]
+    fn messages_to_wire_marks_system_and_last_message() {
+        // cache=true: the system message and the last cache-able conversation
+        // message both serialize as one-block arrays carrying `cache_control`
+        // (pi's `addCacheControlToLastConversationMessage` pattern); every
+        // other message keeps the plain one-block array (Bailian requires
+        // array-form content for the prefix match to stay stable).
+        let msgs = conversation();
+        let wire = messages_to_wire(&msgs, true);
+        assert_eq!(wire.len(), 3);
+
+        // system → array block with cache_control
+        assert_eq!(
+            wire[0].content,
+            Some(WireContent::Blocks(vec![WireContentBlock {
+                kind: "text",
+                text: "You are slimcode.".to_string(),
+                cache_control: Some(WireCacheControl { kind: "ephemeral" }),
+            }]))
+        );
+        // middle user → array block without cache_control
+        assert_eq!(
+            wire[1].content,
+            Some(WireContent::Blocks(vec![WireContentBlock {
+                kind: "text",
+                text: "hello".to_string(),
+                cache_control: None,
+            }]))
+        );
+        // last assistant → array block with cache_control
+        assert_eq!(
+            wire[2].content,
+            Some(WireContent::Blocks(vec![WireContentBlock {
+                kind: "text",
+                text: "hi there".to_string(),
+                cache_control: Some(WireCacheControl { kind: "ephemeral" }),
+            }]))
+        );
+    }
+
+    #[test]
+    fn messages_to_wire_cache_off_keeps_pre_cache_bytes() {
+        // cache=false: no marks anywhere, and every message serializes as the
+        // plain-string shape of the pre-cache client.
+        let msgs = conversation();
+        let wire = messages_to_wire(&msgs, false);
+        assert_eq!(
+            wire[0].content,
+            Some(WireContent::Text("You are slimcode.".to_string()))
+        );
+        assert_eq!(
+            wire[1].content,
+            Some(WireContent::Text("hello".to_string()))
+        );
+        assert_eq!(
+            wire[2].content,
+            Some(WireContent::Text("hi there".to_string()))
+        );
+    }
+
+    #[test]
+    fn messages_to_wire_cache_off_bytes_match_message_to_wire() {
+        // The list mapper with cache off must be byte-identical to mapping
+        // each message with the single-message mapper (regression: no
+        // accidental last-message handling when caching is off).
+        let msgs = conversation();
+        let list = messages_to_wire(&msgs, false);
+        let single: Vec<_> = msgs.iter().map(|m| message_to_wire(m, false)).collect();
+        assert_eq!(
+            serde_json::to_string(&list).unwrap(),
+            serde_json::to_string(&single).unwrap()
+        );
+    }
+
+    #[test]
+    fn messages_to_wire_skips_empty_tail_and_marks_earlier_message() {
+        // Tail messages with empty text (an assistant tool-call message and an
+        // empty tool result) carry no mark and are skipped; the scan walks to
+        // the last cache-able message (the user question) and marks it.
+        let mut asst_tool = Message::text(Role::Assistant, "");
+        asst_tool.tool_calls = vec![ToolCall {
+            id: "call_1".to_string(),
+            name: "get_weather".to_string(),
+            arguments: "{}".to_string(),
+        }];
+        let msgs = vec![
+            Message::text(Role::System, "You are slimcode."),
+            Message::text(Role::User, "what's the weather?"),
+            asst_tool.clone(),
+            Message::tool_result("call_1", ""),
+        ];
+        let wire = messages_to_wire(&msgs, true);
+        // system marked
+        assert!(matches!(
+            &wire[0].content,
+            Some(WireContent::Blocks(blocks))
+                if blocks[0].cache_control.is_some()
+        ));
+        // the user message is the last cache-able one → marked
+        assert!(matches!(
+            &wire[1].content,
+            Some(WireContent::Blocks(blocks))
+                if blocks[0].text == "what's the weather?" && blocks[0].cache_control.is_some()
+        ));
+        // assistant tool-call message: empty content, no mark
+        assert_eq!(wire[2].content, Some(WireContent::Text(String::new())));
+        // empty tool result: empty content, no mark
+        assert_eq!(wire[3].content, Some(WireContent::Text(String::new())));
+    }
+
+    #[test]
+    fn messages_to_wire_tool_result_with_content_is_markable() {
+        // A tool result carrying text is a cache-able message: when it is the
+        // last one, it gets the mark (pi's `addCacheControlToMessage` accepts
+        // the tool role the same way).
+        let msgs = vec![
+            Message::text(Role::System, "You are slimcode."),
+            Message::text(Role::User, "weather?"),
+            Message::tool_result("call_1", "{\"temp\":\"25C\"}"),
+        ];
+        let wire = messages_to_wire(&msgs, true);
+        assert!(matches!(
+            &wire[2].content,
+            Some(WireContent::Blocks(blocks))
+                if blocks[0].text == "{\"temp\":\"25C\"}" && blocks[0].cache_control.is_some()
+        ));
+    }
+
+    #[test]
+    fn messages_to_wire_empty_tool_result_not_markable() {
+        // The scan must never mark an empty tool result: its content stays the
+        // empty string and the previous message (the user) gets the mark.
+        let msgs = vec![
+            Message::text(Role::System, "You are slimcode."),
+            Message::text(Role::User, "weather?"),
+            Message::tool_result("call_1", ""),
+        ];
+        let wire = messages_to_wire(&msgs, true);
+        assert!(matches!(
+            &wire[1].content,
+            Some(WireContent::Blocks(blocks)) if blocks[0].cache_control.is_some()
+        ));
+        assert_eq!(wire[2].content, Some(WireContent::Text(String::new())));
+    }
+
+    #[test]
+    fn messages_to_wire_only_system_marked_when_no_markable_message() {
+        // A conversation whose tail is all empty-text messages leaves the
+        // system message as the only marked one.
+        let mut asst_tool = Message::text(Role::Assistant, "");
+        asst_tool.tool_calls = vec![ToolCall {
+            id: "call_1".to_string(),
+            name: "get_weather".to_string(),
+            arguments: "{}".to_string(),
+        }];
+        let msgs = vec![
+            Message::text(Role::System, "You are slimcode."),
+            asst_tool,
+            Message::tool_result("call_1", ""),
+        ];
+        let wire = messages_to_wire(&msgs, true);
+        assert!(matches!(
+            &wire[0].content,
+            Some(WireContent::Blocks(blocks)) if blocks[0].cache_control.is_some()
+        ));
+        assert_eq!(wire[1].content, Some(WireContent::Text(String::new())));
+        assert_eq!(wire[2].content, Some(WireContent::Text(String::new())));
+    }
+
+    #[test]
+    fn messages_to_wire_bytes_are_deterministic_and_locked() {
+        // Byte-determinism contract: the same messages + tools + cache flag
+        // must serialize to byte-identical requests (a cached prefix must stay
+        // stable across turns — nothing time- or order-dependent may leak in).
+        let msgs = conversation();
+        let a = serde_json::to_string(&wire_request(messages_to_wire(&msgs, true), None)).unwrap();
+        let b = serde_json::to_string(&wire_request(messages_to_wire(&msgs, true), None)).unwrap();
+        assert_eq!(a, b);
+        // Lock the full request shape: two `cache_control` markers (system +
+        // last message), array-form content throughout, plain block for the
+        // middle message.
+        assert_eq!(
+            a,
+            "{\"model\":\"qwen-plus\",\"messages\":[{\"role\":\"system\",\"content\":[{\"type\":\"text\",\"text\":\"You are slimcode.\",\"cache_control\":{\"type\":\"ephemeral\"}}]},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hello\"}]},{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"hi there\",\"cache_control\":{\"type\":\"ephemeral\"}}]}],\"stream\":true,\"stream_options\":{\"include_usage\":true}}"
+        );
+    }
+
+    #[test]
+    fn request_bytes_are_deterministic_and_locked_with_tools() {
+        // ADR-0016 D5 words the byte-determinism contract over "messages +
+        // tools + cache flag": adding the tool declarations must stay
+        // byte-stable too (same call shape, same order), so the cached prefix
+        // including the tool block keeps matching.
+        let msgs = conversation();
+        let tools = || {
+            vec![tool_to_wire(&ToolSpec::new(
+                "get_weather",
+                "Get the current weather for a city",
+                serde_json::json!({"type": "object"}),
+            ))]
+        };
+        let a = serde_json::to_string(&wire_request(messages_to_wire(&msgs, true), Some(tools())))
+            .unwrap();
+        let b = serde_json::to_string(&wire_request(messages_to_wire(&msgs, true), Some(tools())))
+            .unwrap();
+        assert_eq!(a, b);
+        assert_eq!(
+            a,
+            "{\"model\":\"qwen-plus\",\"messages\":[{\"role\":\"system\",\"content\":[{\"type\":\"text\",\"text\":\"You are slimcode.\",\"cache_control\":{\"type\":\"ephemeral\"}}]},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hello\"}]},{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"hi there\",\"cache_control\":{\"type\":\"ephemeral\"}}]}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":\"Get the current weather for a city\",\"parameters\":{\"type\":\"object\"}}}],\"parallel_tool_calls\":true,\"stream\":true,\"stream_options\":{\"include_usage\":true}}"
+        );
+    }
+
+    #[test]
+    fn messages_to_wire_cache_off_request_bytes_match_pre_cache_shape() {
+        // cache=false: the full request serializes to the exact pre-cache
+        // plain-string shape (regression: no marks, no array-form content).
+        let msgs = conversation();
+        let bytes =
+            serde_json::to_string(&wire_request(messages_to_wire(&msgs, false), None)).unwrap();
+        assert_eq!(
+            bytes,
+            "{\"model\":\"qwen-plus\",\"messages\":[{\"role\":\"system\",\"content\":\"You are slimcode.\"},{\"role\":\"user\",\"content\":\"hello\"},{\"role\":\"assistant\",\"content\":\"hi there\"}],\"stream\":true,\"stream_options\":{\"include_usage\":true}}"
+        );
+    }
+
+    // --- parallel tool calls (parallel-tool-calls ticket 02) --------------
 
     #[test]
     fn request_serializes_parallel_tool_calls_when_tools_are_present() {
@@ -804,7 +1121,7 @@ mod tests {
             "Get current weather for a city",
             serde_json::json!({"type": "object"}),
         );
-        let req = request_with_tools(Some(vec![tool_to_wire(&tool)]), true);
+        let req = wire_request(Vec::new(), Some(vec![tool_to_wire(&tool)]));
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["parallel_tool_calls"], true);
         assert!(v.get("tools").is_some());
@@ -814,7 +1131,7 @@ mod tests {
     fn request_omits_parallel_tool_calls_without_tools() {
         // No tools → the flag is omitted entirely: a plain-answer request
         // keeps the exact byte shape it had before parallel support.
-        let req = request_with_tools(None, false);
+        let req = wire_request(Vec::new(), None);
         let v = serde_json::to_value(&req).unwrap();
         assert!(v.get("parallel_tool_calls").is_none());
         assert!(v.get("tools").is_none());

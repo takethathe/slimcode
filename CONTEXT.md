@@ -249,8 +249,20 @@ The runner status embedded in the editor's top border while a turn runs: a brail
 _Avoid_: loading bar, RUNNING flag, spinner line
 
 **Config**:
-The resolved, non-secret application settings (model, base URL, cache flag) produced by the four-layer resolution (frontend overrides > env > `config.toml` > defaults), handed to the frontends as a `BailianConfig`. Distinct from credentials.
+The resolved, non-secret application settings (model, base URL, cache flag) produced by the four-layer resolution (frontend overrides > env > `config.toml` > defaults), handed to the frontends as a `ProviderConfig`. Distinct from credentials.
 _Avoid_: settings file, options
+
+**ProviderConfig**:
+The provider-owned settings carried across the `Provider::chat` seam (api key, base URL, model, explicit-cache flag), owned by `slimcode-ai`. Deliberately provider-agnostic in name so `app`/`cli` never name a concrete provider; the provider instance itself is stateless and reads every setting from this argument (ADR-0016).
+_Avoid_: BailianConfig, endpoint settings, LLM options
+
+**provider-owned concern**:
+A setting or wire behavior whose implementation differs from provider to provider — told apart by "would this behave differently if I swapped the provider?". Cache-mark syntax and placement are the canonical example; `RunConfig` (runtime behavior like `parallel_tools`) and `app`/`cli` composition are the other two buckets (ADR-0016).
+_Avoid_: provider setting, LLM config
+
+**cache mark**:
+The `cache_control: {"type": "ephemeral"}` marker a provider places on the request so the endpoint caches a stable prefix. Placement is provider-owned: the Bailian provider marks the system message and the last cache-able (non-empty-text) conversation message, and serializes every non-empty-text message as array-form content so the prefix bytes stay stable across turns (ADR-0016). Distinct from the **cache flag** (`ProviderConfig.cache`), which merely turns marking on or off.
+_Avoid_: cache header, cache tag, cache annotation
 
 **config.toml**:
 The user-level config file at `~/.slimcode/config.toml` (or `$SLIMCODE_HOME/config.toml`): a TOML `[ai]` table with optional `base_url` / `model` / `cache` / `api_key`. Edited by hand or interactively via `slimcode config`. Distinct from credentials management.

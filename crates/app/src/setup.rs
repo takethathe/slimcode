@@ -5,18 +5,19 @@
 
 use std::path::Path;
 
-use slimcode_ai::{BailianConfig, BailianProvider};
+use slimcode_ai::BailianProvider;
 use slimcode_core::agent::{CancelToken, Tool};
 
 use crate::tools;
 
-/// Build the provider from a resolved config and the seven-tool set bound to
-/// `cwd` (the plain, non-cancellable tools — used by the one-shot CLI).
-/// Provider construction validates the config (API key, URL); callers
-/// must run this before opening any full-screen UI so failures surface on the
-/// normal terminal.
-pub fn setup(cwd: &Path, config: BailianConfig) -> Result<(BailianProvider, Vec<Tool>), String> {
-    let provider = BailianProvider::new(config)?;
+/// Build the provider and the seven-tool set bound to `cwd` (the plain,
+/// non-cancellable tools — used by the one-shot CLI). The provider is
+/// stateless (ADR-0016): it needs no config at construction; the resolved
+/// [`slimcode_ai::ProviderConfig`] is threaded into each turn by the caller.
+/// Callers must run this before opening any full-screen UI so failures surface
+/// on the normal terminal.
+pub fn setup(cwd: &Path) -> Result<(BailianProvider, Vec<Tool>), String> {
+    let provider = BailianProvider::new()?;
     let tools = tools::build_tools(cwd);
     Ok((provider, tools))
 }
@@ -26,10 +27,9 @@ pub fn setup(cwd: &Path, config: BailianConfig) -> Result<(BailianProvider, Vec<
 /// [`setup`] otherwise.
 pub fn setup_with_cancel(
     cwd: &Path,
-    config: BailianConfig,
     cancel: &CancelToken,
 ) -> Result<(BailianProvider, Vec<Tool>), String> {
-    let provider = BailianProvider::new(config)?;
+    let provider = BailianProvider::new()?;
     let tools = tools::build_tools_with_cancel(cwd, cancel);
     Ok((provider, tools))
 }

@@ -20,7 +20,7 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use slimcode_ai::BailianConfig;
+use slimcode_ai::ProviderConfig;
 use slimcode_app::context::{ContextBuilder, Environment, skill_loaded_in};
 use slimcode_app::context_files::ContextFile;
 use slimcode_app::history::{HISTORY_DISPLAY, HistoryStore, render_history, resolve_replay_index};
@@ -45,7 +45,7 @@ use crate::render::TuiAdapter;
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     cwd: &Path,
-    config: BailianConfig,
+    config: ProviderConfig,
     store: &SessionStore,
     history: &HistoryStore,
     skills: &SkillStore,
@@ -56,7 +56,7 @@ pub fn run(
     // One token shared by the cancellable tool set and every turn: Esc cancels
     // whichever phase the run is in.
     let cancel = CancelToken::new();
-    let (provider, tools) = slimcode_app::setup::setup_with_cancel(cwd, config, &cancel)?;
+    let (provider, tools) = slimcode_app::setup::setup_with_cancel(cwd, &cancel)?;
     let session = store.new_session();
 
     // The `/`-candidate pool (ADR-0014 D3): the command registry plus the
@@ -80,6 +80,7 @@ pub fn run(
         skills,
         context_files: context_files.to_vec(),
         environment,
+        config,
         completions,
         inner: Mutex::new(Inner {
             session,
@@ -195,6 +196,10 @@ struct TuiSession<'a> {
     skills: &'a SkillStore,
     context_files: Vec<ContextFile>,
     environment: Environment,
+    /// The resolved provider config (ADR-0016). Held here for the whole
+    /// session and threaded into every turn's `run_turn` call; the provider
+    /// instance stays stateless.
+    config: ProviderConfig,
     completions: CliCompletions,
     inner: Mutex<Inner>,
 }
@@ -597,6 +602,7 @@ impl TuiSession<'_> {
             tools,
             context,
             &cfg,
+            &self.config,
             cancel,
             &mut TuiAdapter::new(emit),
             &mut |msg: &AgentMessage| -> Result<(), String> {
@@ -788,6 +794,7 @@ mod tests {
             &mut self,
             _messages: &[Message],
             _tools: &[slimcode_core::agent::ToolSpec],
+            _config: &ProviderConfig,
             _cancel: &CancelToken,
         ) -> Result<Vec<Delta>, String> {
             if self.fail_at == Some(self.calls) {
@@ -841,6 +848,7 @@ mod tests {
                     project_home: self.scratch.path("proj"),
                 },
                 completions,
+                config: ProviderConfig::new("test-key", "https://example.invalid/v1", "test-model"),
                 inner: Mutex::new(Inner {
                     session,
                     provider: Some(provider),

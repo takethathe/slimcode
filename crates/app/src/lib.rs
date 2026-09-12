@@ -5,7 +5,7 @@
 //!
 //! Modules:
 //! - [`config`]: four-layer config resolution (frontend overrides > env >
-//!   `config.toml` > defaults), producing a [`slimcode_ai::BailianConfig`].
+//!   `config.toml` > defaults), producing a [`slimcode_ai::ProviderConfig`].
 //! - [`session`]: `SessionStore` + session metadata helpers.
 //! - [`history`]: `HistoryStore` for input history persistence.
 //! - [`skills`]: `Skill` model + `SkillStore` for user/project-scoped skill

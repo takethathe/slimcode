@@ -17,7 +17,8 @@
 //! message at the moment it exists.
 
 use slimcode_core::agent::{
-    AgentEvent, AgentMessage, AgentRunner, CancelToken, Provider, RunConfig, StopReason, Tool,
+    AgentEvent, AgentMessage, AgentRunner, CancelToken, Provider, ProviderConfig, RunConfig,
+    StopReason, Tool,
 };
 
 use crate::context::Context;
@@ -40,11 +41,13 @@ use crate::render::{Renderer, map_event};
 /// A provider error propagates as `Err(String)`; no partial history is
 /// fabricated. `on_message` errors abort the loop the same way a renderer
 /// error does.
+#[allow(clippy::too_many_arguments)] // the turn's full run context crosses this seam
 pub fn run_turn<P: Provider>(
     provider: &mut P,
     tools: &[Tool],
     context: Context,
     cfg: &RunConfig,
+    provider_config: &ProviderConfig,
     cancel: &CancelToken,
     renderer: &mut dyn Renderer,
     on_message: &mut dyn FnMut(&AgentMessage) -> Result<(), String>,
@@ -61,7 +64,7 @@ pub fn run_turn<P: Provider>(
         }
         Ok(())
     };
-    let mut runner = AgentRunner::new(tools, cfg.clone(), cancel, &mut sink);
+    let mut runner = AgentRunner::new(tools, cfg.clone(), provider_config, cancel, &mut sink);
     runner.run(provider, &system, messages)
 }
 
@@ -72,6 +75,13 @@ mod tests {
     use serde_json::Value;
     use slimcode_core::agent::{Delta, FinishReason, StopReason, ToolSpec};
     use slimcode_core::session::{AgentMessage, Message, Role};
+
+    /// A fixed provider config for the turn-runner tests: these tests exercise
+    /// event mapping and cancellation, not config resolution (that lives in
+    /// `crate::config`).
+    fn test_config() -> ProviderConfig {
+        ProviderConfig::new("test-key", "https://example.invalid/v1", "test-model")
+    }
 
     // --- helpers (the agent crate's scripted FakeProvider pattern) ----------
 
@@ -131,6 +141,7 @@ mod tests {
             &mut self,
             _messages: &[Message],
             _tools: &[ToolSpec],
+            _config: &ProviderConfig,
             _cancel: &CancelToken,
         ) -> Result<Vec<Delta>, String> {
             let d = self.script.get(self.calls).cloned().unwrap_or_default();
@@ -219,11 +230,12 @@ mod tests {
         messages: Vec<AgentMessage>,
         events: &mut Vec<AgentEvent>,
     ) -> Result<(Vec<AgentMessage>, StopReason), String> {
+        let config = ProviderConfig::new("test-key", "https://example.invalid/v1", "test-model");
         let mut sink = |e: AgentEvent| {
             events.push(e);
             Ok(())
         };
-        let mut runner = AgentRunner::new(tools, cfg, cancel, &mut sink);
+        let mut runner = AgentRunner::new(tools, cfg, &config, cancel, &mut sink);
         runner.run(provider, system, messages)
     }
 
@@ -250,6 +262,7 @@ mod tests {
             &[weather_tool()],
             context(messages),
             &RunConfig::default(),
+            &test_config(),
             &cancel,
             &mut renderer,
             &mut noop_sink(),
@@ -342,6 +355,7 @@ mod tests {
             &[weather_tool()],
             context(messages.clone()),
             &RunConfig::default(),
+            &test_config(),
             &cancel,
             &mut renderer,
             &mut noop_sink(),
@@ -379,6 +393,7 @@ mod tests {
             &[weather_tool()],
             context(messages),
             &RunConfig::default(),
+            &test_config(),
             &cancel,
             &mut renderer,
             &mut noop_sink(),
@@ -450,6 +465,7 @@ mod tests {
             &[slow, fast],
             context(vec![user("go")]),
             &RunConfig::default(),
+            &test_config(),
             &cancel,
             &mut renderer,
             &mut |m| {
@@ -482,6 +498,52 @@ mod tests {
     }
 
     #[test]
+    fn provider_receives_the_config_crossing_the_chat_seam() {
+        // ADR-0016: the resolved config (model, base URL, cache flag) travels
+        // across the `chat` seam, not through the provider instance — a
+        // stateless provider must see exactly what the caller resolved.
+        struct CapturingProvider {
+            seen: Option<(String, String, bool)>,
+        }
+        impl Provider for CapturingProvider {
+            fn chat(
+                &mut self,
+                _m: &[Message],
+                _t: &[ToolSpec],
+                config: &ProviderConfig,
+                _c: &CancelToken,
+            ) -> Result<Vec<Delta>, String> {
+                self.seen = Some((config.model.clone(), config.base_url.clone(), config.cache));
+                Ok(vec![text("ok"), done_stop()])
+            }
+        }
+        let mut provider = CapturingProvider { seen: None };
+        let mut renderer = RecordingRenderer::new();
+        let cancel = CancelToken::new();
+        let config = ProviderConfig::new("k", "https://chosen.example.com/v1", "chosen-model")
+            .with_cache(false);
+        run_turn(
+            &mut provider,
+            &[],
+            context(vec![user("hi")]),
+            &RunConfig::default(),
+            &config,
+            &cancel,
+            &mut renderer,
+            &mut noop_sink(),
+        )
+        .unwrap();
+        assert_eq!(
+            provider.seen,
+            Some((
+                "chosen-model".to_string(),
+                "https://chosen.example.com/v1".to_string(),
+                false,
+            ))
+        );
+    }
+
+    #[test]
     fn provider_error_propagates() {
         struct ErrProvider;
         impl Provider for ErrProvider {
@@ -489,6 +551,7 @@ mod tests {
                 &mut self,
                 _m: &[Message],
                 _t: &[ToolSpec],
+                _cfg: &ProviderConfig,
                 _c: &CancelToken,
             ) -> Result<Vec<Delta>, String> {
                 Err("provider exploded".to_string())
@@ -502,6 +565,7 @@ mod tests {
             &[],
             context(vec![user("hi")]),
             &RunConfig::default(),
+            &test_config(),
             &cancel,
             &mut renderer,
             &mut noop_sink(),
@@ -522,6 +586,7 @@ mod tests {
             &[],
             context(vec![user("hi")]),
             &RunConfig::default(),
+            &test_config(),
             &cancel,
             &mut renderer,
             &mut noop_sink(),
@@ -549,6 +614,7 @@ mod tests {
             &[],
             context(vec![user("hi")]),
             &RunConfig::default(),
+            &test_config(),
             &cancel,
             &mut renderer,
             &mut noop_sink(),
@@ -612,6 +678,7 @@ mod tests {
             &[weather_tool()],
             context(messages),
             &RunConfig::default(),
+            &test_config(),
             &cancel,
             &mut renderer,
             &mut |m| {
@@ -643,6 +710,7 @@ mod tests {
             &[],
             context(vec![user("hi")]),
             &RunConfig::default(),
+            &test_config(),
             &cancel,
             &mut renderer,
             &mut |_| Err("sink exploded".to_string()),
@@ -663,13 +731,14 @@ mod tests {
             &mut self,
             m: &[Message],
             t: &[ToolSpec],
+            config: &ProviderConfig,
             _c: &CancelToken,
         ) -> Result<Vec<Delta>, String> {
             self.calls += 1;
             if self.calls == 1 {
                 self.cancel.cancel();
             }
-            self.inner.chat(m, t, &self.cancel)
+            self.inner.chat(m, t, config, &self.cancel)
         }
     }
 }

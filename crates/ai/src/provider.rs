@@ -5,11 +5,16 @@
 //! boundary is entirely inside this crate. Streaming is used with
 //! `stream_options.include_usage=true` (ticket 05 verified usage arrives in the
 //! final chunk with `choices: []`); each SSE chunk maps to provider deltas.
+//!
+//! The provider instance is **stateless** (ADR-0016): construction only builds
+//! the HTTP client, and every `chat` call reads its settings (model, base URL,
+//! API key, cache flag) from the `&ProviderConfig` argument — so one instance
+//! is reusable with different configs (tests, future config switching).
 
 use std::io::Read;
 use std::time::Duration;
 
-use crate::config::BailianConfig;
+use crate::config::ProviderConfig;
 use crate::llm::{CancelToken, Delta, Provider, ToolSpec};
 use crate::message::Message;
 use crate::wire;
@@ -83,9 +88,10 @@ fn trim_partial_sse_tail(body: &str) -> &str {
     }
 }
 
-/// Provider for the Bailian compatible-mode endpoint.
+/// Provider for the Bailian compatible-mode endpoint. Stateless: construction
+/// only builds the HTTP client; the per-call settings ride the `&ProviderConfig`
+/// argument of [`Provider::chat`] (ADR-0016).
 pub struct BailianProvider {
-    config: BailianConfig,
     client: reqwest::blocking::Client,
     /// Token usage from the most recent `chat` call (None before any call or
     /// when the endpoint omitted it).
@@ -96,8 +102,9 @@ pub struct BailianProvider {
 }
 
 impl BailianProvider {
-    /// Build a provider from an explicit config.
-    pub fn new(config: BailianConfig) -> Result<Self, String> {
+    /// Build the HTTP client. Takes no config — the provider is stateless
+    /// (ADR-0016): every `chat` call receives its settings as an argument.
+    pub fn new() -> Result<Self, String> {
         let client = reqwest::blocking::Client::builder()
             // A stalled connection must not hang the synchronous agent loop
             // indefinitely. Generous enough for long thinking-streams.
@@ -106,7 +113,6 @@ impl BailianProvider {
             .build()
             .map_err(|e| format!("failed to build HTTP client: {e}"))?;
         Ok(Self {
-            config,
             client,
             last_usage: None,
             total_usage: TokenUsage::default(),
@@ -125,14 +131,12 @@ impl Provider for BailianProvider {
         &mut self,
         messages: &[Message],
         tools: &[ToolSpec],
+        config: &ProviderConfig,
         cancel: &CancelToken,
     ) -> Result<Vec<Delta>, String> {
         let req = wire::WireRequest {
-            model: &self.config.model,
-            messages: messages
-                .iter()
-                .map(|m| wire::message_to_wire(m, self.config.cache))
-                .collect(),
+            model: &config.model,
+            messages: wire::messages_to_wire(messages, config.cache),
             tools: if tools.is_empty() {
                 None
             } else {
@@ -150,8 +154,8 @@ impl Provider for BailianProvider {
 
         let resp = self
             .client
-            .post(self.config.chat_completions_url())
-            .bearer_auth(&self.config.api_key)
+            .post(config.chat_completions_url())
+            .bearer_auth(&config.api_key)
             .json(&req)
             .send()
             .map_err(|e| format!("request failed: {e}"))?;
@@ -362,7 +366,7 @@ mod tests {
     /// resolution owner is `slimcode-app::config`; this helper keeps the live
     /// smoke tests working by reading the same env var names and the AI
     /// crate's own endpoint defaults (this crate depends on no slimcode crate).
-    fn provider_from_env() -> Result<BailianProvider, String> {
+    fn provider_from_env() -> Result<(BailianProvider, ProviderConfig), String> {
         const ENV_API_KEY: &str = "DASHSCOPE_API_KEY";
         const ENV_BASE_URL: &str = "SLIMCODE_AI_BASE_URL";
         const ENV_MODEL: &str = "SLIMCODE_AI_MODEL";
@@ -372,7 +376,10 @@ mod tests {
             .unwrap_or_else(|_| crate::config::DEFAULT_BASE_URL.to_string());
         let model =
             std::env::var(ENV_MODEL).unwrap_or_else(|_| crate::config::DEFAULT_MODEL.to_string());
-        BailianProvider::new(BailianConfig::new(api_key, base_url, model))
+        Ok((
+            BailianProvider::new()?,
+            ProviderConfig::new(api_key, base_url, model),
+        ))
     }
 
     #[test]
@@ -453,10 +460,10 @@ mod tests {
     #[test]
     #[ignore = "requires live DASHSCOPE_API_KEY and network access"]
     fn live_chat_returns_text_and_done() {
-        let mut p = provider_from_env().expect("env config");
+        let (mut p, config) = provider_from_env().expect("env config");
         let msgs = vec![Message::text(Role::User, "Reply with exactly: pong")];
         let deltas = p
-            .chat(&msgs, &[], &CancelToken::new())
+            .chat(&msgs, &[], &config, &CancelToken::new())
             .expect("chat succeeds");
         assert!(
             deltas
@@ -475,7 +482,7 @@ mod tests {
     #[test]
     #[ignore = "requires live DASHSCOPE_API_KEY and network access"]
     fn live_chat_calls_tool() {
-        let mut p = provider_from_env().expect("env config");
+        let (mut p, config) = provider_from_env().expect("env config");
         let tool = ToolSpec::new(
             "get_weather",
             "Get the current weather for a city",
@@ -492,7 +499,7 @@ mod tests {
             "What is the weather in Beijing? Use the get_weather tool.",
         )];
         let deltas = p
-            .chat(&msgs, &[tool], &CancelToken::new())
+            .chat(&msgs, &[tool], &config, &CancelToken::new())
             .expect("chat succeeds");
         assert!(
             deltas

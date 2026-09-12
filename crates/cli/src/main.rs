@@ -23,7 +23,7 @@ use std::env;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
-use slimcode_ai::BailianConfig;
+use slimcode_ai::ProviderConfig;
 use slimcode_app::config::{self, Overrides};
 use slimcode_app::context::{ContextBuilder, Environment};
 use slimcode_app::context_files::{ContextFile, load_context_files, resolve_project_home};
@@ -72,13 +72,13 @@ fn usage() -> String {
 fn run_once(
     prompt: &str,
     cwd: &Path,
-    config: BailianConfig,
+    config: ProviderConfig,
     skills: &[Skill],
     context_files: &[ContextFile],
     environment: Environment,
     out: &mut dyn Write,
 ) -> Result<i32, String> {
-    let (mut provider, tools) = slimcode_app::setup::setup(cwd, config)?;
+    let (mut provider, tools) = slimcode_app::setup::setup(cwd)?;
     // The CLI one-shot path has no command parser, so a leading `/skill:{name}`
     // trigger is normalized to the `/{name}` form the model understands before
     // it becomes a user message (the TUI already embeds the skill content).
@@ -98,6 +98,7 @@ fn run_once(
         &tools,
         context,
         &cfg,
+        &config,
         &cancel,
         &mut renderer,
         &mut |_| Ok(()),
@@ -112,7 +113,7 @@ fn run_once(
 /// on the normal terminal.
 fn run_tui(
     cwd: &Path,
-    config: BailianConfig,
+    config: ProviderConfig,
     store: &SessionStore,
     history: &HistoryStore,
     skills: &SkillStore,

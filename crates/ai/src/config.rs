@@ -1,32 +1,38 @@
-//! Provider configuration for the Bailian OpenAI-compatible endpoint.
+//! Provider configuration, owned by `slimcode-ai`.
 //!
-//! `BailianConfig` is pure provider data: api key, base URL and model. The
-//! endpoint defaults (`DEFAULT_BASE_URL` / `DEFAULT_MODEL`) are owned here,
-//! next to the provider that talks to that endpoint. The four-layer precedence
-//! resolution (frontend overrides > env > `config.toml` > defaults) — along
-//! with the env var names behind it — lives in `slimcode-app::config`, which
-//! re-exports these defaults. This crate does not read env or files.
+//! `ProviderConfig` is pure provider data: api key, base URL, model and the
+//! explicit-cache flag. The name is deliberately provider-agnostic: the app /
+//! CLI layers must not know which concrete provider they talk to (ADR-0016),
+//! and the same config shape rides the `Provider::chat` seam. The endpoint
+//! defaults (`DEFAULT_BASE_URL` / `DEFAULT_MODEL`) are owned here, next to the
+//! provider that talks to that endpoint. The four-layer precedence resolution
+//! (frontend overrides > env > `config.toml` > defaults) — along with the env
+//! var names behind it — lives in `slimcode-app::config`, which re-exports
+//! these defaults. This crate does not read env or files.
 
 /// Default China-station legacy compatible-mode base URL (no WorkspaceId needed).
 pub const DEFAULT_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 /// Recommended default model.
 pub const DEFAULT_MODEL: &str = "qwen-plus";
 
-/// Resolved provider configuration.
+/// Resolved provider configuration (ADR-0016: the provider-owned settings a
+/// runner hands across the `chat` seam — the provider instance itself stays
+/// stateless).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BailianConfig {
+pub struct ProviderConfig {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
     /// Explicit context caching (Bailian `cache_control` marker on the system
-    /// message). Default on; disable with `with_cache(false)` to keep request
-    /// bytes byte-identical to a non-cache client.
+    /// and last conversation messages). Default on; disable with
+    /// `with_cache(false)` to keep request bytes byte-identical to a
+    /// non-cache client.
     pub cache: bool,
 }
 
-impl BailianConfig {
+impl ProviderConfig {
     /// Construct explicitly (used by callers with their own config / tests).
-    /// Cache is on by default — call [`BailianConfig::with_cache`] to disable.
+    /// Cache is on by default — call [`ProviderConfig::with_cache`] to disable.
     pub fn new(
         api_key: impl Into<String>,
         base_url: impl Into<String>,
@@ -68,7 +74,7 @@ mod tests {
 
     #[test]
     fn chat_completions_url_appends_path() {
-        let cfg = BailianConfig::new("k", "https://x.example.com/compatible-mode/v1/", "m");
+        let cfg = ProviderConfig::new("k", "https://x.example.com/compatible-mode/v1/", "m");
         assert_eq!(
             cfg.chat_completions_url(),
             "https://x.example.com/compatible-mode/v1/chat/completions"
@@ -77,13 +83,13 @@ mod tests {
 
     #[test]
     fn new_defaults_cache_on() {
-        let cfg = BailianConfig::new("k", "https://x.example.com/v1", "m");
+        let cfg = ProviderConfig::new("k", "https://x.example.com/v1", "m");
         assert!(cfg.cache, "cache must default to on");
     }
 
     #[test]
     fn with_cache_sets_the_flag() {
-        let cfg = BailianConfig::new("k", "https://x.example.com/v1", "m");
+        let cfg = ProviderConfig::new("k", "https://x.example.com/v1", "m");
         assert!(cfg.clone().with_cache(true).cache);
         assert!(!cfg.clone().with_cache(false).cache);
     }

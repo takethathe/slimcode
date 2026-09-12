@@ -11,7 +11,7 @@ pub mod message;
 pub mod provider;
 pub mod wire;
 
-pub use config::{BailianConfig, DEFAULT_BASE_URL, DEFAULT_MODEL};
+pub use config::{DEFAULT_BASE_URL, DEFAULT_MODEL, ProviderConfig};
 pub use llm::{CancelToken, Delta, FinishReason, Provider, ToolSpec};
 pub use message::{Message, Part, Role, ToolCall};
 pub use provider::BailianProvider;
