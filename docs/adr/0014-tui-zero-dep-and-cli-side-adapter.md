@@ -75,5 +75,5 @@ from ADR-0004.
   TUI's widget state. The shared `map_event`, the `Renderer` trait, the `DisplayItem` enum and
   `usage_summary` are unchanged.
 - `CONTEXT.md` gains `RenderItem`; `Renderer`'s entry names the CLI's two implementations.
-- The S5 dependency test asserts `crates/tui/Cargo.toml` has no `slimcode-*` dependency and that
+- Ticket 06's dependency test asserts `crates/tui/Cargo.toml` has no `slimcode-*` dependency and that
   `crates/tui/src` mentions no `SessionStore`/`SkillStore`/`Config`.

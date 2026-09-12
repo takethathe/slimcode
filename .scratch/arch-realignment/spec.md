@@ -180,14 +180,24 @@ slimcode 的用户看不见这个问题，维护它的人躲不开：workspace �
   `apply(RenderItem)`。新会话/载入会话、`/help`、"did you mean"、skill 名解析由 CLI 应答并发出
   `RenderItem`。
 
-### 迁移顺序（五张 ticket，见本目录 `issues/01..05`）
+### 迁移顺序（六张 ticket，见本目录 `issues/01..06`）
 
-1. S1 改名与依赖反转（`agent→core`、`common→app`、Provider/Message/ToolSpec/Delta/FinishReason/
-   CancelToken 进 `ai`）——纯机械步骤，先做，后续步骤都在最终名字上工作。
-2. S2 两层消息模型（`AgentMessage`/`to_llm`/`convert`、system 出会话、日志信封、旧记录跳过）。
-3. S3 `RenderItem` + `App::apply` + CLI 的 `TuiAdapter`（channel 改载 `RenderItem`，帧循环暂不动）。
-4. S4 TUI 去业务化（服务与命令语义入 CLI、`UiHandler` seam、补全注入、TUI 的 slimcode 依赖清零）。
-5. S5 依赖矩阵测试 + 文档现状段重写与全仓术语清扫。
+1. **01 改名**（`slimcode-agent`→`slimcode-core`、`slimcode-common`→`slimcode-app`）——纯机械 prefactor，
+   一次提交全绿，后续所有票都在最终名字上工作。
+2. **02 AI 拥有 LLM seam**（`Provider`/`Message`/`ToolSpec`/`Delta`/`FinishReason`/`CancelToken` 进 `ai`，
+   `Tool{spec,run}` 留 core，`ai` 的依赖（含 dev）清零）。
+3. **03 Session 只存模型看过的东西**（`AgentMessage`/`to_llm`/`convert`、system 出会话、日志信封、
+   遗留 system 记录跳过）。
+4. **04 TUI 讲自己的显示词汇**（`RenderItem` + `App::apply` + CLI 的 `TuiAdapter`，channel 改载
+   `RenderItem`，帧循环暂不动）。
+5. **05 TUI 变成 CLI 进入的库**（`run(terminal, app, handler)` + `UiHandler`、服务与命令语义入 CLI、
+   终端生命周期入 CLI、补全注入、TUI 依赖清零）。
+6. **06 分层被测试钉死 + 文档只说这一版**（依赖矩阵双向断言 + TUI 源码黑名单 + 现状段删除）。
+
+```
+01 ──┬─ 02 ── 03 ──┬─ 05 ── 06
+     └─ 04 ────────┘
+```
 
 每一步都必须：`cargo test` 全绿、`cargo fmt --all`、`cargo clippy --all-targets --all-features --
 -D warnings` 0 error / 0 warning，并同步文档。
@@ -245,4 +255,4 @@ slimcode 的用户看不见这个问题，维护它的人躲不开：workspace �
 - 已知残余风险：TUI 源码里可能出现本次断言之外的应用关注点泄漏；`app` 层未来的新服务可能被顺手
   import 进 TUI。二者的防线分别是 review 与依赖矩阵测试。
 - 实施前先写文档、后动代码的顺序已执行：目标架构与"尚未实施"状态已在 `docs/development.md` 标注，
-  S5 负责删除现状段。
+  ticket 06 负责删除现状段。

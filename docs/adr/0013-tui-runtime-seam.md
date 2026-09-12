@@ -72,4 +72,5 @@ reducer never parses commands beyond turning text into an intent, and never touc
 - Tests: the pure `App` keeps its `TestBackend` snapshot coverage; the CLI's handler is testable
   against a fake `UiHandler` that records the rendered items, replacing today's terminal-loop
   integration tests.
-- `docs/development.md`'s TUI section (worker-thread runner, `terminal::run`) is rewritten in S4.
+- `docs/development.md`'s TUI section (worker-thread runner, `terminal::run`) is rewritten in
+  ticket 05.

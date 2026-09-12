@@ -53,7 +53,8 @@ slimcode crate (ADR-0014).
 | `slimcode-tui` | — |
 | `slimcode` (bin) | all of the above |
 
-S5 pins this with a test that reads each crate's `Cargo.toml` (`.scratch/arch-realignment/issues/05`).
+ticket 06 pins this with a test that reads each crate's `Cargo.toml`
+(`.scratch/arch-realignment/issues/06`).
 
 ## Considered Options
 
@@ -69,12 +70,12 @@ S5 pins this with a test that reads each crate's `Cargo.toml` (`.scratch/arch-re
 
 ## Consequences
 
-- Migration is split into five green steps (S1–S5, `.scratch/arch-realignment/`); S1 is the
-  mechanical rename plus the `Provider`/`Message`/`ToolSpec` move, so later steps work against final
-  names.
+- Migration is split into six green tickets (`.scratch/arch-realignment/issues/01..06`); ticket 01
+  is the mechanical rename and ticket 02 the `Provider`/`Message`/`ToolSpec` move, so later tickets
+  work against final names.
 - `crates/ai` gains the `CancelToken` type (the provider seam's cancellation handle) and
   `ToolSpec`; `crates/core`'s loop builds a `Vec<ToolSpec>` per run from its `Tool`s.
 - The CLI grows (services, command semantics and both display adapters move in) and
   `crates/tui/src/terminal.rs` (~844 lines today) shrinks to UI mechanics (ADR-0013).
-- `docs/development.md`'s architecture section carries the target table until S1–S5 land, at which
-  point the old "现状" block is deleted.
+- `docs/development.md`'s architecture section carries the target table until ticket 06 lands, at
+  which point the old "现状" block is deleted.

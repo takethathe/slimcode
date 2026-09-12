@@ -25,7 +25,7 @@ cargo clippy --all-targets --all-features --message-format=json -- -D warnings
 
 ## 架构
 
-> **实施状态**：ADR-0011–0014（crate 分层与 cli 总入口 / 两层消息模型 / TUI 运行 seam / TUI 零依赖与 cli 侧适配器）已决策、**尚未实施**。迁移分 S1–S5，见 `.scratch/arch-realignment/`。下面「目标架构」是设计基准（先读它）；「现状」描述当前代码，S1–S5 完成后删除并按新布局重写各模块段。
+> **实施状态**：ADR-0011–0014（crate 分层与 cli 总入口 / 两层消息模型 / TUI 运行 seam / TUI 零依赖与 cli 侧适配器）已决策、**尚未实施**。迁移分六张 ticket（`.scratch/arch-realignment/issues/01..06`）。下面「目标架构」是设计基准（先读它）；「现状」描述当前代码，ticket 06 完成后删除并按新布局重写各模块段。
 
 ### 目标架构（ADR-0011–0014）
 
@@ -42,9 +42,9 @@ cargo workspace，六个 crate，唯一二进制 `slimcode`：
 
 重命名：`crates/agent` → `crates/core`、`crates/common` → `crates/app`。关键依赖反转：`Provider` trait 与 LLM `Message` 由 `ai` 拥有（现状是 `ai` 反向依赖 `agent`）。
 
-依赖方向由测试断言（S5，`crates/cli/tests/architecture.rs`）：`ai` 无 slimcode 依赖；`core` → 仅 `ai`；`app` → `ai`/`core`/`commands`；`tui` 无 slimcode 依赖；`cli` → 全部；`tui` 源码不得出现 `SessionStore`/`SkillStore`/`Config`。
+依赖方向由测试断言（ticket 06，`crates/cli/tests/architecture.rs`）：`ai` 无 slimcode 依赖；`core` → 仅 `ai`；`app` → `ai`/`core`/`commands`；`tui` 无 slimcode 依赖；`cli` → 全部；`tui` 源码不得出现 `SessionStore`/`SkillStore`/`Config`。
 
-**现状（迁移前，S1–S5 后删除）**：
+**现状（迁移前，ticket 06 后删除）**：
 
 cargo workspace，六个 crate：
 
