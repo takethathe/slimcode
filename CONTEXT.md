@@ -38,11 +38,13 @@ _Avoid_: conversation (used interchangeably)
 
 **Session log**:
 One Session's `<id>.jsonl` file: a log header line followed by one record per line
-(`{"type":"message","message":{…}}`, `{"type":"title","title":…}`), appended as messages enter
+(`{"type":"message","message":{…},"stop_reason":…}`, `{"type":"title","title":…}`), appended as messages enter
 history and never rewritten — the only writes are the header-plus-backlog write that creates the
 log, one record per message after that, and the sealing newline a lenient load may add to a torn
 tail. A record whose `type` is unknown is ignored, so new record kinds stay compatible with older
-readers. The title is a record, never a header field.
+readers. Message records are what the model was shown: the system prompt is assembled per request
+and never recorded, and a legacy system record is skipped on load. `stop_reason`/`error` are record
+metadata (omitted when absent), not message payload. The title is a record, never a header field.
 _Avoid_: session file (ambiguous with the legacy `<id>.json`), dump, snapshot
 
 **Log header**:
@@ -99,8 +101,16 @@ still counted, so they disappear through eviction rather than migration. An **em
 removed by a separate startup sweep that touches only the current project.
 _Avoid_: cleanup, pruning, GC
 
+**Message**:
+A single LLM-visible message (role, content parts, tool calls) as it goes on the provider wire, owned by `slimcode-ai`. Produced from an AgentMessage by `to_llm`; never the unit a Session stores.
+_Avoid_: wire message, llm message
+
+**AgentMessage**:
+A message in a Session's message history, owned by `slimcode-core`: the user/assistant/tool messages the model sees, plus kinds it must never see (e.g. a compaction summary). `to_llm` converts or drops it on the way to the provider.
+_Avoid_: session message (ambiguous with a session-log record), stored message
+
 **Message history**:
-The conversation messages of a Session (`session.messages`), restorable via `/load`.
+The conversation messages of a Session (`session.messages`), restorable via `/load`. The system prompt is not part of it: it is assembled per request and never stored.
 _Avoid_: history (bare — collides with input history)
 
 **Input history**:
@@ -159,20 +169,28 @@ The action of accepting a Completion popup selection with `Tab`: the selected `/
 _Avoid_: 上屏, fill, autofill, insert completion
 
 **Frontend**:
-A user-facing entry point — the one-shot CLI or the interactive TUI — that reads input, drives the shared turn runner, and renders output through its own Renderer.
+The user-facing entry surface of slimcode: the `slimcode` CLI, and the presentation mode it drives (one-shot text or the interactive TUI). There is one entry point, not one per presentation mode.
 _Avoid_: UI, client
 
+**CLI**:
+The `slimcode` binary — the sole entry point. Owns argv, mode selection, config resolution, service construction, command semantics, session persistence, and the display adapters for both modes.
+_Avoid_: binary, main, entrypoint
+
 **TUI**:
-The interactive full-screen terminal frontend (ratatui + crossterm) entered when `slimcode` starts without a prompt; it replaces the line-based REPL.
-_Avoid_: REPL, UI
+slimcode's terminal graphics library (ratatui + crossterm): transcript model, components, input reducer, and frame loop. Entered by the CLI; holds no argv, config, provider, session or command semantics, and depends on no other slimcode crate.
+_Avoid_: REPL, frontend, UI
 
 **Renderer**:
-The per-frontend component that turns DisplayItems into frontend output — text lines for the CLI, widget state for the TUI.
+The component that turns DisplayItems into frontend output. Both implementations live in the CLI: the text renderer (terminal lines for one-shot output) and the TUI adapter (RenderItems for the interactive TUI). The TUI itself does not implement it.
 _Avoid_: printer, formatter
 
 **DisplayItem**:
 The frontend-agnostic unit a Renderer consumes (turn marker, streamed text fragment, reasoning line, tool start/result, stop marker, or token usage), produced from an AgentEvent by a shared mapping function.
 _Avoid_: RenderText, view model
+
+**RenderItem**:
+The TUI's own display vocabulary: what the CLI's TUI adapter produces from a DisplayItem, and from CLI-owned state that is not an agent event (notices, skills, branch, session change, token usage), before the TUI applies it to its transcript. Distinct from DisplayItem (frontend-agnostic) and from Entry (the TUI's transcript model).
+_Avoid_: view model, ui event, display item
 
 **Theme**:
 A semantic color-token system (accent, border, borderAccent, muted, dim, userMessageBg, toolPendingBg, toolSuccessBg, toolErrorBg, markdown tokens, ...) whose names and hex values mirror pi's `dark.json`; the TUI resolves tokens to terminal colors at render time. Dark only.
@@ -195,7 +213,7 @@ The runner status embedded in the editor's top border while a turn runs: a brail
 _Avoid_: loading bar, RUNNING flag, spinner line
 
 **Config**:
-The resolved, non-secret application settings (model, base URL, cache flag) produced by the four-layer resolution in `slimcode-common::config` (frontend overrides > env > `config.toml` > defaults), handed to the frontends as a `BailianConfig`. Distinct from credentials.
+The resolved, non-secret application settings (model, base URL, cache flag) produced by the four-layer resolution (frontend overrides > env > `config.toml` > defaults), handed to the frontends as a `BailianConfig`. Distinct from credentials.
 _Avoid_: settings file, options
 
 **config.toml**:

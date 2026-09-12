@@ -25,6 +25,27 @@ cargo clippy --all-targets --all-features --message-format=json -- -D warnings
 
 ## 架构
 
+> **实施状态**：ADR-0011–0014（crate 分层与 cli 总入口 / 两层消息模型 / TUI 运行 seam / TUI 零依赖与 cli 侧适配器）已决策、**尚未实施**。迁移分 S1–S5，见 `.scratch/arch-realignment/`。下面「目标架构」是设计基准（先读它）；「现状」描述当前代码，S1–S5 完成后删除并按新布局重写各模块段。
+
+### 目标架构（ADR-0011–0014）
+
+cargo workspace，六个 crate，唯一二进制 `slimcode`：
+
+| crate | 包名 | 目标职责（对外界面） | 依赖 |
+| --- | --- | --- | --- |
+| `crates/ai` | `slimcode-ai` | LLM 层：`Message`（wire 消息）/ `Provider` / `ToolSpec` / `Delta` / `FinishReason` / `CancelToken` / `TokenUsage` / wire 模型 | 无 slimcode 依赖 |
+| `crates/core` | `slimcode-core` | agent 运行时：`AgentEvent` / `AgentRunner`（loop + 可选闭包 hook 字段）/ `AgentMessage`(+`to_llm`) / `convert` / `Tool{spec,run}` / `RunConfig` / `StopReason` | → ai |
+| `crates/app` | `slimcode-app` | 前端无关应用层：`DisplayItem` / `map_event` / `Renderer` / `usage_summary` / `ContextBuilder`→`Context{system,messages}` / 会话与输入历史持久化 / skills / context_files / 七工具 / setup / `run_turn` | → ai, core, commands |
+| `crates/commands` | `slimcode-commands` | `/` 命令注册表 + fuzzy 预测（纯数据 + 纯函数，无 I/O） | 无 |
+| `crates/tui` | `slimcode-tui` | 终端图形库：`RenderItem` / `Effect` / `App`(new/apply/draw/handle_key) / `run(terminal, app, handler)` / `UiHandler` / 组件（theme/markdown/toolcall/footer/text/git） | **无 slimcode 依赖** |
+| `crates/cli` | `slimcode` | 唯一二进制 = 总入口：argv / 模式选择（one-shot 文本 vs 交互 TUI）/ 配置解析 / 服务构建 / 命令语义 / 会话落盘 / `TextRenderer` / `TuiAdapter` / 补全与文案 | → 全部 |
+
+重命名：`crates/agent` → `crates/core`、`crates/common` → `crates/app`。关键依赖反转：`Provider` trait 与 LLM `Message` 由 `ai` 拥有（现状是 `ai` 反向依赖 `agent`）。
+
+依赖方向由测试断言（S5，`crates/cli/tests/architecture.rs`）：`ai` 无 slimcode 依赖；`core` → 仅 `ai`；`app` → `ai`/`core`/`commands`；`tui` 无 slimcode 依赖；`cli` → 全部；`tui` 源码不得出现 `SessionStore`/`SkillStore`/`Config`。
+
+**现状（迁移前，S1–S5 后删除）**：
+
 cargo workspace，六个 crate：
 
 | crate | 包名 | 职责 | 状态 |

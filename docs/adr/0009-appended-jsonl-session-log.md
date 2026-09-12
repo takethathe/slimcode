@@ -1,5 +1,11 @@
 # Appended JSONL session logs
 
+> **Amended by ADR-0012**: D2's system-message clause is superseded — the system prompt is
+> assembled per request and never stored, so no system message enters `Session::messages` or the
+> log, and `load` skips a legacy `role: "system"` record. D5's `stop_reason`/`error` move from the
+> message payload into the record envelope (`{"type":"message","message":{…},"stop_reason":…}`),
+> keeping the closing-assistant-message behaviour. D1, D3, D4 and D6 stand unchanged.
+
 Sessions were persisted as a whole-file pretty-printed JSON document: every save re-serialized the
 entire history and rewrote `<id>.json` with `fs::write`, i.e. truncate-then-write. Two consequences
 were accepted until now and are not acceptable any more: a crash (or a full disk) in the middle of a
