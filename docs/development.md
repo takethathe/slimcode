@@ -32,18 +32,13 @@ cargo workspace，六个 crate，唯一二进制 `slimcode`：
 | crate | 包名 | 职责（对外界面） | 依赖 |
 | --- | --- | --- | --- |
 | `crates/ai` | `slimcode-ai` | LLM 层：`Message`（wire 消息）/ `Provider` / `ToolSpec` / `Delta` / `FinishReason` / `CancelToken` / `TokenUsage` / wire 模型 | 无 slimcode 依赖 |
-| `crates/core` | `slimcode-core` | agent 运行时：`AgentEvent` / loop（`run_agent` / `run_agent_from_messages(_sink)`）/ `AgentMessage`(+`to_llm`) / `convert` / `Tool{spec,run}` / `RunConfig` / `StopReason` | → ai |
+| `crates/core` | `slimcode-core` | agent 运行时：`AgentEvent` / `AgentRunner`（借用式 per-run 值：tools/cfg/cancel/事件订阅，`run(provider, system, messages)`，ADR-0015 加可选 hook 字段）/ `AgentMessage`(+`to_llm`) / `convert` / `Tool{spec,run}` / `RunConfig` / `StopReason` | → ai |
 | `crates/app` | `slimcode-app` | 前端无关应用层：`DisplayItem` / `map_event` / `Renderer` / `usage_summary` / `ContextBuilder`→`Context{system,messages}` / 会话与输入历史持久化 / skills / context_files / 七工具 / setup / `run_turn` | → ai, core, commands |
 | `crates/commands` | `slimcode-commands` | `/` 命令注册表 + fuzzy 预测（纯数据 + 纯函数，无 I/O） | 无 |
 | `crates/tui` | `slimcode-tui` | 终端图形库：`RenderItem` / `Effect` / `App`(new/apply/draw/handle_key) / `run(terminal, app, handler)` / `UiHandler` / 组件（theme/markdown/toolcall/footer/text/git） | **无 slimcode 依赖** |
 | `crates/cli` | `slimcode` | 唯一二进制 = 总入口：argv / 模式选择（one-shot 文本 vs 交互 TUI）/ 配置解析 / 服务构建 / 命令语义 / 会话落盘 / `TextRenderer` / `TuiAdapter` / 补全与文案 | → 全部 |
 
 重命名（ticket 01）：`crates/agent` → `crates/core`、`crates/common` → `crates/app`。关键依赖反转（ticket 02）：`Provider` trait 与 LLM `Message` 由 `ai` 拥有，`ai` 不再反向依赖运行时。
-
-**已知 spec 偏差**：spec 的「运行时与 hooks」要求把 loop 从自由函数改为 `AgentRunner`
-结构体（仅为 seam：事件订阅 + 可选闭包 hook 字段，默认全 `None`，不实现新语义）。
-六张 ticket 没有一张覆盖它，所以未实现 —— 运行时仍是自由函数
-`run_agent` / `run_agent_from_messages` / `run_agent_from_messages_sink`。已记入 `TODO.md`。
 
 依赖方向由测试断言（ticket 06，`crates/cli/tests/architecture.rs`）：`ai` 无 slimcode 依赖；`core` → 仅 `ai`；`app` → `ai`/`core`/`commands`；`tui` 无 slimcode 依赖；`cli` → 全部；`tui` 源码不得出现 `SessionStore`/`SkillStore`/`Config`。
 
@@ -115,7 +110,9 @@ tool_call_id，已不含日志专用字段），`core` 拥有会话单元 `Agent
 
 ### crates/core 运行时循环（`core`）
 
-折入自 ticket 04 原型，决策：
+循环是一个值：`AgentRunner`（借用式 per-run：tools / `RunConfig` / `CancelToken` / 事件订阅，
+`run(provider, system, messages)` 驱动，返回更新后的 history 与 stop reason；ADR-0011 D1，
+hook seam 见 ADR-0015）。折入自 ticket 04 原型，决策：
 
 - 循环：模型带 `tool_calls` 的响应 → 执行工具 → 追加 `role: tool` 结果 → 循环，直到模型不再调工具；
 - 停止：无 tool_calls → `Completed`（coding agent 无迭代上限，何时结束由模型决定）；

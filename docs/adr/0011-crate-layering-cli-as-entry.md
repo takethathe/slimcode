@@ -1,12 +1,11 @@
 # Crate layering with the CLI as the sole entry point
 
-> **Implementation note (tickets 02/03 + review)**: D1's `AgentRunner` name did not survive as a
-> type. The runtime loop stayed free functions (`run_agent`, `run_agent_from_messages`,
-> `run_agent_from_messages_sink`); the spec's "loop becomes a struct with optional closure hook
-> fields" seam was `seam only, no new semantics` and no ticket in the migration carried it, so it is
-> not built. Everything else D1 lists (`AgentEvent`, `AgentMessage` + `to_llm`/`convert`,
-> `Tool { spec, run }`, `RunConfig`, `StopReason`, `Provider`/`Message`/`ToolSpec`/`CancelToken` in
-> `ai`) is in place. Tracked in `TODO.md`.
+> **Implementation note (post-arch-realignment)**: D1's `AgentRunner` is implemented as a borrowed,
+> per-run value — `AgentRunner { tools, cfg, cancel, on_event }` with `run(provider, system,
+> messages)` driving the loop; the three free loop functions and `RunResult` are deleted. The
+> optional closure hook fields (the `RunHooks` seam) landed with ADR-0015. Everything else D1 lists
+> (`AgentEvent`, `AgentMessage` + `to_llm`/`convert`, `Tool { spec, run }`, `RunConfig`,
+> `StopReason`, `Provider`/`Message`/`ToolSpec`/`CancelToken` in `ai`) is in place.
 
 
 The workspace is re-cut into six crates with a single direction of dependency and one binary:

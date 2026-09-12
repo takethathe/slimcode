@@ -19,7 +19,7 @@ tool → …）。这组消息在交给运行时之前，由前端无关的 `Con
 `slimcode-app::context`）组装：基础系统提示（默认 `DEFAULT_SYSTEM_PROMPT`
 或 `with_system` 覆盖）+ 可自动调用 skill 的广告段落 + 可选 message history
 + 当轮 user prompt 或 skill 触发。`build()` 返回的 `Vec<Message>` 可直接交给
-`run_agent_from_messages`，无需二次转换。前端启动时还会注入系统环境信息
+`AgentRunner::run`，无需二次转换。前端启动时还会注入系统环境信息
 （`with_environment`）：OS 名、global home（slimcode home）、project home（git
 仓库根，无 git 时回退到 OS 用户主目录），渲染为 `## Environment` 章节放在基础
 提示之后、上下文文件之前，让模型无需探测文件系统就知道平台与全局/项目根目录。

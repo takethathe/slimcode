@@ -121,7 +121,7 @@ slimcode 的用户看不见这个问题，维护它的人躲不开：workspace �
 | crate | 对外界面 | 依赖 |
 | --- | --- | --- |
 | `slimcode-ai` | `Message`(wire) / `Provider` / `ToolSpec` / `Delta` / `FinishReason` / `CancelToken` / `TokenUsage` / wire 模型 | 无 slimcode 依赖 |
-| `slimcode-core` | `AgentEvent` / loop（`AgentRunner` —— 见下方实施偏差，实为自由函数）/ `AgentMessage`(+`to_llm`) / `convert` / `Tool{spec,run}` / `RunConfig` / `StopReason` | `ai` |
+| `slimcode-core` | `AgentEvent` / `AgentRunner`（loop + 可选闭包 hook 字段）/ `AgentMessage`(+`to_llm`) / `convert` / `Tool{spec,run}` / `RunConfig` / `StopReason` | `ai` |
 | `slimcode-app` | `DisplayItem` / `map_event` / `Renderer` / `usage_summary` / `ContextBuilder`→`Context{system,messages}` / 会话与输入历史持久化 / skills / context_files / 七工具 / setup / `run_turn` | `ai`, `core`, `commands` |
 | `slimcode-commands` | `/` 注册表 + fuzzy 预测（纯数据 + 纯函数） | 无 |
 | `slimcode-tui` | `RenderItem` / `Effect` / `App`(new/apply/draw/handle_key) / `run(terminal, app, handler)` / `UiHandler` / 组件 | **无 slimcode 依赖** |
@@ -152,10 +152,23 @@ slimcode 的用户看不见这个问题，维护它的人躲不开：workspace �
 - `Provider::chat(&[Message], &[ToolSpec], &CancelToken)`：工具对 provider 只是 schema；
   `core::Tool { spec: ToolSpec, run }` 是带执行闭包的包装；loop 每次 run 开头构建一次
   `Vec<ToolSpec>`。
-- `AgentRunner` 从自由函数变为结构体：事件订阅 + 可选闭包字段（如工具调用前后、回合结束/续跑），
-  默认全为 `None` 时行为与今天逐字节相同；本 spec 只摆 seam，不实现新语义。
-  **实施偏差（review）**：六张 ticket 没有一张覆盖这条，因此未实现 —— loop 仍是自由函数
-  `run_agent` / `run_agent_from_messages(_sink)`；已记入 `TODO.md`，ADR-0011 附 implementation note。
+- `AgentRunner` 从自由函数变为结构体：**借用式 per-run 值** —— 持有本轮的 `tools`、
+  `RunConfig`、`CancelToken`、事件订阅（`on_event` sink）与 `RunHooks`；`run(provider, system,
+  messages)` 每轮接收 provider、system 与 history。三个自由函数（`run_agent` /
+  `run_agent_from_messages` / `run_agent_from_messages_sink`）删除，调用点改为"构造 runner + `run()`"。
+- `RunHooks` 三个可选闭包字段，默认全 `None`（此时行为与今天逐字节相同），载荷都是
+  `AgentMessage`：
+  `before_tool(&mut AgentMessage, call_index) -> Result<ToolDecision, String>` —— 整批 call 在
+  **任何 dispatch 之前**按 model 序回调；`ToolDecision::Skip(Result<String, String>)` 表示不执行、
+  直接用给定结果（仍然产生一条 tool result，保持 call↔result 一一对应）；
+  `after_tool(&mut AgentMessage, ok: bool) -> Result<(), String>` —— 每条 result 进 history 与
+  发事件之前回调，**完成序**（被短路的 call 也算，排在完成序最前、彼此 model 序）；
+  `turn_end(&mut Vec<AgentMessage>, turns: usize, &StopReason) -> Result<(), String>` ——
+  `Completed`/`Cancelled` 收尾时回调一次，在 `AgentEvent::Stop` 之前。
+  钩子**可以改写**拿到的消息（新增 `AgentMessage::llm_mut`），`Err` 中止整轮；改写在事件与落盘
+  之前发生，所以界面、日志、下一轮请求看到的是同一份（ADR-0015）。
+  **对"只摆 seam，不实现新语义"的修订**：本票未覆盖该条、review 时发现，随后与用户逐条裁定为
+  "可改写的介入 seam"，记录在 ADR-0015。
 - `AgentEvent::Message` 的载荷是 `AgentMessage`；运行时不做磁盘 I/O。
 
 ### 显示链（ADR-0004 保留 + ADR-0014）

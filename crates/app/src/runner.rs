@@ -17,7 +17,7 @@
 //! message at the moment it exists.
 
 use slimcode_core::agent::{
-    AgentEvent, AgentMessage, CancelToken, Provider, RunConfig, StopReason, Tool,
+    AgentEvent, AgentMessage, AgentRunner, CancelToken, Provider, RunConfig, StopReason, Tool,
 };
 
 use crate::context::Context;
@@ -50,25 +50,19 @@ pub fn run_turn<P: Provider>(
     on_message: &mut dyn FnMut(&AgentMessage) -> Result<(), String>,
 ) -> Result<(Vec<AgentMessage>, StopReason), String> {
     let Context { system, messages } = context;
-    slimcode_core::agent::run_agent_from_messages_sink(
-        provider,
-        tools,
-        &system,
-        messages,
-        cfg,
-        cancel,
-        &mut |e| {
-            match &e {
-                AgentEvent::Message(m) => on_message(m)?,
-                _ => {
-                    if let Some(item) = map_event(&e) {
-                        renderer.render(&item)?;
-                    }
+    let mut sink = |e: AgentEvent| {
+        match &e {
+            AgentEvent::Message(m) => on_message(m)?,
+            _ => {
+                if let Some(item) = map_event(&e) {
+                    renderer.render(&item)?;
                 }
             }
-            Ok(())
-        },
-    )
+        }
+        Ok(())
+    };
+    let mut runner = AgentRunner::new(tools, cfg.clone(), cancel, &mut sink);
+    runner.run(provider, &system, messages)
 }
 
 #[cfg(test)]
@@ -187,6 +181,26 @@ mod tests {
     /// A sink that accepts every message (no persistence in these tests).
     fn noop_sink() -> impl FnMut(&AgentMessage) -> Result<(), String> {
         |_| Ok(())
+    }
+
+    /// Drive the agent loop directly (the runner the shared `run_turn` uses),
+    /// returning the updated history, the stop reason and the collected events.
+    fn run_agent(
+        provider: &mut impl Provider,
+        tools: &[Tool],
+        cfg: RunConfig,
+        cancel: &CancelToken,
+        system: &Message,
+        messages: Vec<AgentMessage>,
+    ) -> Result<(Vec<AgentMessage>, StopReason, Vec<AgentEvent>), String> {
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let mut sink = |e: AgentEvent| {
+            events.push(e);
+            Ok(())
+        };
+        let mut runner = AgentRunner::new(tools, cfg, cancel, &mut sink);
+        let (messages, stop) = runner.run(provider, system, messages)?;
+        Ok((messages, stop, events))
     }
 
     // --- behavior -----------------------------------------------------------
@@ -311,17 +325,18 @@ mod tests {
         .unwrap();
 
         let mut provider2 = FakeProvider::new(script);
-        let result = slimcode_core::agent::run_agent_from_messages(
+        let tools = [weather_tool()];
+        let (updated2, stop2, _) = run_agent(
             &mut provider2,
-            &[weather_tool()],
+            &tools,
+            RunConfig::default(),
+            &CancelToken::new(),
             &system(),
             messages,
-            &RunConfig::default(),
-            &CancelToken::new(),
         )
         .unwrap();
-        assert_eq!(updated, result.messages);
-        assert_eq!(stop, result.stop);
+        assert_eq!(updated, updated2);
+        assert_eq!(stop, stop2);
     }
 
     #[test]

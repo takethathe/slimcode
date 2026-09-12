@@ -75,6 +75,26 @@ parallel tool calls are a request-side capability, a Tool batch is the runtime's
 whichever calls arrive.
 _Avoid_: parallel function call, 并行函数调用
 
+**AgentRunner**:
+The runtime loop of one run as a value: it holds that run's tools, config, cancel token, event
+subscription and optional Run hooks, and takes the provider, system prompt and message history per
+call. It replaced the free loop functions, so a boundary (a hook, a subscriber) has one place to
+attach to.
+_Avoid_: executor, driver, agent loop (as a function)
+
+**Run hooks**:
+The optional callbacks an AgentRunner invokes at its boundaries: before a Tool batch's calls are
+dispatched, as each tool result is about to enter history, and once when the run stops. All of them
+default to unset, and a hook may rewrite the AgentMessage it is handed — so the model, the session
+log and the display all see the rewritten message.
+_Avoid_: middleware, interceptor, plugin
+
+**ToolDecision**:
+What a before-tool hook returns for one call: run it, or skip execution and supply the result the
+model will see. A skip still yields a tool result, because every `tool_call` must be paired with
+one.
+_Avoid_: verdict, action, permission
+
 **Session store**:
 The project-scoped place sessions are persisted: one directory per project
 (`<home>/sessions/<project-key>/`) holding one session log per Session; `/load` and `/sessions` see

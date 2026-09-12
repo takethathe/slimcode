@@ -4,7 +4,7 @@
 //!
 //! Frontend-agnostic: any frontend (the one-shot CLI, the TUI, or a web UI)
 //! builds a turn through [`ContextBuilder`] and hands the result straight to
-//! `run_agent_from_messages`. See `.scratch/context-builder` spec.
+//! [`slimcode_core::agent::AgentRunner::run`]. See `.scratch/context-builder` spec.
 
 use std::path::PathBuf;
 

@@ -1,6 +1,8 @@
 //! Agent runtime loop, folded from the ticket 04 prototype.
 //!
 //! Shape locked by `.scratch/slimcode-v1` ticket 04:
+//! - the loop is a value, [`AgentRunner`] (ADR-0011 D1): one run's tools,
+//!   config, cancel token and event subscription, with `run` driving the loop;
 //! - loop: model response with `tool_calls` → execute tools → append tool
 //!   results → loop, until the model stops calling tools;
 //! - stop conditions: no tool_calls → `Completed`; user interrupt (cancel
@@ -139,14 +141,6 @@ impl Default for RunConfig {
     }
 }
 
-#[derive(Debug)]
-pub struct RunResult {
-    pub messages: Vec<AgentMessage>,
-    pub iterations: usize,
-    pub stop: StopReason,
-    pub events: Vec<AgentEvent>,
-}
-
 fn dispatch(tools: &[Tool], tc: &ToolCall) -> Result<String, String> {
     match tools.iter().find(|t| t.spec.name == tc.name) {
         Some(t) => {
@@ -160,7 +154,7 @@ fn dispatch(tools: &[Tool], tc: &ToolCall) -> Result<String, String> {
 
 /// A live event sink for the agent loop: invoked for every [`AgentEvent`] as
 /// it is produced. `Err` aborts the loop (used to propagate renderer errors).
-type EventSink<'a> = &'a mut dyn FnMut(AgentEvent) -> Result<(), String>;
+pub type EventSink<'a> = &'a mut dyn FnMut(AgentEvent) -> Result<(), String>;
 
 /// Emit the `ToolStart`/`ToolResult` pair for one finished call. Called in
 /// **completion order** so the frontends see results as they land; the
@@ -296,155 +290,137 @@ fn execute_tools(
     Ok(false)
 }
 
-/// The agent loop over a freshly built `[system, user]` history — the simple
-/// one-shot entry point (used by the non-interactive CLI mode).
-pub fn run_agent<P: Provider>(
-    provider: &mut P,
-    tools: &[Tool],
-    system: &str,
-    user: &str,
-    cfg: &RunConfig,
-    cancel: &CancelToken,
-) -> Result<RunResult, String> {
-    let system = Message::text(Role::System, system);
-    let messages = vec![AgentMessage::text(Role::User, user)];
-    run_agent_from_messages(provider, tools, &system, messages, cfg, cancel)
+/// The agent loop as a value (ADR-0011 D1): one run's tools, config, cancel
+/// token and event subscription, with [`AgentRunner::run`] driving the loop
+/// over a message history. The event subscription is the sink every
+/// [`AgentEvent`] flows into; `slimcode-app`'s shared turn runner builds one
+/// runner per turn. ADR-0015 adds the optional hook seam on top of this.
+pub struct AgentRunner<'a> {
+    /// The tools this run may invoke.
+    pub tools: &'a [Tool],
+    /// The run's configuration (parallel vs serial tool dispatch).
+    pub cfg: RunConfig,
+    /// The caller's cancellation handle.
+    pub cancel: &'a CancelToken,
+    /// The live event subscription.
+    pub on_event: EventSink<'a>,
 }
 
-/// The shared loop: drives one turn over `messages`, forwarding every event to
-/// `on_event` as it happens, and returns `(updated history, iterations, stop)`.
-/// A sink error (e.g. a renderer failure) aborts the run.
-///
-/// A cancel is honored at every runner boundary (ticket 07): before a
-/// provider call, right after it errors (a provider error that coincides with
-/// a cancel is a silent Cancelled stop, not a propagated error), after its
-/// deltas were streamed (a cancel that landed during the request discards the
-/// half text — no assistant message enters history), and before/after each
-/// tool call. Partial history (already-pushed tool results) is returned
-/// as-is with [`StopReason::Cancelled`].
-fn run_loop<P: Provider>(
-    provider: &mut P,
-    tools: &[Tool],
-    system: &Message,
-    mut messages: Vec<AgentMessage>,
-    cfg: &RunConfig,
-    cancel: &CancelToken,
-    on_event: EventSink<'_>,
-) -> Result<(Vec<AgentMessage>, usize, StopReason), String> {
-    let mut iterations = 0usize;
-
-    // The provider sees tools as a schema only: build the `ToolSpec` list once
-    // per run (not per request) and hand it to every `chat` call (ADR-0011 D1).
-    let tool_specs: Vec<ToolSpec> = tools.iter().map(|t| t.spec.clone()).collect();
-
-    // Unbounded loop: a coding agent runs until the model stops calling tools
-    // (`FinishReason::Stop`), the caller cancels, or the provider errors.
-    // There is intentionally no iteration cap — ending a run is the model's
-    // job (no tool calls ⇒ final answer). Each `break` carries the
-    // [`StopReason`] for that exit.
-    let stop = 'run: loop {
-        // Boundary: a cancel between iterations (or before the first request)
-        // stops before any provider call is made.
-        if cancel.is_cancelled() {
-            break 'run StopReason::Cancelled;
+impl<'a> AgentRunner<'a> {
+    pub fn new(
+        tools: &'a [Tool],
+        cfg: RunConfig,
+        cancel: &'a CancelToken,
+        on_event: EventSink<'a>,
+    ) -> Self {
+        Self {
+            tools,
+            cfg,
+            cancel,
+            on_event,
         }
-        iterations += 1;
-        let turn = iterations;
-        on_event(AgentEvent::Turn { turn })?;
+    }
 
-        let deltas = match provider.chat(&convert(system, &messages), &tool_specs, cancel) {
-            Ok(deltas) => deltas,
-            // A provider error that landed together with a cancel (its
-            // interruptible read aborted) is a silent cancelled stop, not an
-            // error.
-            Err(_) if cancel.is_cancelled() => break 'run StopReason::Cancelled,
-            Err(e) => return Err(e),
-        };
-        // Anything the provider returned was emitted live during the
-        // request; stream it out as it arrived.
-        for d in &deltas {
-            on_event(AgentEvent::Stream(d.clone()))?;
-        }
-        // A cancel that landed during the request discards the half message:
-        // the streamed deltas stay on the transcript, but no assistant
-        // message enters history.
-        if cancel.is_cancelled() {
-            break 'run StopReason::Cancelled;
-        }
-        let (text, tool_calls, reason) = assemble(&deltas);
-        let mut asst = Message::text(Role::Assistant, text);
-        asst.tool_calls = tool_calls.clone();
-        let asst = AgentMessage::Llm(asst);
-        messages.push(asst.clone());
-        // Announce the history entry right after it is pushed, so the session
-        // layer persists the message at the moment it exists (ADR-0009 D2).
-        on_event(AgentEvent::Message(asst))?;
+    /// Drive one run over `messages` (already including the latest user
+    /// message), forwarding every event to the subscription as it happens,
+    /// and return the updated history plus the stop reason. A subscription
+    /// error aborts the run. Cancellation is honored at every runner boundary:
+    /// before a provider call, right after it errors (a provider error that
+    /// coincides with a cancel is a silent Cancelled stop, not a propagated
+    /// error), after its deltas were streamed (a cancel that landed during the
+    /// request discards the half text — no assistant message enters history),
+    /// and before/after each tool call. Partial history (already-pushed tool
+    /// results) is returned as-is with [`StopReason::Cancelled`].
+    ///
+    /// The system prompt is passed separately and never part of the history
+    /// (ADR-0012 D3); the runtime prepends it to `convert` before every
+    /// provider request.
+    pub fn run<P: Provider>(
+        &mut self,
+        provider: &mut P,
+        system: &Message,
+        mut messages: Vec<AgentMessage>,
+    ) -> Result<(Vec<AgentMessage>, StopReason), String> {
+        let mut iterations = 0usize;
 
-        match reason {
-            FinishReason::Stop => break 'run StopReason::Completed,
-            FinishReason::ToolCalls => {
-                let cancelled = execute_tools(
-                    tools,
-                    &tool_calls,
-                    cfg.parallel_tools,
-                    cancel,
-                    on_event,
-                    &mut messages,
-                )?;
-                if cancelled {
-                    break 'run StopReason::Cancelled;
-                }
-                // fall through to the next turn (tool results are in history)
+        // The provider sees tools as a schema only: build the `ToolSpec` list
+        // once per run (not per request) and hand it to every `chat` call
+        // (ADR-0011 D1).
+        let tool_specs: Vec<ToolSpec> = self.tools.iter().map(|t| t.spec.clone()).collect();
+
+        // Unbounded loop: a coding agent runs until the model stops calling
+        // tools (`FinishReason::Stop`), the caller cancels, or the provider
+        // errors. There is intentionally no iteration cap — ending a run is
+        // the model's job (no tool calls ⇒ final answer). Each `break` carries
+        // the [`StopReason`] for that exit.
+        let stop = 'run: loop {
+            // Boundary: a cancel between iterations (or before the first
+            // request) stops before any provider call is made.
+            if self.cancel.is_cancelled() {
+                break 'run StopReason::Cancelled;
             }
-        }
-    };
+            iterations += 1;
+            let turn = iterations;
+            on_event_call(&mut self.on_event, AgentEvent::Turn { turn })?;
 
-    on_event(AgentEvent::Stop(stop.clone()))?;
-    Ok((messages, iterations, stop))
+            let deltas = match provider.chat(&convert(system, &messages), &tool_specs, self.cancel)
+            {
+                Ok(deltas) => deltas,
+                // A provider error that landed together with a cancel (its
+                // interruptible read aborted) is a silent cancelled stop, not
+                // an error.
+                Err(_) if self.cancel.is_cancelled() => break 'run StopReason::Cancelled,
+                Err(e) => return Err(e),
+            };
+            // Anything the provider returned was emitted live during the
+            // request; stream it out as it arrived.
+            for d in &deltas {
+                on_event_call(&mut self.on_event, AgentEvent::Stream(d.clone()))?;
+            }
+            // A cancel that landed during the request discards the half
+            // message: the streamed deltas stay on the transcript, but no
+            // assistant message enters history.
+            if self.cancel.is_cancelled() {
+                break 'run StopReason::Cancelled;
+            }
+            let (text, tool_calls, reason) = assemble(&deltas);
+            let mut asst = Message::text(Role::Assistant, text);
+            asst.tool_calls = tool_calls.clone();
+            let asst = AgentMessage::Llm(asst);
+            messages.push(asst.clone());
+            // Announce the history entry right after it is pushed, so the
+            // session layer persists the message at the moment it exists
+            // (ADR-0009 D2).
+            on_event_call(&mut self.on_event, AgentEvent::Message(asst))?;
+
+            match reason {
+                FinishReason::Stop => break 'run StopReason::Completed,
+                FinishReason::ToolCalls => {
+                    let cancelled = execute_tools(
+                        self.tools,
+                        &tool_calls,
+                        self.cfg.parallel_tools,
+                        self.cancel,
+                        &mut *self.on_event,
+                        &mut messages,
+                    )?;
+                    if cancelled {
+                        break 'run StopReason::Cancelled;
+                    }
+                    // fall through to the next turn (tool results are in
+                    // history)
+                }
+            }
+        };
+
+        on_event_call(&mut self.on_event, AgentEvent::Stop(stop.clone()))?;
+        Ok((messages, stop))
+    }
 }
 
-/// The agent loop over an existing message history (already including the
-/// latest user message), streaming every event to `on_event` live and
-/// returning the updated message history together with the stop reason. Used
-/// by `slimcode-app`'s shared runner to render live through a `Renderer`.
-pub fn run_agent_from_messages_sink<P: Provider>(
-    provider: &mut P,
-    tools: &[Tool],
-    system: &Message,
-    messages: Vec<AgentMessage>,
-    cfg: &RunConfig,
-    cancel: &CancelToken,
-    on_event: EventSink<'_>,
-) -> Result<(Vec<AgentMessage>, StopReason), String> {
-    let (messages, _, stop) = run_loop(provider, tools, system, messages, cfg, cancel, on_event)?;
-    Ok((messages, stop))
-}
-
-/// The agent loop over an existing message history (already including the
-/// latest user message). Used by an interactive frontend to continue a
-/// restored session: assistant replies and tool results are appended to
-/// `messages`, so the caller replaces its stored history with
-/// `RunResult::messages`.
-pub fn run_agent_from_messages<P: Provider>(
-    provider: &mut P,
-    tools: &[Tool],
-    system: &Message,
-    messages: Vec<AgentMessage>,
-    cfg: &RunConfig,
-    cancel: &CancelToken,
-) -> Result<RunResult, String> {
-    let mut events: Vec<AgentEvent> = Vec::new();
-    let (messages, iterations, stop) =
-        run_loop(provider, tools, system, messages, cfg, cancel, &mut |e| {
-            events.push(e);
-            Ok(())
-        })?;
-    Ok(RunResult {
-        messages,
-        iterations,
-        stop,
-        events,
-    })
+/// Invoke the event subscription once (a `&mut dyn FnMut` stored in a field).
+fn on_event_call(sink: &mut EventSink<'_>, event: AgentEvent) -> Result<(), String> {
+    sink(event)
 }
 
 #[cfg(test)]
@@ -554,20 +530,44 @@ mod tests {
         )
     }
 
+    /// The loop test harness: one run over a scripted provider with a
+    /// collecting event sink. Returns the run's observables so tests assert
+    /// external behaviour only.
+    fn run_with(
+        provider: &mut impl Provider,
+        tools: &[Tool],
+        cfg: RunConfig,
+        cancel: &CancelToken,
+        system: &Message,
+        messages: Vec<AgentMessage>,
+    ) -> Result<(Vec<AgentMessage>, StopReason, Vec<AgentEvent>), String> {
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let mut sink = |e: AgentEvent| {
+            events.push(e);
+            Ok(())
+        };
+        let mut runner = AgentRunner::new(tools, cfg, cancel, &mut sink);
+        let (messages, stop) = runner.run(provider, system, messages)?;
+        Ok((messages, stop, events))
+    }
+
+    /// The standard one-shot script: system "be helpful", user
+    /// "weather in Beijing?", fresh cancel token.
     fn run(
         script: Vec<Vec<Delta>>,
         tools: Vec<Tool>,
-        cfg: &RunConfig,
-    ) -> Result<RunResult, String> {
+        cfg: RunConfig,
+    ) -> Result<(Vec<AgentMessage>, usize, StopReason, Vec<AgentEvent>), String> {
         let mut p = FakeProvider::new(script);
-        run_agent(
-            &mut p,
-            &tools,
-            "be helpful",
-            "weather in Beijing?",
-            cfg,
-            &CancelToken::new(),
-        )
+        let system = Message::text(Role::System, "be helpful");
+        let messages = vec![AgentMessage::text(Role::User, "weather in Beijing?")];
+        let (messages, stop, events) =
+            run_with(&mut p, &tools, cfg, &CancelToken::new(), &system, messages)?;
+        let turns = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Turn { .. }))
+            .count();
+        Ok((messages, turns, stop, events))
     }
 
     // --- assemble ----------------------------------------------------------
@@ -615,15 +615,15 @@ mod tests {
 
     #[test]
     fn single_turn_no_tools_completes() {
-        let res = run(
+        let (messages, turns, stop, _) = run(
             vec![vec![t("Beijing is sunny."), done_stop()]],
             vec![weather_tool()],
-            &RunConfig::default(),
+            RunConfig::default(),
         )
         .unwrap();
-        assert_eq!(res.stop, StopReason::Completed);
-        assert_eq!(res.iterations, 1);
-        assert_eq!(res.messages.len(), 2); // user + assistant (system is not history)
+        assert_eq!(stop, StopReason::Completed);
+        assert_eq!(turns, 1);
+        assert_eq!(messages.len(), 2); // user + assistant (system is not history)
     }
 
     #[test]
@@ -636,22 +636,19 @@ mod tests {
             ],
             vec![t("Beijing is 25C."), done_stop()],
         ];
-        let res = run(script, vec![weather_tool()], &RunConfig::default()).unwrap();
-        assert_eq!(res.stop, StopReason::Completed);
-        assert_eq!(res.iterations, 2);
+        let (messages, turns, stop, events) =
+            run(script, vec![weather_tool()], RunConfig::default()).unwrap();
+        assert_eq!(stop, StopReason::Completed);
+        assert_eq!(turns, 2);
         // user + assistant(tool_calls) + tool + assistant(final): the
         // system prompt is not part of the history (ADR-0012 D3)
-        assert_eq!(res.messages.len(), 4);
+        assert_eq!(messages.len(), 4);
         // the tool message carries the result
-        let tool_msg = res
-            .messages
-            .iter()
-            .find(|m| m.role() == &Role::Tool)
-            .unwrap();
+        let tool_msg = messages.iter().find(|m| m.role() == &Role::Tool).unwrap();
         assert_eq!(tool_msg.tool_call_id(), Some("call_1"));
         assert!(tool_msg.text_content().contains("25C"));
         // events expose the full surface
-        assert!(res.events.iter().any(
+        assert!(events.iter().any(
             |e| matches!(e, AgentEvent::ToolResult { name, ok: true, .. } if name == "get_weather")
         ));
     }
@@ -671,9 +668,9 @@ mod tests {
             ],
             vec![t("Beijing is 25C."), done_stop()],
         ];
-        let res = run(script, vec![weather_tool()], &RunConfig::default()).unwrap();
-        let announced: Vec<&AgentMessage> = res
-            .events
+        let (messages, _, _, events) =
+            run(script, vec![weather_tool()], RunConfig::default()).unwrap();
+        let announced: Vec<&AgentMessage> = events
             .iter()
             .filter_map(|e| match e {
                 AgentEvent::Message(m) => Some(m),
@@ -683,7 +680,7 @@ mod tests {
         // The announced messages are exactly the ones that entered history.
         assert_eq!(
             announced.iter().map(|m| (*m).clone()).collect::<Vec<_>>(),
-            res.messages[1..]
+            messages[1..]
         );
     }
 
@@ -702,9 +699,8 @@ mod tests {
             ],
             vec![t("done"), done_stop()],
         ];
-        let res = run(script, vec![weather_tool()], &RunConfig::default()).unwrap();
-        let kinds: Vec<&str> = res
-            .events
+        let (_, _, _, events) = run(script, vec![weather_tool()], RunConfig::default()).unwrap();
+        let kinds: Vec<&str> = events
             .iter()
             .map(|e| match e {
                 AgentEvent::Turn { .. } => "turn",
@@ -755,9 +751,8 @@ mod tests {
             ],
             vec![t("Beijing is 25C."), done_stop()],
         ];
-        let res = run(script, vec![weather_tool()], &RunConfig::default()).unwrap();
-        let start_id = res
-            .events
+        let (_, _, _, events) = run(script, vec![weather_tool()], RunConfig::default()).unwrap();
+        let start_id = events
             .iter()
             .find_map(|e| match e {
                 AgentEvent::ToolStart {
@@ -767,8 +762,7 @@ mod tests {
             })
             .expect("tool start event");
         assert_eq!(start_id, "call_1");
-        let result_id = res
-            .events
+        let result_id = events
             .iter()
             .find_map(|e| match e {
                 AgentEvent::ToolResult {
@@ -792,16 +786,15 @@ mod tests {
             ],
             vec![t("both done"), done_stop()],
         ];
-        let res = run(
+        let (messages, _, _, _) = run(
             script,
             vec![weather_tool()],
-            &RunConfig {
+            RunConfig {
                 parallel_tools: true,
             },
         )
         .unwrap();
-        let tool_msgs: Vec<_> = res
-            .messages
+        let tool_msgs: Vec<_> = messages
             .iter()
             .filter(|m| m.role() == &Role::Tool)
             .collect();
@@ -841,15 +834,15 @@ mod tests {
             ],
             vec![t("done"), done_stop()],
         ];
-        let res = run(
+        let (_, _, stop, _) = run(
             script,
             vec![blocking_tool("tool_a"), blocking_tool("tool_b")],
-            &RunConfig {
+            RunConfig {
                 parallel_tools: true,
             },
         )
         .unwrap();
-        assert_eq!(res.stop, StopReason::Completed);
+        assert_eq!(stop, StopReason::Completed);
         let peak = peak.load(std::sync::atomic::Ordering::SeqCst);
         assert!(peak >= 2, "peak concurrency was {peak}, not concurrent");
     }
@@ -896,18 +889,17 @@ mod tests {
             ],
             vec![t("done"), done_stop()],
         ];
-        let res = run(
+        let (messages, _, _, events) = run(
             script,
             vec![slow, fast],
-            &RunConfig {
+            RunConfig {
                 parallel_tools: true,
             },
         )
         .unwrap();
 
         // History (and thus the Session log) is deterministic: model order.
-        let history_ids: Vec<&str> = res
-            .messages
+        let history_ids: Vec<&str> = messages
             .iter()
             .filter(|m| m.role() == &Role::Tool)
             .map(|m| m.tool_call_id().expect("tool result has an id"))
@@ -915,8 +907,7 @@ mod tests {
         assert_eq!(history_ids, vec!["call_0", "call_1"]);
 
         // Events stream in completion order: the fast call reports first.
-        let result_ids: Vec<&str> = res
-            .events
+        let result_ids: Vec<&str> = events
             .iter()
             .filter_map(|e| match e {
                 AgentEvent::ToolResult { tool_call_id, .. } => Some(tool_call_id.as_str()),
@@ -936,20 +927,17 @@ mod tests {
             ],
             vec![t("No station for Tokyo."), done_stop()],
         ];
-        let res = run(script, vec![fragile_tool()], &RunConfig::default()).unwrap();
-        assert_eq!(res.stop, StopReason::Completed);
-        let tool_msg = res
-            .messages
-            .iter()
-            .find(|m| m.role() == &Role::Tool)
-            .unwrap();
+        let (messages, _, stop, _) =
+            run(script, vec![fragile_tool()], RunConfig::default()).unwrap();
+        assert_eq!(stop, StopReason::Completed);
+        let tool_msg = messages.iter().find(|m| m.role() == &Role::Tool).unwrap();
         assert!(
             tool_msg.text_content().starts_with("Error: "),
             "got: {}",
             tool_msg.text_content()
         );
         // the final assistant answer still comes through
-        let last = res.messages.last().unwrap();
+        let last = messages.last().unwrap();
         assert_eq!(last.role(), &Role::Assistant);
         assert!(last.text_content().contains("Tokyo"));
     }
@@ -968,14 +956,15 @@ mod tests {
             ]);
         }
         script.push(vec![t("done"), done_stop()]);
-        let res = run(script, vec![weather_tool()], &RunConfig::default()).unwrap();
-        assert_eq!(res.stop, StopReason::Completed);
-        assert_eq!(res.iterations, 6);
-        assert_eq!(res.messages.len(), 1 /*user*/ + 6 + 5);
+        let (messages, turns, stop, _) =
+            run(script, vec![weather_tool()], RunConfig::default()).unwrap();
+        assert_eq!(stop, StopReason::Completed);
+        assert_eq!(turns, 6);
+        assert_eq!(messages.len(), 1 /*user*/ + 6 + 5);
     }
 
     #[test]
-    fn run_agent_from_messages_continues_existing_history() {
+    fn run_continues_existing_history() {
         // A restored session already has an old assistant reply; the frontend
         // appends a new user message and continues from there. The system
         // prompt is passed separately and never part of the history
@@ -994,20 +983,21 @@ mod tests {
             vec![t("Beijing is 25C."), done_stop()],
         ];
         let mut p = FakeProvider::new(script);
-        let res = run_agent_from_messages(
+        let tools = [weather_tool()];
+        let (messages, stop, _) = run_with(
             &mut p,
-            &[weather_tool()],
+            &tools,
+            RunConfig::default(),
+            &CancelToken::new(),
             &system,
             history.clone(),
-            &RunConfig::default(),
-            &CancelToken::new(),
         )
         .unwrap();
-        assert_eq!(res.stop, StopReason::Completed);
+        assert_eq!(stop, StopReason::Completed);
         // old history preserved + assistant(tool_calls) + tool + assistant(final)
-        assert_eq!(res.messages.len(), history.len() + 3);
-        assert_eq!(res.messages[0].role(), &Role::Assistant);
-        assert!(res.messages[1].text_content().contains("weather"));
+        assert_eq!(messages.len(), history.len() + 3);
+        assert_eq!(messages[0].role(), &Role::Assistant);
+        assert!(messages[1].text_content().contains("weather"));
         // provider received the system + full history on its first chat call
         assert_eq!(p.calls, 2);
     }
@@ -1026,13 +1016,14 @@ mod tests {
             }
         }
         let mut p = ErrProvider;
-        let err = run_agent(
+        let tools: [Tool; 0] = [];
+        let err = run_with(
             &mut p,
-            &[],
-            "sys",
-            "user",
-            &RunConfig::default(),
+            &tools,
+            RunConfig::default(),
             &CancelToken::new(),
+            &Message::text(Role::System, "sys"),
+            vec![AgentMessage::text(Role::User, "user")],
         )
         .unwrap_err();
         assert!(err.contains("provider exploded"));
@@ -1061,13 +1052,22 @@ mod tests {
         let cancel = CancelToken::new();
         cancel.cancel();
         let mut p = FakeProvider::new(vec![vec![t("never"), done_stop()]]);
-        let res = run_agent(&mut p, &[], "sys", "user", &RunConfig::default(), &cancel).unwrap();
-        assert_eq!(res.stop, StopReason::Cancelled);
+        let tools: [Tool; 0] = [];
+        let (messages, stop, events) = run_with(
+            &mut p,
+            &tools,
+            RunConfig::default(),
+            &cancel,
+            &Message::text(Role::System, "sys"),
+            vec![AgentMessage::text(Role::User, "user")],
+        )
+        .unwrap();
+        assert_eq!(stop, StopReason::Cancelled);
         assert_eq!(p.calls, 0, "no provider call must be made");
-        assert_eq!(res.messages.len(), 1, "history untouched (user only)");
+        assert_eq!(messages.len(), 1, "history untouched (user only)");
         // The cancelled stop is emitted as an event, like every other stop.
         assert!(
-            res.events
+            events
                 .iter()
                 .any(|e| matches!(e, AgentEvent::Stop(StopReason::Cancelled)))
         );
@@ -1080,16 +1080,25 @@ mod tests {
         // batch, simulating Esc landing while the request was streaming.
         let mut p =
             FakeProvider::new(vec![vec![t("half text"), done_stop()]]).cancels_on(1, &cancel);
-        let res = run_agent(&mut p, &[], "sys", "user", &RunConfig::default(), &cancel).unwrap();
-        assert_eq!(res.stop, StopReason::Cancelled);
+        let tools: [Tool; 0] = [];
+        let (messages, stop, events) = run_with(
+            &mut p,
+            &tools,
+            RunConfig::default(),
+            &cancel,
+            &Message::text(Role::System, "sys"),
+            vec![AgentMessage::text(Role::User, "user")],
+        )
+        .unwrap();
+        assert_eq!(stop, StopReason::Cancelled);
         // The half text was streamed out live (it stays on the transcript)...
         assert!(
-            res.events
+            events
                 .iter()
                 .any(|e| matches!(e, AgentEvent::Stream(Delta::Text(t)) if t == "half text"))
         );
         // ...but no assistant message enters history (no half-text message).
-        assert_eq!(res.messages.len(), 1);
+        assert_eq!(messages.len(), 1);
     }
 
     #[test]
@@ -1108,8 +1117,17 @@ mod tests {
             }
         }
         let mut p = ErrProvider;
-        let res = run_agent(&mut p, &[], "sys", "user", &RunConfig::default(), &cancel).unwrap();
-        assert_eq!(res.stop, StopReason::Cancelled);
+        let tools: [Tool; 0] = [];
+        let (_, stop, _) = run_with(
+            &mut p,
+            &tools,
+            RunConfig::default(),
+            &cancel,
+            &Message::text(Role::System, "sys"),
+            vec![AgentMessage::text(Role::User, "user")],
+        )
+        .unwrap();
+        assert_eq!(stop, StopReason::Cancelled);
     }
 
     #[test]
@@ -1126,19 +1144,19 @@ mod tests {
             vec![t("final answer"), done_stop()],
         ])
         .cancels_on(2, &cancel);
-        let res = run_agent(
+        let tools = [weather_tool()];
+        let (messages, stop, events) = run_with(
             &mut p,
-            &[weather_tool()],
-            "sys",
-            "user",
-            &RunConfig::default(),
+            &tools,
+            RunConfig::default(),
             &cancel,
+            &Message::text(Role::System, "sys"),
+            vec![AgentMessage::text(Role::User, "user")],
         )
         .unwrap();
-        assert_eq!(res.stop, StopReason::Cancelled);
+        assert_eq!(stop, StopReason::Cancelled);
         // The already-pushed tool result stays in history...
-        let tool_msgs: Vec<_> = res
-            .messages
+        let tool_msgs: Vec<_> = messages
             .iter()
             .filter(|m| m.role() == &Role::Tool)
             .collect();
@@ -1146,14 +1164,14 @@ mod tests {
         assert!(tool_msgs[0].text_content().contains("25C"));
         // ...but the aborted final assistant reply does not (half text rule).
         assert!(
-            res.messages
+            messages
                 .iter()
                 .all(|m| !m.text_content().contains("final answer")),
             "no assistant message from the cancelled turn in history"
         );
         // The final text was still streamed live.
         assert!(
-            res.events
+            events
                 .iter()
                 .any(|e| matches!(e, AgentEvent::Stream(Delta::Text(t)) if t == "final answer"))
         );
@@ -1186,26 +1204,27 @@ mod tests {
             tc_args(1, "{}"),
             done_tools(),
         ]];
-        let res = run_agent(
+        let tools = [weather_tool(), flipper];
+        let (messages, stop, events) = run_with(
             &mut FakeProvider::new(script),
-            &[weather_tool(), flipper],
-            "sys",
-            "user",
-            &RunConfig {
+            &tools,
+            RunConfig {
                 parallel_tools: true,
             },
             &cancel,
+            &Message::text(Role::System, "sys"),
+            vec![AgentMessage::text(Role::User, "user")],
         )
         .unwrap();
-        assert_eq!(res.stop, StopReason::Cancelled);
-        assert!(res.messages.iter().all(|m| m.role() != &Role::Tool));
+        assert_eq!(stop, StopReason::Cancelled);
+        assert!(messages.iter().all(|m| m.role() != &Role::Tool));
         assert!(
-            res.events.iter().all(|e| !matches!(
+            events.iter().all(|e| !matches!(
                 e,
                 AgentEvent::ToolStart { .. } | AgentEvent::ToolResult { .. }
             )),
             "no tool events for a discarded batch: {:?}",
-            res.events
+            events
         );
     }
 
@@ -1241,24 +1260,24 @@ mod tests {
             tc_args(2, "{}"),
             done_tools(),
         ]];
-        let res = run_agent(
+        let tools = [weather_tool(), tool, never];
+        let (messages, stop, _) = run_with(
             &mut FakeProvider::new(script),
-            &[weather_tool(), tool, never],
-            "sys",
-            "user",
-            &RunConfig {
+            &tools,
+            RunConfig {
                 parallel_tools: false,
             },
             &cancel,
+            &Message::text(Role::System, "sys"),
+            vec![AgentMessage::text(Role::User, "user")],
         )
         .unwrap();
-        assert_eq!(res.stop, StopReason::Cancelled);
+        assert_eq!(stop, StopReason::Cancelled);
         // Tool 2 executed (and cancelled); tool 3 was skipped.
         assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 1);
         // Weather's completed result is in history; the cancelling tool's own
         // aborted result and the skipped tool's result are not.
-        let tool_msgs: Vec<&AgentMessage> = res
-            .messages
+        let tool_msgs: Vec<&AgentMessage> = messages
             .iter()
             .filter(|m| m.role() == &Role::Tool)
             .collect();
@@ -1292,20 +1311,21 @@ mod tests {
         let cfg = RunConfig {
             parallel_tools: true,
         };
-        let res = run_agent(
+        let tools = [weather_tool(), flipper];
+        let (messages, stop, _) = run_with(
             &mut FakeProvider::new(script),
-            &[weather_tool(), flipper],
-            "sys",
-            "user",
-            &cfg,
+            &tools,
+            cfg,
             &cancel,
+            &Message::text(Role::System, "sys"),
+            vec![AgentMessage::text(Role::User, "user")],
         )
         .unwrap();
-        assert_eq!(res.stop, StopReason::Cancelled);
+        assert_eq!(stop, StopReason::Cancelled);
         // The batch ran in parallel (both dispatched) but the cancel landed
         // before any result was applied: history has no tool messages.
         assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert!(res.messages.iter().all(|m| m.role() != &Role::Tool));
+        assert!(messages.iter().all(|m| m.role() != &Role::Tool));
     }
 
     #[test]
@@ -1318,12 +1338,10 @@ mod tests {
             ],
             vec![t("oops"), done_stop()],
         ];
-        let res = run(script, vec![weather_tool()], &RunConfig::default()).unwrap();
-        let tool_msg = res
-            .messages
-            .iter()
-            .find(|m| m.role() == &Role::Tool)
-            .unwrap();
+        let (messages, _, stop, _) =
+            run(script, vec![weather_tool()], RunConfig::default()).unwrap();
+        assert_eq!(stop, StopReason::Completed);
+        let tool_msg = messages.iter().find(|m| m.role() == &Role::Tool).unwrap();
         assert!(tool_msg.text_content().contains("unknown tool: nope"));
     }
 }
