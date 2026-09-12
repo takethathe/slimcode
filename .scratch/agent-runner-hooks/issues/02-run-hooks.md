@@ -64,7 +64,7 @@ that errors aborts the run. With no hook set, nothing about a run changes.
 - 测试 harness 变化：`run_with_hooks` 保持返回三元组；事件收集改为传入调用方持有的
   `&mut Vec`（`run_with_hooks_collect`），规避 runner drop glue 使 sink 借用存活导致的 E0505。
 - 文档：ADR-0015（D1–D4 + 备选 + 后果）、`CONTEXT.md` 的 `AgentRunner` / `Run hooks` /
-  `ToolDecision` 已在设计轮写入并由 01 提交带上；`TODO.md` 勾掉「AgentRunner 运行时 seam」。
-
+  `ToolDecision` 已在设计轮写入并由 01 提交带上；`TODO.md` 按 AGENTS.md §7（完成即删）移除
+  「AgentRunner 运行时 seam」待办项。
 验证：`cargo test --workspace` 全绿（cli 64 + architecture 7 + tmux 3 + ai 45 + app 190 +
-commands 26 + core 79 + tui 123），`cargo fmt --all`，clippy 0 error / 0 warning。
+commands 26 + core 81 + tui 123），`cargo fmt --all`，clippy 0 error / 0 warning。

@@ -185,7 +185,7 @@ mod tests {
 
     /// Drive the agent loop directly (the runner the shared `run_turn` uses),
     /// returning the updated history, the stop reason and the collected events.
-    fn run_agent(
+    fn drive_agent_runner(
         provider: &mut impl Provider,
         tools: &[Tool],
         cfg: RunConfig,
@@ -197,13 +197,20 @@ mod tests {
         // The sink's borrow of `events` ends when the collect helper returns,
         // so the Vec can be moved out afterwards (the runner's drop glue
         // would keep the borrow alive otherwise).
-        let (messages, stop) =
-            run_agent_collect(provider, tools, cfg, cancel, system, messages, &mut events)?;
+        let (messages, stop) = drive_agent_runner_collect(
+            provider,
+            tools,
+            cfg,
+            cancel,
+            system,
+            messages,
+            &mut events,
+        )?;
         Ok((messages, stop, events))
     }
 
     /// The same loop with a caller-owned event collector.
-    fn run_agent_collect(
+    fn drive_agent_runner_collect(
         provider: &mut impl Provider,
         tools: &[Tool],
         cfg: RunConfig,
@@ -316,8 +323,8 @@ mod tests {
 
     #[test]
     fn returned_history_matches_agent_semantics() {
-        // The returned history must equal what the existing agent loop would
-        // produce (RunResult::messages) for the same script.
+        // The returned history must equal what the agent loop produces for
+        // the same script: an AgentRunner-driven run.
         let script = vec![
             vec![
                 tc_start(0, "call_1", "get_weather"),
@@ -343,7 +350,7 @@ mod tests {
 
         let mut provider2 = FakeProvider::new(script);
         let tools = [weather_tool()];
-        let (updated2, stop2, _) = run_agent(
+        let (updated2, stop2, _) = drive_agent_runner(
             &mut provider2,
             &tools,
             RunConfig::default(),

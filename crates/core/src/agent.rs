@@ -170,8 +170,6 @@ fn dispatch(tools: &[Tool], tc: &ToolCall) -> Result<String, String> {
 /// it is produced. `Err` aborts the loop (used to propagate renderer errors).
 pub type EventSink<'a> = &'a mut dyn FnMut(AgentEvent) -> Result<(), String>;
 
-/// The optional hook seam (ADR-0015): three callbacks at the loop's
-/// boundaries, all of them unset by default. A hook receives the
 /// Signature of a [`RunHooks::before_tool`] hook: once per call in model
 /// order, with the batch's assistant message to rewrite or skip.
 pub type BeforeToolHook<'a> =
@@ -313,14 +311,20 @@ impl<'a> AgentRunner<'a> {
             asst.tool_calls = tool_calls.clone();
             let asst = AgentMessage::Llm(asst);
             messages.push(asst.clone());
-            // Announce the history entry right after it is pushed, so the
-            // session layer persists the message at the moment it exists
-            // (ADR-0009 D2).
-            on_event_call(&mut self.on_event, AgentEvent::Message(asst))?;
 
             match reason {
-                FinishReason::Stop => break 'run StopReason::Completed,
+                FinishReason::Stop => {
+                    // Announce the history entry right after it is pushed, so
+                    // the session layer persists the message at the moment it
+                    // exists (ADR-0009 D2).
+                    on_event_call(&mut self.on_event, AgentEvent::Message(asst))?;
+                    break 'run StopReason::Completed;
+                }
                 FinishReason::ToolCalls => {
+                    // The assistant-message event is emitted inside
+                    // `execute_tools`, after the `before_tool` hooks have run:
+                    // the session log, the display and the next request all
+                    // carry the (possibly rewritten) message (ADR-0015 D3).
                     let cancelled = self.execute_tools(&mut messages)?;
                     if cancelled {
                         break 'run StopReason::Cancelled;
@@ -435,6 +439,25 @@ impl<'a> AgentRunner<'a> {
         } else {
             decisions = calls.iter().map(|_| ToolDecision::Run).collect();
         }
+
+        // A `before_tool` hook may rewrite a call's arguments but not the
+        // batch's shape: an added or removed `tool_calls` entry would leave a
+        // call unpaired with a result on the next request (ADR-0015 D4).
+        // Removals are caught per-index above; this catches additions.
+        let final_calls = messages[asst_index].tool_calls().len();
+        if final_calls != calls.len() {
+            return Err(format!(
+                "before_tool restructured the batch: {} -> {final_calls} tool calls",
+                calls.len()
+            ));
+        }
+        // Announce the assistant history entry now that the hooks have run:
+        // the session layer and the display see exactly the message that
+        // stays in history (ADR-0015 D3, ADR-0009 D2).
+        on_event_call(
+            &mut self.on_event,
+            AgentEvent::Message(messages[asst_index].clone()),
+        )?;
 
         if self.cfg.parallel_tools {
             // True concurrency: each call gets its own scoped thread; skipped
@@ -1796,6 +1819,90 @@ mod tests {
         assert!(
             err.contains("before_tool removed tool call 0"),
             "got: {err}"
+        );
+    }
+
+    #[test]
+    fn before_tool_adding_a_call_errors() {
+        // Restructuring also covers additions: an added `tool_calls` entry
+        // would leave a call unpaired with a result on the next request.
+        let mut hooks = RunHooks::default();
+        hooks.before_tool = Some(Box::new(|asst: &mut AgentMessage, _index: usize| {
+            asst.llm_mut().tool_calls.push(ToolCall {
+                id: "extra".to_string(),
+                name: "get_weather".to_string(),
+                arguments: "{}".to_string(),
+            });
+            Ok(ToolDecision::Run)
+        }));
+        let script = vec![vec![
+            tc_start(0, "call_0", "get_weather"),
+            tc_args(0, "{}"),
+            done_tools(),
+        ]];
+        let tools = [weather_tool()];
+        let err = run_with_hooks(
+            &mut FakeProvider::new(script),
+            &tools,
+            RunConfig::default(),
+            &CancelToken::new(),
+            &default_system(),
+            vec![AgentMessage::text(Role::User, "user")],
+            &mut hooks,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("before_tool restructured the batch: 1 -> 2 tool calls"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn before_tool_rewrite_reaches_the_assistant_message_event() {
+        // The assistant-message event is emitted after the `before_tool`
+        // hooks, so the session log (persisted from events) and the returned
+        // history carry the same rewritten arguments (ADR-0015 D3).
+        let mut hooks = RunHooks::default();
+        hooks.before_tool = Some(Box::new(|asst: &mut AgentMessage, _index: usize| {
+            asst.llm_mut().tool_calls[0].arguments = "{\"city\": \"Beijing\"}".to_string();
+            Ok(ToolDecision::Run)
+        }));
+        let script = vec![vec![
+            tc_start(0, "call_0", "get_weather"),
+            tc_args(0, "{\"city\": \"Shanghai\"}"),
+            done_tools(),
+        ]];
+        let tools = [weather_tool()];
+        let (messages, _stop, events) = run_with_hooks(
+            &mut FakeProvider::new(script),
+            &tools,
+            RunConfig::default(),
+            &CancelToken::new(),
+            &default_system(),
+            vec![AgentMessage::text(Role::User, "user")],
+            &mut hooks,
+        )
+        .unwrap();
+        // The announced assistant message is the post-hook one, matching what
+        // stays in the returned history.
+        let announced = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::Message(m) if m.role() == &Role::Assistant => Some(m.clone()),
+                _ => None,
+            })
+            .expect("assistant message event");
+        let in_history = messages
+            .iter()
+            .find(|m| m.role() == &Role::Assistant)
+            .expect("assistant in history");
+        assert_eq!(
+            announced.tool_calls()[0].arguments,
+            "{\"city\": \"Beijing\"}"
+        );
+        assert_eq!(
+            in_history.tool_calls()[0].arguments,
+            announced.tool_calls()[0].arguments
         );
     }
 
