@@ -110,8 +110,12 @@ impl Renderer for TextRenderer<'_> {
 fn render_structural(item: &DisplayItem) -> String {
     match item {
         DisplayItem::Turn { turn } => format!("── turn {turn} ──"),
-        DisplayItem::ToolStart { name, arguments } => format!("  ▶ {name} {arguments}"),
-        DisplayItem::ToolResult { name, ok, result } => {
+        DisplayItem::ToolStart {
+            name, arguments, ..
+        } => format!("  ▶ {name} {arguments}"),
+        DisplayItem::ToolResult {
+            name, ok, result, ..
+        } => {
             let icon = if *ok { "✔" } else { "✖" };
             format!("  {icon} {name}: {result}")
         }
@@ -343,12 +347,14 @@ mod tests {
     }
     fn agent_tool_start() -> AgentEvent {
         AgentEvent::ToolStart {
+            tool_call_id: "call_read".into(),
             name: "read".into(),
             arguments: "{\"path\": \"a.txt\"}".into(),
         }
     }
     fn agent_tool_result(ok: bool) -> AgentEvent {
         AgentEvent::ToolResult {
+            tool_call_id: if ok { "call_read" } else { "call_bash" }.into(),
             name: if ok { "read" } else { "bash" }.into(),
             ok,
             result: if ok { "hello" } else { "boom" }.into(),

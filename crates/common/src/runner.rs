@@ -341,6 +341,93 @@ mod tests {
     }
 
     #[test]
+    fn parallel_batch_streams_events_in_completion_order_and_sinks_history_in_model_order() {
+        // The shared seam both frontends drive: the renderer (UI) must see a
+        // parallel batch's tool events in completion order, while the
+        // on_message sink (session persistence) and the returned history must
+        // see the results in model order.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        let fast_done = Arc::new(AtomicBool::new(false));
+        let signal = fast_done.clone();
+        let fast = Tool::new(
+            "fast_tool",
+            "returns at once",
+            serde_json::json!({}),
+            move |_| {
+                signal.store(true, Ordering::SeqCst);
+                Ok("fast".to_string())
+            },
+        );
+        let wait = fast_done.clone();
+        let slow = Tool::new(
+            "slow_tool",
+            "waits for the fast call",
+            serde_json::json!({}),
+            move |_| {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !wait.load(Ordering::SeqCst) {
+                    if Instant::now() > deadline {
+                        return Err("slow_tool starved".to_string());
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Ok("slow".to_string())
+            },
+        );
+        let script = vec![
+            vec![
+                tc_start(0, "call_0", "slow_tool"),
+                tc_args(0, "{}"),
+                tc_start(1, "call_1", "fast_tool"),
+                tc_args(1, "{}"),
+                done_tools(),
+            ],
+            vec![text("done"), done_stop()],
+        ];
+        let mut provider = FakeProvider::new(script);
+        let mut renderer = RecordingRenderer::new();
+        let cancel = CancelToken::new();
+        let mut seen: Vec<String> = Vec::new();
+        let (updated, stop) = run_turn(
+            &mut provider,
+            &[slow, fast],
+            vec![Message::text(Role::User, "go")],
+            &RunConfig::default(),
+            &cancel,
+            &mut renderer,
+            &mut |m| {
+                if m.role == Role::Tool {
+                    seen.push(m.tool_call_id.clone().unwrap_or_default());
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(stop, StopReason::Completed);
+        // Sink (and history): model order — slow_tool (call_0) first.
+        assert_eq!(seen, vec!["call_0", "call_1"]);
+        let history_ids: Vec<&str> = updated
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .map(|m| m.tool_call_id.as_deref().expect("tool result id"))
+            .collect();
+        assert_eq!(history_ids, vec!["call_0", "call_1"]);
+        // Renderer: completion order — fast_tool (call_1) first.
+        let result_ids: Vec<&str> = renderer
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                DisplayItem::ToolResult { tool_call_id, .. } => Some(tool_call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(result_ids, vec!["call_1", "call_0"]);
+    }
+
+    #[test]
     fn provider_error_propagates() {
         struct ErrProvider;
         impl Provider for ErrProvider {

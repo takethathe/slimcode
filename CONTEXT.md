@@ -52,12 +52,26 @@ immutable identity, the log format version, and the project home it was created 
 (informational: the project-key directory, not the header, decides where a session is found).
 _Avoid_: metadata, front matter
 
+**Tool batch**:
+The set of `tool_calls` carried by one assistant message, executed together as a unit: calls run
+concurrently, results enter history in the order the model emitted them (by `index`), and events
+flow out in completion order. A batch may hold one call (the common case) or several.
+_Avoid_: tool group, 工具组
+
 **Dangling tool batch**:
 A read state in which an assistant message's `tool_calls` have no matching tool results (a crash or
 cancel mid-batch), or a tool result has no matching `tool_calls`. Repaired in memory on load —
 missing results filled in with an `Error: interrupted` tool result, orphan results dropped — so the
 replayed message history always pairs every `tool_call_id`; the log itself is never rewritten.
 _Avoid_: broken tool call, incomplete turn
+
+**Parallel tool call**:
+A `tool_calls` array carrying more than one invocation in a single assistant response, enabled by
+default on the request side (`parallel_tool_calls: true`); the model uses it for independent calls
+and falls back to serial rounds for dependent ones. Distinct from a Tool batch (the execution unit):
+parallel tool calls are a request-side capability, a Tool batch is the runtime's handling of
+whichever calls arrive.
+_Avoid_: parallel function call, 并行函数调用
 
 **Session store**:
 The project-scoped place sessions are persisted: one directory per project

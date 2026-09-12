@@ -117,6 +117,10 @@ pub enum Entry {
     /// A paired tool start/result block: state-colored background, bold title,
     /// pretty args, gray output, collapsed to [`TOOL_PREVIEW_LINES`].
     Tool {
+        /// The model-emitted call id this block pairs on: unique per
+        /// invocation, so the same tool called several times in one parallel
+        /// batch stays unambiguous.
+        tool_call_id: String,
         name: String,
         args: String,
         output: String,
@@ -857,30 +861,41 @@ impl App {
                     self.transcript.push(Entry::Thinking { text: fragment });
                 }
             }
-            DisplayItem::ToolStart { name, arguments } => {
+            DisplayItem::ToolStart {
+                tool_call_id,
+                name,
+                arguments,
+            } => {
                 self.transcript.push(Entry::Tool {
+                    tool_call_id,
                     name,
                     args: arguments,
                     output: String::new(),
                     status: ToolStatus::Pending,
                 });
             }
-            DisplayItem::ToolResult { name, ok, result } => {
+            DisplayItem::ToolResult {
+                tool_call_id,
+                name,
+                ok,
+                result,
+            } => {
                 let status = if ok {
                     ToolStatus::Success
                 } else {
                     ToolStatus::Error
                 };
-                // Pair with the last pending block for the same tool (the
-                // shared runner emits start/result sequentially per tool).
+                // Pair on the call id: it is unique per invocation, so the
+                // same tool called several times in one parallel batch stays
+                // unambiguous (pairing by name would swap their outputs).
                 let pending = self.transcript.iter().rposition(|entry| {
                     matches!(
                         entry,
                         Entry::Tool {
-                            name: n,
+                            tool_call_id: id,
                             status: ToolStatus::Pending,
                             ..
-                        } if *n == name
+                        } if *id == tool_call_id
                     )
                 });
                 if let Some(idx) = pending {
@@ -892,7 +907,9 @@ impl App {
                         *st = status;
                     }
                 } else {
+                    // A result whose start was never seen keeps its own block.
                     self.transcript.push(Entry::Tool {
+                        tool_call_id,
                         name,
                         args: String::new(),
                         output: result,
@@ -1404,6 +1421,7 @@ fn entry_rows(
             args,
             output,
             status,
+            ..
         } => tool_rows(name, args, output, *status, width, tool_expanded),
         Entry::Notice(text) => text
             .lines()
@@ -1849,11 +1867,13 @@ mod tests {
     fn tool_start_pairs_with_result_into_one_block() {
         let mut app = seeded_app();
         app.render(&DisplayItem::ToolStart {
+            tool_call_id: "call_read".to_string(),
             name: "read".to_string(),
             arguments: r#"{"path": "a.txt"}"#.to_string(),
         })
         .unwrap();
         app.render(&DisplayItem::ToolResult {
+            tool_call_id: "call_read".to_string(),
             name: "read".to_string(),
             ok: true,
             result: "ok".to_string(),
@@ -1870,14 +1890,62 @@ mod tests {
     }
 
     #[test]
+    fn parallel_same_name_tools_pair_by_call_id() {
+        // Two parallel calls to the same built-in tool, then results arriving
+        // in completion order (call_1 first). Pairing by "last pending block
+        // with the same name" would swap the two outputs; pairing by call id
+        // must keep each result with its own call.
+        let mut app = seeded_app();
+        app.render(&DisplayItem::ToolStart {
+            tool_call_id: "call_1".to_string(),
+            name: "read".to_string(),
+            arguments: r#"{"path":"a.txt"}"#.to_string(),
+        })
+        .unwrap();
+        app.render(&DisplayItem::ToolStart {
+            tool_call_id: "call_2".to_string(),
+            name: "read".to_string(),
+            arguments: r#"{"path":"b.txt"}"#.to_string(),
+        })
+        .unwrap();
+        app.render(&DisplayItem::ToolResult {
+            tool_call_id: "call_1".to_string(),
+            name: "read".to_string(),
+            ok: true,
+            result: "alpha".to_string(),
+        })
+        .unwrap();
+        app.render(&DisplayItem::ToolResult {
+            tool_call_id: "call_2".to_string(),
+            name: "read".to_string(),
+            ok: true,
+            result: "beta".to_string(),
+        })
+        .unwrap();
+
+        let rows = transcript_window(&mut app, 20);
+        let pos = |needle: &str| {
+            rows.iter()
+                .position(|r| r.contains(needle))
+                .unwrap_or_else(|| panic!("missing {needle:?} in {rows:#?}"))
+        };
+        // Block order: a.txt then its output, then b.txt then its output.
+        assert!(pos("a.txt") < pos("alpha"), "rows: {rows:#?}");
+        assert!(pos("alpha") < pos("b.txt"), "rows: {rows:#?}");
+        assert!(pos("b.txt") < pos("beta"), "rows: {rows:#?}");
+    }
+
+    #[test]
     fn failed_tool_result_sets_error_block() {
         let mut app = seeded_app();
         app.render(&DisplayItem::ToolStart {
+            tool_call_id: "call_write".to_string(),
             name: "write".to_string(),
             arguments: "x".to_string(),
         })
         .unwrap();
         app.render(&DisplayItem::ToolResult {
+            tool_call_id: "call_write".to_string(),
             name: "write".to_string(),
             ok: false,
             result: "denied".to_string(),
@@ -2767,6 +2835,7 @@ mod tests {
     fn tool_block_pending_then_success_backgrounds() {
         let mut app = seeded_app();
         app.render(&DisplayItem::ToolStart {
+            tool_call_id: "call_read".to_string(),
             name: "read".to_string(),
             arguments: r#"{"path": "a.txt"}"#.to_string(),
         })
@@ -2780,6 +2849,7 @@ mod tests {
         );
 
         app.render(&DisplayItem::ToolResult {
+            tool_call_id: "call_read".to_string(),
             name: "read".to_string(),
             ok: true,
             result: "ok".to_string(),
@@ -2798,12 +2868,14 @@ mod tests {
     fn completed_tool_block_buffer(ok: bool) -> Buffer {
         let mut app = seeded_app();
         app.render(&DisplayItem::ToolStart {
+            tool_call_id: "call_read".to_string(),
             name: "read".to_string(),
             arguments: r#"{"path": "a.txt"}"#.to_string(),
         })
         .unwrap();
         let output: String = (0..15).map(|i| format!("out line {i}\n")).collect();
         app.render(&DisplayItem::ToolResult {
+            tool_call_id: "call_read".to_string(),
             name: "read".to_string(),
             ok,
             result: output,
@@ -2824,6 +2896,7 @@ mod tests {
         // Pending: the block is open and only the title row exists yet.
         let mut app = seeded_app();
         app.render(&DisplayItem::ToolStart {
+            tool_call_id: "call_read".to_string(),
             name: "read".to_string(),
             arguments: r#"{"path": "a.txt"}"#.to_string(),
         })
@@ -2895,6 +2968,7 @@ mod tests {
     fn tool_block_padding_is_display_width_exact_for_wide_chars() {
         let mut app = seeded_app();
         app.render(&DisplayItem::ToolStart {
+            tool_call_id: "call_read".to_string(),
             name: "read".to_string(),
             arguments: r#"{"path": "a.txt"}"#.to_string(),
         })
@@ -2904,6 +2978,7 @@ mod tests {
         // 59 with the state background (nothing truncated, nothing short).
         let output: String = (0..12).map(|i| format!("\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}line {i}\n")).collect();
         app.render(&DisplayItem::ToolResult {
+            tool_call_id: "call_read".to_string(),
             name: "read".to_string(),
             ok: true,
             result: output,
@@ -2928,11 +3003,13 @@ mod tests {
     fn tool_block_error_background_and_compact_title() {
         let mut app = seeded_app();
         app.render(&DisplayItem::ToolStart {
+            tool_call_id: "call_edit".to_string(),
             name: "edit".to_string(),
             arguments: r#"{"path":"a.txt","old":"x"}"#.to_string(),
         })
         .unwrap();
         app.render(&DisplayItem::ToolResult {
+            tool_call_id: "call_edit".to_string(),
             name: "edit".to_string(),
             ok: false,
             result: "no match".to_string(),
@@ -2956,11 +3033,13 @@ mod tests {
         // the range; the raw JSON never appears.
         let mut app = seeded_app();
         app.render(&DisplayItem::ToolStart {
+            tool_call_id: "call_read".to_string(),
             name: "read".to_string(),
             arguments: r#"{"path":"a.txt","offset":2,"limit":3}"#.to_string(),
         })
         .unwrap();
         app.render(&DisplayItem::ToolResult {
+            tool_call_id: "call_read".to_string(),
             name: "read".to_string(),
             ok: true,
             result: "line2\nline3\nline4".to_string(),
@@ -2975,22 +3054,26 @@ mod tests {
         // its `/pattern/ in <scope>` shape — again without a JSON dump.
         let mut app = seeded_app();
         app.render(&DisplayItem::ToolStart {
+            tool_call_id: "call_bash".to_string(),
             name: "bash".to_string(),
             arguments: r#"{"command":"ls -la"}"#.to_string(),
         })
         .unwrap();
         app.render(&DisplayItem::ToolResult {
+            tool_call_id: "call_bash".to_string(),
             name: "bash".to_string(),
             ok: true,
             result: "total 8".to_string(),
         })
         .unwrap();
         app.render(&DisplayItem::ToolStart {
+            tool_call_id: "call_grep".to_string(),
             name: "grep".to_string(),
             arguments: r#"{"pattern":"TODO","path":"src"}"#.to_string(),
         })
         .unwrap();
         app.render(&DisplayItem::ToolResult {
+            tool_call_id: "call_grep".to_string(),
             name: "grep".to_string(),
             ok: true,
             result: "src/main.rs:1: TODO".to_string(),
@@ -3007,11 +3090,13 @@ mod tests {
     fn unknown_tool_block_keeps_pretty_json_args_fallback() {
         let mut app = seeded_app();
         app.render(&DisplayItem::ToolStart {
+            tool_call_id: "call_fetch_web".to_string(),
             name: "fetch_web".to_string(),
             arguments: r#"{"url":"https://x","depth":2}"#.to_string(),
         })
         .unwrap();
         app.render(&DisplayItem::ToolResult {
+            tool_call_id: "call_fetch_web".to_string(),
             name: "fetch_web".to_string(),
             ok: true,
             result: "<html>".to_string(),
@@ -3036,11 +3121,13 @@ mod tests {
                 .join(" ")
         );
         app.render(&DisplayItem::ToolStart {
+            tool_call_id: "call_bash".to_string(),
             name: "bash".to_string(),
             arguments: serde_json::json!({"command": long_command}).to_string(),
         })
         .unwrap();
         app.render(&DisplayItem::ToolResult {
+            tool_call_id: "call_bash".to_string(),
             name: "bash".to_string(),
             ok: true,
             result: "done".to_string(),
@@ -3062,12 +3149,14 @@ mod tests {
     fn tool_output_collapses_to_ten_lines_and_ctrl_o_expands() {
         let mut app = seeded_app();
         app.render(&DisplayItem::ToolStart {
+            tool_call_id: "call_grep".to_string(),
             name: "grep".to_string(),
             arguments: "{\"pattern\":\"x\"}".to_string(),
         })
         .unwrap();
         let output: String = (0..15).map(|i| format!("line{i}\n")).collect();
         app.render(&DisplayItem::ToolResult {
+            tool_call_id: "call_grep".to_string(),
             name: "grep".to_string(),
             ok: true,
             result: output.clone(),
@@ -3103,11 +3192,13 @@ mod tests {
     fn tool_output_under_ten_lines_has_no_hint() {
         let mut app = seeded_app();
         app.render(&DisplayItem::ToolStart {
+            tool_call_id: "call_ls".to_string(),
             name: "ls".to_string(),
             arguments: "{\"path\":\".\"}".to_string(),
         })
         .unwrap();
         app.render(&DisplayItem::ToolResult {
+            tool_call_id: "call_ls".to_string(),
             name: "ls".to_string(),
             ok: true,
             result: "a\nb".to_string(),

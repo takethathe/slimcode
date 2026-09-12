@@ -46,7 +46,8 @@ cargo workspace，六个 crate：
   中途取消返回 `Cancelled(partial)`，provider 对已收到的完整 SSE 事件做 salvage 解析，把已流式内容交回 runner；
   阻塞 reqwest 没有 per-read 超时——静默服务器仍由客户端 300s 整体超时兜底）；
 - **请求**：`stream: true` + `stream_options.include_usage: true`（ticket 05 实测 usage 只在带 `choices: []` 的最终 chunk 出现）；
-  工具用 `role: tool` 消息回传结果；
+  工具用 `role: tool` 消息回传结果；声明了 tools 时额外带 `parallel_tool_calls: true`
+  （默认开启，见 ADR-0010），`tools` 为空时该字段省略、请求字节与旧版一致；
 - **显式上下文缓存**（llm-cache）：`BailianConfig.cache`（默认 `true`，`with_cache(bool)` 建造式 setter）。
   开启时 system 消息的 `content` 序列化为单元素块数组
   `[{"type":"text","text":"…","cache_control":{"type":"ephemeral"}}]`，把稳定前缀交给端点缓存；
@@ -104,7 +105,12 @@ cargo workspace，六个 crate：
   `reset`/`is_cancelled`/`Clone`）由每个 run 入口携带，在每个 runner 边界检查：provider chat 之前、
   chat 返回 Err 时若 flag 置位视为静默 Cancelled 而非错误、已流出的 deltas 之后（半段文本不落 history）、
   每个工具派发前后（串行/并行）。已 push 的工具结果保留；
-- 工具执行默认**串行**（本地工具引擎安全），`RunConfig.parallel_tools` 开关留给未来 IO 工具；
+- 工具执行默认**并行**（ADR-0010）：一个 Tool batch 内的调用各在 scoped thread 上真并发，
+  事件按完成顺序流出、结果按模型返回顺序（`tool_calls` 的 index）进 history；取消在批次应用前
+  检查，已 push 的结果保留、未应用的不追加。`RunConfig.parallel_tools` 默认 `true`，
+  串行路径保留给显式 `parallel_tools: false` 的场景（串行语义测试）；`Tool.run` 约束为 `Fn + Send + Sync`
+  （工作线程共享同一组工具只读调用）；
+- 工具事件（`ToolStart`/`ToolResult`）携带 `tool_call_id`，渲染端据此配对同名工具的多次调用；
 - 工具报错以 `Error: …` 前缀作 `role: tool` 内容进 history，模型自然恢复；
 - `Provider` trait 是 crates/ai 已实现的 seam（当前同步、无 async 依赖，真实 provider 内部处理阻塞边界）；
 - 流式 delta（`Reasoning`/`Text`/`ToolCallStart`/`ToolCallArgs`/`Done`）镜像 ticket 05 实测 wire 形状，`assemble` 负责拼接。
@@ -294,7 +300,7 @@ reducer + draw）、`terminal`（薄壳 + worker-thread runner）。分层：
   `slimcode - <session> - <cwd 目录名>`，`/new` `/load` 时更新），并尽力
   `git branch --show-current` 喂 footer。提交后把 `BailianProvider`（`Option`
   take/restore）+ `Vec<Tool>`（`mem::take`，`Tool::run` 已加宽为 `Box<dyn Fn(...) +
-  Send>`）移入 worker `thread::spawn` 跑共享 `run_turn`，经 mpsc `ChannelRenderer`
+  Send + Sync>`）移入 worker `thread::spawn` 跑共享 `run_turn`，经 mpsc `ChannelRenderer`
   把 `DisplayItem` 流回 UI；UI 循环 `event::poll(80ms)` 同时当帧定时器，poll 事件 + 排空
   通道 + `draw` + `app.tick()`，spinner 因此边 HTTP 等待边动画。运行中：裸 `Esc` →
   `Effect::CancelRunning`（`Tui` 持有每轮 `CancelToken`，`drive_turn` 开头 `reset()`，

@@ -5,9 +5,10 @@
 //!   results → loop, until the model stops calling tools;
 //! - stop conditions: no tool_calls → `Completed`; user interrupt (cancel
 //!   token) → `Cancelled` (the CLI/TUI layer concern);
-//! - tool execution defaults to **serial** (local tool engines are naturally
-//!   serial and share no concurrent state); `parallel_tools` is a switch
-//!   reserved for future I/O-heavy tools;
+//! - tool execution defaults to **parallel** (ADR-0010): a Tool batch's calls
+//!   run on scoped threads, its tool events stream in completion order and its
+//!   results enter history in model order; `RunConfig.parallel_tools` keeps a
+//!   serial path for tests that assert the serial append semantics;
 //! - tool errors are surfaced to the model as a `role: tool` message prefixed
 //!   `Error: …` so it can recover naturally;
 //! - deltas mirror the live Bailian wire shape (ticket 05): `reasoning` before
@@ -91,9 +92,10 @@ pub struct Tool {
     pub description: String,
     pub parameters: Value,
     /// Runs the tool against parsed JSON arguments. `Err` becomes an
-    /// `Error: …` tool message in history. `Send` so a `Vec<Tool>` can move
-    /// into the TUI's worker thread (all tool closures capture owned data).
-    pub run: Box<dyn Fn(Value) -> Result<String, String> + Send>,
+    /// `Error: …` tool message in history. `Send + Sync` so one batch of
+    /// calls can share the same tools across the worker threads of a
+    /// parallel dispatch (all tool closures capture owned data).
+    pub run: Box<dyn Fn(Value) -> Result<String, String> + Send + Sync>,
 }
 
 impl Tool {
@@ -101,7 +103,7 @@ impl Tool {
         name: impl Into<String>,
         description: impl Into<String>,
         parameters: Value,
-        run: impl Fn(Value) -> Result<String, String> + Send + 'static,
+        run: impl Fn(Value) -> Result<String, String> + Send + Sync + 'static,
     ) -> Self {
         Self {
             name: name.into(),
@@ -176,10 +178,15 @@ pub enum AgentEvent {
     /// Raw delta, forwarded live so the CLI can stream text / a thinking line.
     Stream(Delta),
     ToolStart {
+        /// The model-emitted call id: renderers pair a start with its result
+        /// by this id, so the same tool invoked several times in one batch
+        /// (parallel execution) stays unambiguous.
+        tool_call_id: String,
         name: String,
         arguments: String,
     },
     ToolResult {
+        tool_call_id: String,
         name: String,
         ok: bool,
         result: String,
@@ -192,11 +199,21 @@ pub enum AgentEvent {
     Stop(StopReason),
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct RunConfig {
     /// Execute multiple tool calls from one response concurrently, or one at a
-    /// time (appending results as we go).
+    /// time (appending results as we go). Defaults to `true`: a Tool batch is
+    /// dispatched on scoped threads, its events stream in completion order and
+    /// its results enter history in model order.
     pub parallel_tools: bool,
+}
+
+impl Default for RunConfig {
+    fn default() -> Self {
+        Self {
+            parallel_tools: true,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -222,30 +239,45 @@ fn dispatch(tools: &[Tool], tc: &ToolCall) -> Result<String, String> {
 /// it is produced. `Err` aborts the loop (used to propagate renderer errors).
 type EventSink<'a> = &'a mut dyn FnMut(AgentEvent) -> Result<(), String>;
 
-/// Append one tool result to history, emitting ToolStart/ToolResult events
-/// through the sink, then the per-message event announcing the history entry
-/// (ADR-0009 D2: the session layer persists each result as it is pushed). `tc`
-/// is the tool call this result belongs to.
+/// Emit the `ToolStart`/`ToolResult` pair for one finished call. Called in
+/// **completion order** so the frontends see results as they land; the
+/// history entry is pushed separately, in model order.
+fn emit_tool_events(
+    tc: &ToolCall,
+    res: &Result<String, String>,
+    on_event: EventSink<'_>,
+) -> Result<(), String> {
+    let (ok, result) = match res {
+        Ok(body) => (true, body.clone()),
+        Err(err) => (false, err.clone()),
+    };
+    on_event(AgentEvent::ToolStart {
+        tool_call_id: tc.id.clone(),
+        name: tc.name.clone(),
+        arguments: tc.arguments.clone(),
+    })?;
+    on_event(AgentEvent::ToolResult {
+        tool_call_id: tc.id.clone(),
+        name: tc.name.clone(),
+        ok,
+        result,
+    })?;
+    Ok(())
+}
+
+/// Append one tool result to history, emitting the per-message event
+/// announcing the history entry (ADR-0009 D2: the session layer persists each
+/// result as it is pushed). `tc` is the tool call this result belongs to.
 fn push_tool_result(
     tc: &ToolCall,
     res: Result<String, String>,
     on_event: EventSink<'_>,
     messages: &mut Vec<Message>,
 ) -> Result<(), String> {
-    let (ok, body) = match res {
-        Ok(o) => (true, o),
-        Err(e) => (false, e),
+    let content = match res {
+        Ok(body) => body,
+        Err(err) => format!("Error: {err}"),
     };
-    on_event(AgentEvent::ToolStart {
-        name: tc.name.clone(),
-        arguments: tc.arguments.clone(),
-    })?;
-    on_event(AgentEvent::ToolResult {
-        name: tc.name.clone(),
-        ok,
-        result: body.clone(),
-    })?;
-    let content = if ok { body } else { format!("Error: {body}") };
     let msg = Message::tool_result(&tc.id, content);
     messages.push(msg.clone());
     on_event(AgentEvent::Message(msg))?;
@@ -253,9 +285,11 @@ fn push_tool_result(
 }
 
 /// Execute tool calls and append their results to `messages`, emitting events
-/// through the sink. In serial mode each result is appended before the next
-/// call runs (so later tools can observe earlier results in history); in
-/// parallel mode all calls run first and results are appended together.
+/// through the sink. Serial mode dispatches and appends one call at a time (so
+/// later tools can observe earlier results in history); parallel mode runs
+/// every call on its own scoped thread, streams tool events in **completion
+/// order**, then appends every result to history in **model order** (the
+/// `tool_calls` order) so the Session log stays deterministic.
 ///
 /// Checks the cancel token before each dispatch (and after each result, so a
 /// tool that aborted itself mid-run — e.g. a cancelled bash child — does not
@@ -271,20 +305,59 @@ fn execute_tools(
     messages: &mut Vec<Message>,
 ) -> Result<bool, String> {
     if parallel {
-        // Run every call first, then append all results together.
+        // True concurrency: each call gets its own scoped thread; completion
+        // order flows back over a channel while the other calls keep running.
         if cancel.is_cancelled() {
             return Ok(true);
         }
-        let results: Vec<(&ToolCall, Result<String, String>)> =
-            calls.iter().map(|tc| (tc, dispatch(tools, tc))).collect();
-        for (tc, res) in results {
-            if cancel.is_cancelled() {
-                return Ok(true);
+        let mut results: Vec<Option<Result<String, String>>> = calls.iter().map(|_| None).collect();
+        // Completion order of the calls, recorded while draining the channel.
+        let mut completion_order: Vec<usize> = Vec::new();
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<String, String>)>();
+            for (index, tc) in calls.iter().enumerate() {
+                let tx = tx.clone();
+                let cancel = cancel.clone();
+                scope.spawn(move || {
+                    // A call whose batch was cancelled before it started never
+                    // dispatches (and so never reports).
+                    if cancel.is_cancelled() {
+                        return;
+                    }
+                    let res = dispatch(tools, tc);
+                    let _ = tx.send((index, res));
+                });
             }
-            push_tool_result(tc, res, on_event, messages)?;
+            drop(tx);
+            for (index, res) in rx {
+                results[index] = Some(res);
+                completion_order.push(index);
+            }
+        });
+        // A cancel anywhere in the batch discards the whole batch, so nothing
+        // is emitted for it: the tool events and the history stay consistent
+        // (the UI never shows a block the Session log did not receive).
+        if cancel.is_cancelled() {
+            return Ok(true);
+        }
+        // Tool events in completion order (a batch's blocks appear in the order
+        // its calls finished)...
+        for &index in &completion_order {
+            if let Some(res) = results[index].as_ref() {
+                emit_tool_events(&calls[index], res, &mut *on_event)?;
+            }
+        }
+        // ...and history entries in model order (index), keeping the Session
+        // log deterministic regardless of which call finished first. A call
+        // with no result (only possible if a tool resets the cancel token
+        // mid-run) is skipped rather than panicking.
+        for (index, tc) in calls.iter().enumerate() {
+            if let Some(res) = results[index].take() {
+                push_tool_result(tc, res, &mut *on_event, messages)?;
+            }
         }
     } else {
-        // Serial: dispatch and append one call at a time.
+        // Serial: dispatch, emit and append one call at a time.
         for tc in calls {
             if cancel.is_cancelled() {
                 return Ok(true);
@@ -293,7 +366,8 @@ fn execute_tools(
             if cancel.is_cancelled() {
                 return Ok(true);
             }
-            push_tool_result(tc, res, on_event, messages)?;
+            emit_tool_events(tc, &res, &mut *on_event)?;
+            push_tool_result(tc, res, &mut *on_event, messages)?;
         }
     }
     Ok(false)
@@ -733,6 +807,44 @@ mod tests {
     }
 
     #[test]
+    fn tool_events_carry_the_tool_call_id() {
+        // ToolStart/ToolResult must carry the call's id so renderers can pair
+        // them even when the same tool is called several times in one batch
+        // (parallel execution).
+        let script = vec![
+            vec![
+                tc_start(0, "call_1", "get_weather"),
+                tc_args(0, "{\"city\": \"Beijing\"}"),
+                done_tools(),
+            ],
+            vec![t("Beijing is 25C."), done_stop()],
+        ];
+        let res = run(script, vec![weather_tool()], &RunConfig::default()).unwrap();
+        let start_id = res
+            .events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::ToolStart {
+                    tool_call_id, name, ..
+                } if name == "get_weather" => Some(tool_call_id.clone()),
+                _ => None,
+            })
+            .expect("tool start event");
+        assert_eq!(start_id, "call_1");
+        let result_id = res
+            .events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::ToolResult {
+                    tool_call_id, name, ..
+                } if name == "get_weather" => Some(tool_call_id.clone()),
+                _ => None,
+            })
+            .expect("tool result event");
+        assert_eq!(result_id, "call_1");
+    }
+
+    #[test]
     fn parallel_tools_executes_all_calls() {
         let script = vec![
             vec![
@@ -762,6 +874,120 @@ mod tests {
             2,
             "both parallel calls' results are in history"
         );
+    }
+
+    #[test]
+    fn parallel_tools_run_concurrently() {
+        // True concurrency's observable signal: two blocking calls overlap, so
+        // the peak number of simultaneously running tools reaches 2. A
+        // sequential dispatcher (the old "batched results" parallel path) can
+        // never exceed a peak of 1.
+        let running = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let blocking_tool = |name: &'static str| {
+            let running = running.clone();
+            let peak = peak.clone();
+            Tool::new(name, "blocks briefly", serde_json::json!({}), move |_| {
+                let cur = running.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                peak.fetch_max(cur, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                running.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(format!("{name} done"))
+            })
+        };
+        let script = vec![
+            vec![
+                tc_start(0, "call_0", "tool_a"),
+                tc_args(0, "{}"),
+                tc_start(1, "call_1", "tool_b"),
+                tc_args(1, "{}"),
+                done_tools(),
+            ],
+            vec![t("done"), done_stop()],
+        ];
+        let res = run(
+            script,
+            vec![blocking_tool("tool_a"), blocking_tool("tool_b")],
+            &RunConfig {
+                parallel_tools: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(res.stop, StopReason::Completed);
+        let peak = peak.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(peak >= 2, "peak concurrency was {peak}, not concurrent");
+    }
+
+    #[test]
+    fn parallel_history_follows_model_order_while_events_follow_completion_order() {
+        // Index 1 finishes first (it signals index 0). History must still be
+        // appended in model order, while the streamed events reflect real
+        // completion order.
+        let fast_done = Arc::new(AtomicBool::new(false));
+        let signal = fast_done.clone();
+        let fast = Tool::new(
+            "fast_tool",
+            "returns at once",
+            serde_json::json!({}),
+            move |_| {
+                signal.store(true, Ordering::SeqCst);
+                Ok("fast".to_string())
+            },
+        );
+        let wait = fast_done.clone();
+        let slow = Tool::new(
+            "slow_tool",
+            "waits for fast_tool",
+            serde_json::json!({}),
+            move |_| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while !wait.load(Ordering::SeqCst) {
+                    if std::time::Instant::now() > deadline {
+                        return Err("slow_tool starved: calls did not overlap".to_string());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Ok("slow".to_string())
+            },
+        );
+        let script = vec![
+            vec![
+                tc_start(0, "call_0", "slow_tool"),
+                tc_args(0, "{}"),
+                tc_start(1, "call_1", "fast_tool"),
+                tc_args(1, "{}"),
+                done_tools(),
+            ],
+            vec![t("done"), done_stop()],
+        ];
+        let res = run(
+            script,
+            vec![slow, fast],
+            &RunConfig {
+                parallel_tools: true,
+            },
+        )
+        .unwrap();
+
+        // History (and thus the Session log) is deterministic: model order.
+        let history_ids: Vec<&str> = res
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .map(|m| m.tool_call_id.as_deref().expect("tool result has an id"))
+            .collect();
+        assert_eq!(history_ids, vec!["call_0", "call_1"]);
+
+        // Events stream in completion order: the fast call reports first.
+        let result_ids: Vec<&str> = res
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolResult { tool_call_id, .. } => Some(tool_call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(result_ids, vec!["call_1", "call_0"]);
     }
 
     #[test]
@@ -992,6 +1218,62 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_parallel_batch_emits_no_tool_events() {
+        // A cancel that lands during a parallel batch discards the whole batch:
+        // neither history nor the rendered tool events may reflect it. The UI
+        // must never show a completed block for a result the Session log never
+        // received.
+        let cancel = CancelToken::new();
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ran2 = ran.clone();
+        let cancel2 = cancel.clone();
+        let flipper = Tool::new(
+            "flip_tool",
+            "flips the token",
+            serde_json::json!({}),
+            move |_| {
+                ran2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                cancel2.cancel();
+                Ok("flipped".to_string())
+            },
+        );
+        let script = vec![vec![
+            tc_start(0, "call_0", "get_weather"),
+            tc_args(0, "{}"),
+            tc_start(1, "call_1", "flip_tool"),
+            tc_args(1, "{}"),
+            done_tools(),
+        ]];
+        let res = run_agent(
+            &mut FakeProvider::new(script),
+            &[weather_tool(), flipper],
+            "sys",
+            "user",
+            &RunConfig {
+                parallel_tools: true,
+            },
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(res.stop, StopReason::Cancelled);
+        assert!(res.messages.iter().all(|m| m.role != Role::Tool));
+        assert!(
+            res.events.iter().all(|e| !matches!(
+                e,
+                AgentEvent::ToolStart { .. } | AgentEvent::ToolResult { .. }
+            )),
+            "no tool events for a discarded batch: {:?}",
+            res.events
+        );
+    }
+
+    #[test]
+    fn run_config_defaults_to_parallel_tools() {
+        // Parallel tool calls are on by default; no configuration opts in.
+        assert!(RunConfig::default().parallel_tools);
+    }
+
+    #[test]
     fn cancel_between_serial_tools_keeps_only_completed_results() {
         let cancel = CancelToken::new();
         // Tool 2 cancels the run when it executes; tool 3 must never dispatch.
@@ -1022,7 +1304,9 @@ mod tests {
             &[weather_tool(), tool, never],
             "sys",
             "user",
-            &RunConfig::default(),
+            &RunConfig {
+                parallel_tools: false,
+            },
             &cancel,
         )
         .unwrap();

@@ -24,9 +24,14 @@ pub enum DisplayItem {
     /// A streamed assistant text fragment (no trailing newline implied).
     Text(String),
     /// A tool invocation started, with the raw JSON arguments string.
-    ToolStart { name: String, arguments: String },
+    ToolStart {
+        tool_call_id: String,
+        name: String,
+        arguments: String,
+    },
     /// A tool finished: `ok` distinguishes success from failure.
     ToolResult {
+        tool_call_id: String,
         name: String,
         ok: bool,
         result: String,
@@ -53,11 +58,22 @@ pub fn map_event(e: &AgentEvent) -> Option<DisplayItem> {
         AgentEvent::Stream(Delta::ToolCallStart { .. })
         | AgentEvent::Stream(Delta::ToolCallArgs { .. })
         | AgentEvent::Stream(Delta::Done(_)) => None,
-        AgentEvent::ToolStart { name, arguments } => Some(DisplayItem::ToolStart {
+        AgentEvent::ToolStart {
+            tool_call_id,
+            name,
+            arguments,
+        } => Some(DisplayItem::ToolStart {
+            tool_call_id: tool_call_id.clone(),
             name: name.clone(),
             arguments: arguments.clone(),
         }),
-        AgentEvent::ToolResult { name, ok, result } => Some(DisplayItem::ToolResult {
+        AgentEvent::ToolResult {
+            tool_call_id,
+            name,
+            ok,
+            result,
+        } => Some(DisplayItem::ToolResult {
+            tool_call_id: tool_call_id.clone(),
             name: name.clone(),
             ok: *ok,
             result: result.clone(),
@@ -135,12 +151,14 @@ mod tests {
     }
     fn tool_start(name: &str) -> AgentEvent {
         AgentEvent::ToolStart {
+            tool_call_id: format!("call_{name}"),
             name: name.to_string(),
             arguments: "{}".to_string(),
         }
     }
     fn tool_result(name: &str, ok: bool) -> AgentEvent {
         AgentEvent::ToolResult {
+            tool_call_id: format!("call_{name}"),
             name: name.to_string(),
             ok,
             result: "out".to_string(),
@@ -265,6 +283,7 @@ mod tests {
         assert_eq!(
             map_event(&tool_start("read")),
             Some(DisplayItem::ToolStart {
+                tool_call_id: "call_read".to_string(),
                 name: "read".to_string(),
                 arguments: "{}".to_string(),
             })
@@ -272,6 +291,7 @@ mod tests {
         assert_eq!(
             map_event(&tool_result("bash", true)),
             Some(DisplayItem::ToolResult {
+                tool_call_id: "call_bash".to_string(),
                 name: "bash".to_string(),
                 ok: true,
                 result: "out".to_string(),
@@ -280,6 +300,7 @@ mod tests {
         assert_eq!(
             map_event(&tool_result("bash", false)),
             Some(DisplayItem::ToolResult {
+                tool_call_id: "call_bash".to_string(),
                 name: "bash".to_string(),
                 ok: false,
                 result: "out".to_string(),
@@ -340,10 +361,12 @@ mod tests {
                 DisplayItem::Text("answer ".to_string()),
                 DisplayItem::Text("fragment".to_string()),
                 DisplayItem::ToolStart {
+                    tool_call_id: "call_read".to_string(),
                     name: "read".to_string(),
                     arguments: "{}".to_string(),
                 },
                 DisplayItem::ToolResult {
+                    tool_call_id: "call_read".to_string(),
                     name: "read".to_string(),
                     ok: true,
                     result: "out".to_string(),

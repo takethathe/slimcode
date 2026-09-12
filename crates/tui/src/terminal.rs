@@ -824,10 +824,12 @@ mod tests {
         assert!(items.contains(&DisplayItem::Text("hello ".to_string())));
         assert!(items.contains(&DisplayItem::Text("world".to_string())));
         assert!(items.contains(&DisplayItem::ToolStart {
+            tool_call_id: "tc-1".to_string(),
             name: "get_weather".to_string(),
             arguments: r#"{"city": "Tokyo"}"#.to_string(),
         }));
         assert!(items.contains(&DisplayItem::ToolResult {
+            tool_call_id: "tc-1".to_string(),
             name: "get_weather".to_string(),
             ok: true,
             result: r#"{"city": "Tokyo", "temp": "25C"}"#.to_string(),

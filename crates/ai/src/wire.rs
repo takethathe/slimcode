@@ -121,8 +121,18 @@ pub struct WireRequest<'a> {
     pub messages: Vec<WireMessage<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<WireTool>>,
+    /// Opt into several independent `tool_calls` in one response. Only
+    /// meaningful — and only serialized — when `tools` is non-empty, so a
+    /// plain-answer request keeps its pre-parallel byte shape.
+    #[serde(skip_serializing_if = "is_false")]
+    pub parallel_tool_calls: bool,
     pub stream: bool,
     pub stream_options: WireStreamOptions,
+}
+
+/// `skip_serializing_if` predicate: omit a `false` flag from the request.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Serialize)]
@@ -767,5 +777,51 @@ mod tests {
         let m = Message::text(Role::User, "");
         let w = message_to_wire(&m, true);
         assert_eq!(w.content, None);
+    }
+
+    // --- parallel tool calls (parallel-tool-calls ticket 02) --------------
+
+    /// Build a request with the given tools and parallel flag for the
+    /// serialization tests.
+    fn request_with_tools<'a>(
+        tools: Option<Vec<WireTool>>,
+        parallel_tool_calls: bool,
+    ) -> WireRequest<'a> {
+        WireRequest {
+            model: "m",
+            messages: Vec::new(),
+            tools,
+            parallel_tool_calls,
+            stream: true,
+            stream_options: WireStreamOptions {
+                include_usage: true,
+            },
+        }
+    }
+
+    #[test]
+    fn request_serializes_parallel_tool_calls_when_tools_are_present() {
+        // With tools declared, the request opts into parallel tool calls so
+        // the model may return several independent calls in one response.
+        let tool = Tool::new(
+            "get_weather",
+            "Get current weather for a city",
+            serde_json::json!({"type": "object"}),
+            |_| Ok(String::new()),
+        );
+        let req = request_with_tools(Some(vec![tool_to_wire(&tool)]), true);
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["parallel_tool_calls"], true);
+        assert!(v.get("tools").is_some());
+    }
+
+    #[test]
+    fn request_omits_parallel_tool_calls_without_tools() {
+        // No tools → the flag is omitted entirely: a plain-answer request
+        // keeps the exact byte shape it had before parallel support.
+        let req = request_with_tools(None, false);
+        let v = serde_json::to_value(&req).unwrap();
+        assert!(v.get("parallel_tool_calls").is_none());
+        assert!(v.get("tools").is_none());
     }
 }

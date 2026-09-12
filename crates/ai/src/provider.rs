@@ -132,6 +132,10 @@ impl Provider for BailianProvider {
             } else {
                 Some(tools.iter().map(wire::tool_to_wire).collect())
             },
+            // Parallel tool calls are on by default: the model may answer an
+            // independent multi-tool request in one response. The flag rides
+            // only when tools are declared (never on a plain-answer request).
+            parallel_tool_calls: !tools.is_empty(),
             stream: true,
             stream_options: wire::WireStreamOptions {
                 include_usage: true,
