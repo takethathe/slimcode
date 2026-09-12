@@ -52,6 +52,9 @@ pub fn run<H: UiHandler>(
                     }
                 }
             }
+            // Wheel notches scroll the transcript; every other mouse event is
+            // ignored by the reducer.
+            Event::Mouse(mouse) => app.handle_mouse(mouse),
             // Resize re-renders: ratatui's draw autoresizes, so the next frame
             // already uses the new size.
             Event::Resize(..) => {}
@@ -112,6 +115,9 @@ fn drive_turn<H: UiHandler>(
                             _ => {}
                         }
                     }
+                    // The wheel keeps scrolling the transcript during a turn:
+                    // it is a view gesture, not a cancel and not an input.
+                    Ok(Event::Mouse(mouse)) if ui_error.is_none() => app.handle_mouse(mouse),
                     Ok(_) => {}
                     Err(e) if ui_error.is_none() => ui_error = Some(format!("event: {e}")),
                     Err(_) => {}

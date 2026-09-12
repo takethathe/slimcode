@@ -9,7 +9,7 @@
 //! the frame loop responsive and knows the app through two vocabularies:
 //! [`Effect`]s out, [`RenderItem`]s in.
 
-use std::io::stdout;
+use std::io::{Write, stdout};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -90,10 +90,15 @@ pub fn run(
         }),
     };
 
-    // The terminal belongs to the CLI: raw mode, the alternate screen and the
-    // title are all set up here, and the panic hook restores them.
+    // The terminal belongs to the CLI: raw mode, the alternate screen, the
+    // mouse subscription and the title are all set up here, and the panic hook
+    // restores them.
     enable_raw_mode().map_err(|e| format!("raw mode: {e}"))?;
     execute!(stdout(), EnterAlternateScreen).map_err(|e| format!("alternate screen: {e}"))?;
+    if let Err(e) = enable_wheel_scroll() {
+        restore_terminal();
+        return Err(format!("mouse scroll: {e}"));
+    }
     install_panic_hook();
     let mut terminal = match Terminal::new(CrosstermBackend::new(stdout())) {
         Ok(terminal) => terminal,
@@ -113,11 +118,34 @@ pub fn run(
     result.map(|()| 0)
 }
 
-/// Leave raw mode and the alternate screen. Best-effort: the process is
-/// exiting the TUI either way, so failures are swallowed.
+/// Subscribe to wheel scroll only: DECSET `?1000` (button press/release, which
+/// is how a wheel notch arrives) plus `?1006` (SGR coordinates).
+///
+/// Deliberately *not* crossterm's all-in-one `EnableMouseCapture`, which also
+/// sends `?1002`/`?1003`/`?1015` and thereby subscribes to mouse motion — the
+/// frame loop implements no motion semantics and must not be flooded by move
+/// events. `XTSHIFTESCAPE` is not sent either, so Shift+drag stays the
+/// terminal's native selection (ADR-0017 D2/D3).
+const ENABLE_WHEEL_SCROLL: &[u8] = b"\x1b[?1000h\x1b[?1006h";
+
+/// The exact inverse of [`ENABLE_WHEEL_SCROLL`], sent from every exit path so
+/// the shell gets its mouse back.
+const DISABLE_WHEEL_SCROLL: &[u8] = b"\x1b[?1006l\x1b[?1000l";
+
+/// Turn the wheel subscription on. Fails only if the terminal is unreachable.
+fn enable_wheel_scroll() -> std::io::Result<()> {
+    let mut out = stdout();
+    out.write_all(ENABLE_WHEEL_SCROLL)?;
+    out.flush()
+}
+
+/// Leave raw mode, the mouse subscription and the alternate screen. Best-effort:
+/// the process is exiting the TUI either way, so failures are swallowed.
 fn restore_terminal() {
+    let mut out = stdout();
+    let _ = out.write_all(DISABLE_WHEEL_SCROLL);
     let _ = disable_raw_mode();
-    let _ = execute!(stdout(), LeaveAlternateScreen);
+    let _ = execute!(out, LeaveAlternateScreen);
 }
 
 /// Restore the terminal when the TUI panics, so the shell is usable again.

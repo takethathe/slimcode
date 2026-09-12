@@ -324,8 +324,8 @@ CLI 拥有进程与应用生命周期；本 crate 拥有纯 `App` 状态机与�
   `Submit` 让**库**把该 turn 放到 worker 线程上跑 `submit`；`cancel` 由帧循环在 Esc 时
   调用，所以 `submit`/`cancel` 取 `&self`（`Sync`，turn 期间从 UI 线程与 worker 并发可达；
   CLI 用互斥量满足它）。库负责通道、`event::poll(80ms)` 帧定时器、排空、`draw`、
-  `app.tick()` 与 scoped worker；raw mode / alternate screen / 终端标题 / panic hook /
-  退出码全在 CLI。
+  `app.tick()` 与 scoped worker；raw mode / alternate screen / 鼠标订阅 / 终端标题 / panic hook /
+  退出码全在 CLI（鼠标滚轮：ADR-0017）。
 - **`/` 补全来自注入的 provider（ADR-0014 D3）**：reducer 每次按键刷新弹框，但候选池
   由 CLI 在 `App::new` 时注入（`CompletionProvider::complete(&self, input) ->
   Vec<CompletionItem>`，`CompletionItem` 是 TUI 自己的类型）。CLI 的实现由
@@ -370,9 +370,11 @@ CLI 拥有进程与应用生命周期；本 crate 拥有纯 `App` 状态机与�
 - **纯 App core（`app`）**：前端无关、无 I/O 的 reducer。持有 transcript、输入框、
   `history`（input history 快照）、`recall` 态、`completion`、`scroll` /
   `scrollbar_ticks`（auto 模式滚动条：出现后 ~1s 淡出，与 scroll 位置无关）、
+  `content_width` / `view_height`（最近一次 draw 的 transcript 面板宽度/高度，
+  行宽折行与滚轮溢出判定都依据它）、
   `status`（`cwd` / `session_id` / `branch` / `usage: FooterUsage` / `running` /
   `spinner_frame`）、注入的 `completions` provider、全局 `tool_output_expanded`、
-  `version`。`handle_key` / `handle_key_running` / `tick()`（推进 spinner 帧、递减滚动条
+  `version`。`handle_key` / `handle_key_running` / `handle_mouse` / `tick()`（推进 spinner 帧、递减滚动条
   淡出计数）是纯 reducer；`Effect` 只有五个变体——`SubmitPrompt(Prompt)`（打字的 prompt
   或 recall 重跑，`Prompt.record` 决定是否写输入历史）、`Command { name, arg }`、`Quit` /
   `QuitAfterTurn` / `CancelRunning`——**reducer 不解析命令语义**：`/` 开头的输入原样变成
@@ -385,6 +387,22 @@ CLI 拥有进程与应用生命周期；本 crate 拥有纯 `App` 状态机与�
   横线，边框色蓝色（`border`）闲置 / 青色（`borderAccent`）运行中，右缘滚动条 thumb。
   输入历史 recall：输入框为空时 `↑`/`↓` 进入（最新一条开始），`Enter` 把选中的历史 prompt
   作为新一轮重跑（不再写入历史）；每轮提交时追加（不查重，同 `HistoryStore::append`）。
+  滚动位置上限是 `max_scroll(total_lines, view_height)`（“面板始终填满 transcript”）：
+  滚轮与 `PgUp`/`PgDn` 都不会把空白滚进视口（旧版“至少留一行”的上限会让到顶时只剩
+  一行内容、其余是空白），内容不足一屏时两者都停在原处（ADR-0017 D5）。
+  视口靠内容锚泊：`apply` 只在 `follow` 时重新锚到底部，否则把本次追加的行数加到
+  `scroll` 上，所以上滚后（`follow == false`，滚轮或 `PgUp` 都一样）流式新内容**不会**把
+  视口拽回底部，窗口停在原内容上（ADR-0017 D6）；`/new`/`/load` 换 transcript 仍整体
+  `reset_view`。
+  `handle_mouse`（ADR-0017）是与键盘 reducer 并列的鼠标入口，**无返回值**（滚轮不产生
+  `Effect`）：只认 `ScrollUp`/`ScrollDown`，每格调用既有 `scroll_up`/`scroll_down` 3 行
+  （`WHEEL_LINES`），坐标/修饰键/点击/按下释放/水平滚轮一律忽略；内容不足一屏时
+  `scroll_up` 直接返回（`max_scroll == 0`），所以既不移动也不退出 follow/不重启滚动条
+  淡出（滚轮与 `PgUp` 同一规则，只有一份）。它刻意**不**走 `PgUp`/`PgDn` 的
+  “弹框优先”分支：弹框打开时滚轮仍滚 transcript（候选高亮不动），仍不进入输入历史
+  recall。这些边界都是有意的、且逐条有单测钉死（弹框、指针坐标、短内容、点击/按下
+  释放/水平滚轮零状态变化）：滚轮 ≠ `PgUp`/`PgDn` 的作用域优先级，事件坐标一律忽略
+  （不按指针下区域分派）。
 - **Footer / 状态指示器（ADR-0006 D5/D6）**：两行 dim footer 由纯函数拼装——第一行
   `~/cwd (branch) • session`（`footer::format_cwd_for_footer`：只在词法上位于 `$HOME`
   内时缩写为 `~` / `~/rel`），第二行 `stats_line`（`↑in ↓out Rcache WcacheWrite
@@ -401,7 +419,10 @@ CLI 拥有进程与应用生命周期；本 crate 拥有纯 `App` 状态机与�
   （CLI 持有每轮 `CancelToken`，`submit` 开头 `reset()`；worker 在下一 runner 边界 /
   下个 socket chunk 中止在途请求，并杀掉 bash 子进程组；以 `StopReason::Cancelled` 静默
   结束、已流式内容保留、不进历史）；Ctrl+C / Ctrl+D → `Effect::QuitAfterTurn`，其它按键
-  忽略。`handle.is_finished()` 门控 join，任何路径都先 join 再让 CLI 归还 provider/工具
+  忽略。**鼠标事件在两条路径上都转发给 `app.handle_mouse`**（空闲态主循环 + 运行中轮询
+  循环），所以运行中照常滚 transcript（3 行/格、滚动条淡出、上滚停跟随且新流式内容
+  不把视口拽回底部），而滚轮既不会取消这一轮也不会成为输入（不产生 Effect）；运行中 `Esc` 取消、Ctrl+C/Ctrl+D
+  标记退出后仍不变（ADR-0017 D1/D4/D6）。`handle.is_finished()` 门控 join，任何路径都先 join 再让 CLI 归还 provider/工具
   （不变量：provider 总被归还）。turn 的收尾全在 CLI：会话持久化为**每条消息实时追加**
   （ADR-0009 D5），`on_message` sink 把进入历史的每条消息同时推进 session 并
   `store.append`（追加失败收集为 notice、不打断 turn）；失败/取消且本轮已产出过消息时
@@ -449,7 +470,10 @@ stdout 是否 TTY）：
 模块：
 
 - `tui`：TUI 入口与 handler（ADR-0013）。`run` 拥有进程生命周期（raw mode / alternate
-  screen / 终端标题 / panic hook / 退出码）；`TuiSession` 实现 `UiHandler`，拥有 provider
+  screen / 鼠标订阅 / 终端标题 / panic hook / 退出码）：进入 TUI 时发最小鼠标订阅
+  `?1000h`+`?1006h`（DECSET press/release + SGR 坐标，**不**订阅 motion、不发
+  `XTSHIFTESCAPE`），`restore_terminal()` 发其逆向 `?1006l`+`?1000l`，panic hook 复用
+  同一恢复函数，所以异常退出也不会把鼠标留在 app 手里（ADR-0017 D2/D8）；`TuiSession` 实现 `UiHandler`，拥有 provider
   与工具（`Mutex` 里，turn 期间 take 出来跑、结束后归还）、session store、input history、
   skills、context files、environment，并实现**全部命令语义**（`/help` / `/new` / `/load` /
   `/sessions` / `/usage` / `/history` / `/skills` / `/install-skill` / `/exit` / `/!!` /

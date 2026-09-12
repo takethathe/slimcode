@@ -233,7 +233,7 @@ One item of the TUI's transcript model: the startup header, a boxed user prompt,
 _Avoid_: row, line, message (a Message is model-facing; an Entry is rendered)
 
 **Transcript**:
-The scrollable top region of the TUI holding the startup header, user/assistant messages, and tool blocks; it scrolls, the dock below it never does.
+The scrollable top region of the TUI holding the startup header, user/assistant messages, and tool blocks; it scrolls, the dock below it never does. The mouse wheel and `PgUp`/`PgDn` are the same family of Transcript scroll gestures — view-only, stopping follow on the way up, re-following at the bottom, showing the fading scrollbar; the wheel is **not** `↑`/`↓` and never enters Input history recall (ADR-0017).
 _Avoid_: chat area, message list
 
 **Dock**:

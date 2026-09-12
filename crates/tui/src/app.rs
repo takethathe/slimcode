@@ -15,7 +15,7 @@
 //! loading a session, installing a skill, ...) are surfaced as [`Effect`]s for
 //! the library to hand to the CLI.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -46,6 +46,12 @@ const COMPLETION_VISIBLE: usize = 5;
 
 /// Number of lines a PageUp / PageDown key scrolls the transcript by.
 const PAGE_LINES: usize = 10;
+
+/// Lines one mouse-wheel notch scrolls the transcript by: a sibling of
+/// [`PAGE_LINES`], deliberately small so a notch does not skip past what the
+/// reader was looking at. Not configurable, and there is no modifier-key
+/// acceleration (ADR-0017 D7).
+const WHEEL_LINES: usize = 3;
 
 /// Rows available to the footer (pi's two-line footer).
 const FOOTER_HEIGHT: u16 = 2;
@@ -236,6 +242,10 @@ pub struct App {
     /// most recent draw; 0 before the first draw. Used to wrap long lines so
     /// scroll/window row math matches what is rendered.
     content_width: u16,
+    /// The transcript pane height from the most recent draw; 0 before the
+    /// first draw. The scroll clamp ([`max_scroll`]) and the wheel's
+    /// "nothing to scroll" check ([`App::handle_mouse`]) both use it.
+    view_height: u16,
     /// Version string shown in the startup header (slimcode's version).
     version: String,
     /// Global tool-output expansion flag: Ctrl+O expands every tool block.
@@ -277,6 +287,7 @@ impl App {
             scroll: 0,
             follow: true,
             content_width: 0,
+            view_height: 0,
             version: version.into(),
             tool_output_expanded: false,
             scrollbar_ticks: 0,
@@ -422,6 +433,29 @@ impl App {
                 self.refresh_completion();
                 None
             }
+        }
+    }
+
+    /// Mouse reducer, the wheel's sibling of [`App::handle_key`]: the wheel
+    /// scrolls the transcript, everything else a mouse can report is ignored.
+    ///
+    /// Only `ScrollUp` / `ScrollDown` do anything, and they reuse the existing
+    /// scroll semantics ([`App::scroll_up`] / [`App::scroll_down`]): upward
+    /// stops following, returning to the bottom re-follows, and the scrollbar
+    /// fade counter restarts. A transcript that already fits the pane has
+    /// nowhere to scroll, so scrolling it is a complete no-op. Pointer
+    /// coordinates, modifiers, clicks, press/release, drags, motion and the
+    /// horizontal wheel change nothing — so a stray mouse can neither move the
+    /// input cursor, expand a tool block, pick a completion, nor cancel a
+    /// running turn. In particular the wheel is *not* `↑`/`↓`: it never enters
+    /// input-history recall (that keyboard semantic is untouched).
+    ///
+    /// Yields no [`Effect`]: the wheel is a view-only gesture, never an action.
+    pub fn handle_mouse(&mut self, event: MouseEvent) {
+        match event.kind {
+            MouseEventKind::ScrollUp => self.scroll_up(WHEEL_LINES),
+            MouseEventKind::ScrollDown => self.scroll_down(WHEEL_LINES),
+            _ => {}
         }
     }
 
@@ -667,6 +701,7 @@ impl App {
         // markdown wraps), so nothing is truncated.
         let content_width = transcript_area.width;
         self.content_width = content_width;
+        self.view_height = transcript_area.height;
         let lines = self.visible_lines(transcript_area.height, content_width);
         frame.render_widget(Paragraph::new(lines), transcript_area);
         self.render_scrollbar(frame, transcript_area, self.total_lines());
@@ -791,7 +826,15 @@ impl App {
     /// the shared runner); turn markers and the `✓ done` stop line are gone.
     /// CLI-owned state (notices, errors, prompts, usage, skills, branch,
     /// session changes) lands in the transcript/status line directly.
+    ///
+    /// The view follows the content instead of jumping: while the user is at
+    /// the bottom it stays anchored there, and while the user has scrolled up
+    /// it stays on the rows being read (the offset counts rows up from the
+    /// bottom, so it grows with the transcript). Without that, every streamed
+    /// delta would yank a mid-run reader back to the bottom.
     pub fn apply(&mut self, item: RenderItem) {
+        // Only a parked view needs the before/after height.
+        let parked_at = (!self.follow).then(|| self.total_lines());
         match item {
             RenderItem::Text(fragment) => {
                 if let Some(Entry::Assistant { text }) = self.transcript.last_mut() {
@@ -868,14 +911,23 @@ impl App {
             RenderItem::UserPrompt(text) => self.transcript.push(Entry::UserPrompt { text }),
             RenderItem::Usage(usage) => self.status.usage = usage,
             RenderItem::Branch(branch) => self.status.branch = branch,
-            // A new or loaded session drops the old transcript; the CLI emits
-            // the accompanying notice as its own item.
+            // A new or loaded session drops the old transcript — and the view
+            // state with it; the CLI emits the accompanying notice as its own
+            // item.
             RenderItem::SessionChanged { id } => {
                 self.transcript.clear();
                 self.status.session_id = id;
+                self.reset_view();
+                return;
             }
         }
-        self.reset_view();
+        match parked_at {
+            None => self.reset_view(),
+            Some(before) => {
+                let after = self.total_lines();
+                self.scroll = self.scroll.saturating_add(after.saturating_sub(before));
+            }
+        }
     }
 
     /// One loop frame (~80ms): decrement the scrollbar fade counter (auto
@@ -892,21 +944,32 @@ impl App {
         }
     }
 
-    /// Re-anchor the view at the bottom (follow mode): used after new content
-    /// is appended and after a transcript replacement.
+    /// Re-anchor the view at the bottom (follow mode): used when a prompt is
+    /// submitted, when the transcript is replaced, and after new content while
+    /// the user is already following it. A parked view (scrolled up) is left
+    /// alone by [`App::apply`].
     fn reset_view(&mut self) {
         self.scroll = 0;
         self.follow = true;
         self.scrollbar_ticks = 0;
     }
 
-    /// Scroll the transcript up `lines` and stop following.
+    /// Scroll the transcript up `lines` and stop following. The offset is
+    /// capped at [`max_scroll`], so the pane stays full of transcript rows: a
+    /// scroll gesture (wheel or page key) can never leave blank rows below the
+    /// top of the content. A transcript that already fits the pane has nothing
+    /// to scroll to, so the call is a complete no-op — it does not stop
+    /// following or restart the scrollbar fade either, which keeps a short
+    /// transcript from silently departing the follow mode.
     fn scroll_up(&mut self, lines: usize) {
+        let total = self.total_lines();
+        let max = max_scroll(total, self.view_height as usize);
+        if max == 0 {
+            return;
+        }
         self.follow = false;
         self.scrollbar_ticks = SCROLLBAR_FADE_TICKS;
-        let total = self.total_lines();
-        let max_scroll = total.saturating_sub(1);
-        self.scroll = (self.scroll + lines).min(max_scroll);
+        self.scroll = (self.scroll + lines).min(max);
     }
 
     /// Scroll the transcript down `lines`; reaching the bottom re-follows.
@@ -936,7 +999,7 @@ impl App {
         if total == 0 || height == 0 {
             return Vec::new();
         }
-        let max_scroll = total.saturating_sub(1);
+        let max_scroll = max_scroll(total, height);
         let scroll = self.scroll.min(max_scroll);
         let end = total.saturating_sub(scroll);
         let start = end.saturating_sub(height);
@@ -1002,8 +1065,7 @@ impl App {
 
     /// The (start, end) row window for the current scroll position.
     fn viewport(&self, total: usize, view: usize) -> (usize, usize) {
-        let max_scroll = total.saturating_sub(1);
-        let scroll = self.scroll.min(max_scroll);
+        let scroll = self.scroll.min(max_scroll(total, view));
         let end = total.saturating_sub(scroll);
         let start = end.saturating_sub(view);
         (start, end)
@@ -1041,6 +1103,16 @@ impl App {
     fn clear_input(&mut self) {
         self.input = fresh_input();
     }
+}
+
+/// The largest scroll offset (rows scrolled up from the bottom) that still
+/// fills a `view`-row pane with transcript. Scrolling further would only add
+/// blank rows below the last visible content, so `PgUp`/`PgDn` and the mouse
+/// wheel all stop here. A `view` of 0 (before the first draw has told the app
+/// its pane height) degenerates to "keep one row visible", which is what the
+/// scroll model used before the height was known.
+fn max_scroll(total: usize, view: usize) -> usize {
+    total.saturating_sub(view.max(1))
 }
 
 /// Build a fresh multi-line input box with placeholder and border.
@@ -1504,6 +1576,7 @@ fn italicize(line: Line<'static>, color: Color) -> Line<'static> {
 mod tests {
     use super::*;
 
+    use crossterm::event::MouseButton;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -2010,6 +2083,292 @@ mod tests {
         let window = transcript_window(&mut app, 8);
         let last = window.last().unwrap().to_string();
         assert!(last.contains("line 12"), "expected newest, got {last:?}");
+    }
+
+    // --- mouse wheel (tickets 01-03) ---------------------------------------
+
+    /// A mouse event at a pointer position (the wheel itself ignores it).
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// A transcript taller than any test pane: one single-row notice per line,
+    /// so the row math stays exact (streamed text would merge into one entry).
+    fn tall_app(lines: usize) -> App {
+        let mut app = seeded_app();
+        for i in 0..lines {
+            app.apply(RenderItem::Notice(format!("notice {i}")));
+        }
+        app
+    }
+
+    #[test]
+    fn wheel_scrolls_three_lines_and_never_recalls_history() {
+        let mut app = tall_app(20);
+        app.set_history(vec![
+            "older prompt".to_string(),
+            "newest prompt".to_string(),
+        ]);
+        let before = transcript_window(&mut app, 12);
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, 1, 1));
+
+        // One notch moves three rows, stops following, and touches nothing
+        // else: no input text, no recall (the bug being fixed).
+        assert_eq!(app.scroll, WHEEL_LINES);
+        assert!(!app.follow);
+        assert!(app.input_text().is_empty());
+        assert_eq!(app.recall, None);
+        // The visible window moved up by exactly those three rows.
+        let after = transcript_window(&mut app, 12);
+        for i in WHEEL_LINES..after.len() {
+            assert_eq!(
+                after[i],
+                before[i - WHEEL_LINES],
+                "row {i} should carry the row {WHEEL_LINES} lines above it"
+            );
+        }
+
+        // Scrolling back down re-follows the bottom without recalling either.
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 1, 1));
+        assert_eq!(app.scroll, 0);
+        assert!(app.follow);
+        assert!(app.input_text().is_empty());
+        assert_eq!(app.recall, None);
+
+        // The keyboard ↑ semantics are untouched: it still recalls the newest
+        // prompt at the empty input (regression nail against over-reach).
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.input_text(), "newest prompt");
+        assert_eq!(app.recall, Some(Recall { index: 1 }));
+    }
+
+    #[test]
+    fn wheel_stops_at_the_top_with_a_full_pane() {
+        let mut app = tall_app(20);
+        let pane_h = (12 - INPUT_HEIGHT - FOOTER_HEIGHT) as usize;
+        render_buffer(&mut app, 60, 12);
+
+        // Far more notches than the transcript has rows.
+        for _ in 0..40 {
+            app.handle_mouse(mouse(MouseEventKind::ScrollUp, 0, 0));
+        }
+
+        // Stopped where the first content row sits on the pane's first row, so
+        // the pane is still full of transcript and no blank space was scrolled
+        // into view.
+        assert_eq!(app.scroll, app.total_lines() - pane_h);
+        let window = transcript_window(&mut app, 12);
+        assert!(
+            window[0].contains("slimcode v"),
+            "the transcript top must be at the pane top: {window:?}"
+        );
+        assert!(window[1].contains("/help for commands"), "{window:?}");
+
+        // Further notches change nothing: the view is pinned at the top.
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, 0, 0));
+        assert_eq!(transcript_window(&mut app, 12), window);
+    }
+
+    #[test]
+    fn page_keys_share_the_full_pane_bound() {
+        // PgUp/PgDn keep their paging semantics; only their extreme bound is
+        // the same "fill the pane" one the wheel uses, so neither gesture can
+        // scroll a short transcript off the screen or overshoot the top.
+        let mut app = seeded_app();
+        app.apply(RenderItem::Notice("only notice".to_string()));
+        let before = render_buffer(&mut app, 60, 12);
+        app.handle_key(key(KeyCode::PageUp));
+        assert_eq!(app.scroll, 0);
+        assert!(
+            app.follow,
+            "a page key must not leave follow mode when nothing scrolled"
+        );
+        assert_eq!(before, render_buffer(&mut app, 60, 12));
+
+        let mut app = tall_app(20);
+        let pane_h = (12 - INPUT_HEIGHT - FOOTER_HEIGHT) as usize;
+        render_buffer(&mut app, 60, 12);
+        for _ in 0..5 {
+            app.handle_key(key(KeyCode::PageUp));
+        }
+        assert_eq!(app.scroll, app.total_lines() - pane_h);
+        let window = transcript_window(&mut app, 12);
+        assert!(window[0].contains("slimcode v"), "{window:?}");
+    }
+
+    #[test]
+    fn wheel_is_a_no_op_when_the_transcript_fits_the_pane() {
+        let mut app = seeded_app();
+        app.apply(RenderItem::Notice("only notice".to_string()));
+        app.set_history(vec!["a prompt".to_string()]);
+        // Draw once, so the app knows the pane it would scroll in.
+        let before = render_buffer(&mut app, 60, 12);
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, 0, 0));
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 0, 0));
+
+        assert_eq!(app.scroll, 0, "the scroll position must not change");
+        assert!(app.follow, "the view must stay at the bottom");
+        assert!(!has_thumb(&render_buffer(&mut app, 60, 12)));
+        assert_eq!(
+            before,
+            render_buffer(&mut app, 60, 12),
+            "a short transcript must render the same frame"
+        );
+    }
+
+    #[test]
+    fn wheel_scrolls_the_transcript_while_the_completion_popup_is_open() {
+        let mut app = tall_app(20);
+        type_text(&mut app, "/us");
+        render_buffer(&mut app, 60, 16);
+        let popup = app.completion.clone().expect("popup should be open");
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, 0, 0));
+
+        // Deliberately *not* PgUp/PgDn's popup-first branch: the wheel always
+        // scrolls the transcript, and the highlighted candidate stays put.
+        assert_eq!(app.scroll, WHEEL_LINES);
+        assert_eq!(app.completion, Some(popup), "the selection must not move");
+    }
+
+    #[test]
+    fn wheel_output_does_not_depend_on_the_pointer_position() {
+        // A transcript row, an input-box row and a footer row of a 60x12
+        // frame: every position must yield the same view (coordinates are
+        // ignored, the wheel is never routed by region).
+        let positions = [(30u16, 2u16), (30, 9), (30, 11)];
+        let mut views = Vec::new();
+        for (column, row) in positions {
+            let mut app = tall_app(20);
+            render_buffer(&mut app, 60, 12);
+            app.handle_mouse(mouse(MouseEventKind::ScrollUp, column, row));
+            views.push((app.scroll, transcript_window(&mut app, 12)));
+        }
+        assert_eq!(views[0].0, WHEEL_LINES);
+        assert_eq!(views[0], views[1], "input-box pointer must behave the same");
+        assert_eq!(views[1], views[2], "footer pointer must behave the same");
+    }
+
+    #[test]
+    fn non_wheel_mouse_events_change_no_state() {
+        let mut app = tall_app(20);
+        // A collapsed tool block, so a stray click cannot expand or fold it.
+        app.apply(RenderItem::ToolStart {
+            tool_call_id: "call_ls".to_string(),
+            name: "ls".to_string(),
+            arguments: "{\"path\":\".\"}".to_string(),
+        });
+        app.apply(RenderItem::ToolResult {
+            tool_call_id: "call_ls".to_string(),
+            name: "ls".to_string(),
+            ok: true,
+            result: (0..20)
+                .map(|i| format!("out {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        });
+        // An active recall, so mouse events cannot silently exit it either.
+        app.set_history(vec!["recalled prompt".to_string()]);
+        app.handle_key(key(KeyCode::Up));
+        let before = render_buffer(&mut app, 60, 12);
+
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Moved,
+            MouseEventKind::ScrollLeft,
+            MouseEventKind::ScrollRight,
+        ] {
+            app.handle_mouse(mouse(kind, 3, 4));
+        }
+
+        assert_eq!(app.scroll, 0);
+        assert!(app.follow);
+        assert_eq!(app.recall, Some(Recall { index: 0 }));
+        assert_eq!(app.input_text(), "recalled prompt");
+        assert_eq!(app.completion, None);
+        assert!(!app.tool_output_expanded);
+        assert_eq!(before, render_buffer(&mut app, 60, 12));
+    }
+
+    #[test]
+    fn wheel_scrolls_while_a_turn_runs() {
+        let mut app = tall_app(20);
+        app.set_running(true);
+        render_buffer(&mut app, 60, 12);
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, 0, 0));
+        assert_eq!(app.scroll, WHEEL_LINES);
+        assert!(app.status.running, "the wheel must not touch the run");
+
+        // The running keyboard semantics are unchanged, and they do not
+        // scroll the view either.
+        assert_eq!(
+            app.handle_key_running(ctrl_key('c')),
+            Some(Effect::QuitAfterTurn)
+        );
+        assert_eq!(app.scroll, WHEEL_LINES);
+        assert_eq!(
+            app.handle_key_running(key(KeyCode::Esc)),
+            Some(Effect::CancelRunning)
+        );
+        assert_eq!(app.scroll, WHEEL_LINES);
+        assert!(app.status.running);
+    }
+
+    #[test]
+    fn a_parked_view_keeps_reading_while_output_streams() {
+        let mut app = tall_app(20);
+        app.set_running(true);
+        render_buffer(&mut app, 60, 12);
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, 0, 0));
+        let parked = transcript_window(&mut app, 12);
+
+        // Four more rows arrive while the turn streams: the parked window must
+        // still show the same rows (the wheel is useless mid-run otherwise).
+        app.apply(RenderItem::Notice("streamed 1".to_string()));
+        app.apply(RenderItem::Notice("streamed 2".to_string()));
+        assert_eq!(transcript_window(&mut app, 12), parked);
+
+        // The offset grew with the transcript, so scrolling back down still
+        // reaches the newest row and re-follows.
+        for _ in 0..5 {
+            app.handle_mouse(mouse(MouseEventKind::ScrollDown, 0, 0));
+        }
+        assert_eq!(app.scroll, 0);
+        assert!(app.follow);
+        let window = transcript_window(&mut app, 12);
+        assert!(
+            window.iter().any(|row| row.contains("streamed 2")),
+            "expected the newest row back in view: {window:?}"
+        );
+    }
+
+    #[test]
+    fn wheel_shows_the_scrollbar_which_then_fades() {
+        let mut app = tall_app(20);
+        assert!(!has_thumb(&render_buffer(&mut app, 60, 12)));
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, 0, 0));
+        assert!(
+            has_thumb(&render_buffer(&mut app, 60, 12)),
+            "the wheel should show the thumb"
+        );
+
+        // Same ~1s auto fade as PgUp/PgDn.
+        for _ in 0..SCROLLBAR_FADE_TICKS {
+            app.tick();
+        }
+        assert!(!has_thumb(&render_buffer(&mut app, 60, 12)));
     }
 
     #[test]

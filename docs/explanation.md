@@ -141,7 +141,8 @@ notice 行（措辞与 CLI 共用 `usage_summary`，含同样式汇总）。`{pc
 **为什么 TUI 替代 REPL**（ADR-0003）：行式 REPL 无法区分 Shift+Enter 与 Enter，
 多行输入只能靠 `\` 续行（ADR-0001 的取舍）；raw mode 一旦开启（TUI 的必然），
 Shift+Enter 与 Enter 可区分，Enter 提交、Shift+Enter 换行，交互自然得多。同时
-TUI 提供滚动 transcript、`PgUp`/`PgDn` 翻页、输入历史 recall（`↑`/`↓`）、pi 风格
+TUI 提供滚动 transcript、`PgUp`/`PgDn` 翻页、鼠标滚轮滚动（ADR-0017）、输入历史
+recall（`↑`/`↓`）、pi 风格
 的 dock footer 与状态指示器（运行中 spinner 行），可维护性也更好——ratatui 的
 widget 模型 + `TestBackend` 让 UI 逻辑可做帧缓冲
 测试（spec：好的测试断言帧缓冲，而非内部状态）。代价是交互式前端引入
