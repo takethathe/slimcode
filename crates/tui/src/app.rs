@@ -1,7 +1,11 @@
 //! The pure TUI app core: a testable state machine that owns the transcript,
-//! the input box, the status line and the view state, exposes an on-key
-//! reducer and a draw-to-frame function, and implements the shared
-//! [`Renderer`] trait so the shared runner can stream events straight into it.
+//! the input box, the status line and the view state, and exposes an on-key
+//! reducer plus a draw-to-frame function.
+//!
+//! The app consumes only its own display vocabulary: the CLI converts the
+//! application layer's `DisplayItem`s into [`RenderItem`]s (ADR-0014 D2) and
+//! the app applies them through [`App::apply`]. The merge and tool-pairing
+//! rules that build the transcript stay private here.
 //!
 //! Nothing in this module touches a real terminal. Rendering goes through a
 //! [`Frame`] supplied by the caller, so tests can drive it with ratatui's
@@ -15,17 +19,14 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use slimcode_app::render::{DisplayItem, Renderer, usage_summary};
-use slimcode_app::skills::{
-    CompletionItem, Skill, SkillScope, combined_suggestions, complete, find_skill,
-};
+use slimcode_app::skills::{CompletionItem, SkillView, combined_suggestions, complete, find_skill};
 use slimcode_commands::{COMMANDS, find};
-use slimcode_core::agent::StopReason;
 use tui_textarea::{CursorMove, TextArea};
 use unicode_width::UnicodeWidthChar;
 
 use crate::footer::FooterUsage;
 use crate::markdown::render_markdown;
+use crate::render::{RenderItem, SkillInfo, SkillScope};
 use crate::text::{display_width, wrap_to_width};
 use crate::theme::{BgToken, Token, bg, fg};
 use crate::toolcall::{CallPart, tool_call_title};
@@ -224,8 +225,8 @@ pub struct App {
     /// Status-line state.
     pub status: StatusLine,
     /// Snapshot of installed skills used for `/skill` dispatch and suggestions;
-    /// refreshed after a runtime `/install-skill` (see [`App::set_skills`]).
-    pub skills: Vec<Skill>,
+    /// refreshed by [`RenderItem::Skills`] after a runtime `/install-skill`.
+    pub skills: Vec<SkillInfo>,
     /// Recent prompts for ↑/↓ recall, in `HistoryStore` order (oldest first,
     /// newest last — recall starts at the newest entry, matching `/!1`). The
     /// terminal loop seeds this from `HistoryStore` at startup; fresh prompts
@@ -263,7 +264,7 @@ impl App {
         session_id: impl Into<String>,
         model: impl Into<String>,
         version: impl Into<String>,
-        skills: Vec<Skill>,
+        skills: Vec<SkillInfo>,
     ) -> Self {
         let mut app = App {
             transcript: Vec::new(),
@@ -306,18 +307,6 @@ impl App {
         }
     }
 
-    /// Feed the best-effort git branch (shell reads it at startup and on
-    /// session changes). `None` outside a repository.
-    pub fn set_branch(&mut self, branch: Option<String>) {
-        self.status.branch = branch;
-    }
-
-    /// Feed the session-total token usage for the footer stats line (the
-    /// provider's cumulative totals after each turn).
-    pub fn set_usage(&mut self, usage: FooterUsage) {
-        self.status.usage = usage;
-    }
-
     /// The current spinner frame character (pi braille loader).
     fn spinner_char(&self) -> char {
         SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()]
@@ -344,50 +333,23 @@ impl App {
     }
 
     /// Append frontend-owned output to the transcript (dim notice).
-    pub fn push_notice(&mut self, text: impl Into<String>) {
+    fn push_notice(&mut self, text: impl Into<String>) {
         self.transcript.push(Entry::Notice(text.into()));
         self.reset_view();
     }
 
     /// Append an inline error entry to the transcript (red).
-    pub fn push_error(&mut self, text: impl Into<String>) {
+    fn push_error(&mut self, text: impl Into<String>) {
         self.transcript.push(Entry::Error(text.into()));
         self.reset_view();
     }
 
     /// Append a boxed user prompt block (typed, recalled, or `/!!`-replayed
     /// prompts all render the same way; the `> prompt` notice line is gone).
-    pub fn push_user_prompt(&mut self, text: impl Into<String>) {
+    fn push_user_prompt(&mut self, text: impl Into<String>) {
         self.transcript
             .push(Entry::UserPrompt { text: text.into() });
         self.reset_view();
-    }
-
-    /// Clear the transcript for a new session and point the status line at the
-    /// freshly created session. The terminal loop calls this after it fulfils
-    /// an [`Effect::NewSession`].
-    pub fn clear_for_new_session(&mut self, id: &str) {
-        self.transcript.clear();
-        self.status.session_id = id.to_string();
-        self.reset_view();
-        self.push_notice(format!("new session: {id}"));
-    }
-
-    /// Replace the transcript with a freshly loaded session. The terminal loop
-    /// calls this after it fulfils an [`Effect::LoadSession`] successfully.
-    pub fn apply_loaded_session(&mut self, id: &str) {
-        self.transcript.clear();
-        self.status.session_id = id.to_string();
-        self.reset_view();
-        self.push_notice(format!("loaded session: {id}"));
-    }
-
-    /// Replace the skills snapshot. The terminal loop calls this after a
-    /// runtime `/install-skill` re-reads the store, so `/` completion,
-    /// did-you-mean prediction, and skill dispatch see the new skill
-    /// immediately instead of on the next launch.
-    pub fn set_skills(&mut self, skills: Vec<Skill>) {
-        self.skills = skills;
     }
 
     /// On-key reducer: returns the effect (if any) the loop must fulfil.
@@ -837,31 +799,31 @@ impl App {
         frame.render_widget(Paragraph::new(rows), area);
     }
 
-    /// Push a streamed display item into the transcript and re-follow.
+    /// Apply one display item: the TUI's only way in (ADR-0014 D2).
     ///
     /// Consecutive streamed text (and reasoning) fragments merge into a
     /// single assistant/thinking block, so a multi-delta stream renders as one
     /// flowing block. Tool start/result pair into one block (sequential per
     /// the shared runner); turn markers and the `✓ done` stop line are gone.
-    fn push_display_item(&mut self, item: DisplayItem) {
+    /// CLI-owned state (notices, errors, prompts, usage, skills, branch,
+    /// session changes) lands in the transcript/status line directly.
+    pub fn apply(&mut self, item: RenderItem) {
         match item {
-            // Turn markers were removed in the pi alignment (no `── turn N ──`).
-            DisplayItem::Turn { .. } => return,
-            DisplayItem::Text(fragment) => {
+            RenderItem::Text(fragment) => {
                 if let Some(Entry::Assistant { text }) = self.transcript.last_mut() {
                     text.push_str(&fragment);
                 } else {
                     self.transcript.push(Entry::Assistant { text: fragment });
                 }
             }
-            DisplayItem::Reasoning(fragment) => {
+            RenderItem::Reasoning(fragment) => {
                 if let Some(Entry::Thinking { text }) = self.transcript.last_mut() {
                     text.push_str(&fragment);
                 } else {
                     self.transcript.push(Entry::Thinking { text: fragment });
                 }
             }
-            DisplayItem::ToolStart {
+            RenderItem::ToolStart {
                 tool_call_id,
                 name,
                 arguments,
@@ -874,7 +836,7 @@ impl App {
                     status: ToolStatus::Pending,
                 });
             }
-            DisplayItem::ToolResult {
+            RenderItem::ToolResult {
                 tool_call_id,
                 name,
                 ok,
@@ -917,16 +879,17 @@ impl App {
                     });
                 }
             }
-            // A completed run renders nothing (no `✓ done` line); a cancelled
-            // run (Esc) also renders nothing — the partial transcript is the
-            // feedback. There is no abnormal stop: a run ends either because
-            // the model stopped calling tools or because the user cancelled.
-            DisplayItem::Stop(StopReason::Completed) => return,
-            DisplayItem::Stop(StopReason::Cancelled) => return,
-            // `/usage` and the CLI summary share the dim notice line; the
-            // per-turn usage line is gone (the footer shows totals, ticket 03).
-            DisplayItem::Usage(u) => {
-                self.transcript.push(Entry::Notice(usage_summary(&u)));
+            RenderItem::Notice(text) => self.transcript.push(Entry::Notice(text)),
+            RenderItem::Error(text) => self.transcript.push(Entry::Error(text)),
+            RenderItem::UserPrompt(text) => self.transcript.push(Entry::UserPrompt { text }),
+            RenderItem::Usage(usage) => self.status.usage = usage,
+            RenderItem::Skills(skills) => self.skills = skills,
+            RenderItem::Branch(branch) => self.status.branch = branch,
+            // A new or loaded session drops the old transcript; the CLI emits
+            // the accompanying notice as its own item.
+            RenderItem::SessionChanged { id } => {
+                self.transcript.clear();
+                self.status.session_id = id;
             }
         }
         self.reset_view();
@@ -1225,10 +1188,13 @@ impl App {
     }
 }
 
-impl Renderer for App {
-    fn render(&mut self, item: &DisplayItem) -> Result<(), String> {
-        self.push_display_item(item.clone());
-        Ok(())
+impl SkillView for SkillInfo {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        &self.description
     }
 }
 
@@ -1696,22 +1662,17 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
-    use slimcode_ai::wire::TokenUsage;
     use slimcode_app::history::{HISTORY_DISPLAY, render_history};
-    use slimcode_app::skills::{Skill, SkillScope};
 
     // --- helpers -----------------------------------------------------------
 
     /// A minimal installed skill for trigger tests.
-    fn skill(name: &str, description: &str) -> Skill {
-        Skill {
+    fn skill(name: &str, description: &str) -> SkillInfo {
+        SkillInfo {
             name: name.to_string(),
             description: description.to_string(),
             disable_model_invocation: false,
-            body: String::new(),
             scope: SkillScope::User,
-            dir: std::path::PathBuf::new(),
-            file: std::path::PathBuf::new(),
         }
     }
 
@@ -1810,18 +1771,15 @@ mod tests {
     #[test]
     fn transcript_accumulates_streamed_text() {
         let mut app = seeded_app();
-        app.render(&DisplayItem::Text("hello ".to_string()))
-            .unwrap();
-        app.render(&DisplayItem::Text("world\n".to_string()))
-            .unwrap();
+        app.apply(RenderItem::Text("hello ".to_string()));
+        app.apply(RenderItem::Text("world\n".to_string()));
 
         let buffer = render_buffer(&mut app, 40, 12);
         // Consecutive streamed text fragments merge onto one transcript line.
         assert!(buffer_contains(&buffer, "hello world"));
         // A single streamed item spanning multiple lines renders fully.
         let mut app = seeded_app();
-        app.render(&DisplayItem::Text("one\ntwo\n".to_string()))
-            .unwrap();
+        app.apply(RenderItem::Text("one\ntwo\n".to_string()));
         let buffer = render_buffer(&mut app, 40, 12);
         assert!(buffer_contains(&buffer, "one"));
         assert!(buffer_contains(&buffer, "two"));
@@ -1830,10 +1788,8 @@ mod tests {
     #[test]
     fn transcript_accumulates_streamed_reasoning() {
         let mut app = seeded_app();
-        app.render(&DisplayItem::Reasoning("The ".to_string()))
-            .unwrap();
-        app.render(&DisplayItem::Reasoning("user said".to_string()))
-            .unwrap();
+        app.apply(RenderItem::Reasoning("The ".to_string()));
+        app.apply(RenderItem::Reasoning("user said".to_string()));
 
         let buffer = render_buffer(&mut app, 60, 12);
         // Consecutive reasoning deltas merge into one italic thinking block
@@ -1846,7 +1802,7 @@ mod tests {
         let mut app = seeded_app();
         // A line far wider than the 40-wide pane (content width 38).
         let long = format!("{}END", "x".repeat(60));
-        app.render(&DisplayItem::Text(long)).unwrap();
+        app.apply(RenderItem::Text(long));
         let buffer = render_buffer(&mut app, 40, 12);
         // The tail must be visible: wrapped, not truncated.
         assert!(buffer_contains(&buffer, "END"));
@@ -1858,7 +1814,7 @@ mod tests {
         // 31 CJK chars = 62 display columns, wider than the 38-column content
         // area: the trailing char must survive via width-aware wrapping.
         let long = format!("{}尾", "好".repeat(30));
-        app.render(&DisplayItem::Text(long)).unwrap();
+        app.apply(RenderItem::Text(long));
         let buffer = render_buffer(&mut app, 40, 12);
         assert!(buffer_contains(&buffer, "尾"));
     }
@@ -1866,19 +1822,17 @@ mod tests {
     #[test]
     fn tool_start_pairs_with_result_into_one_block() {
         let mut app = seeded_app();
-        app.render(&DisplayItem::ToolStart {
+        app.apply(RenderItem::ToolStart {
             tool_call_id: "call_read".to_string(),
             name: "read".to_string(),
             arguments: r#"{"path": "a.txt"}"#.to_string(),
-        })
-        .unwrap();
-        app.render(&DisplayItem::ToolResult {
+        });
+        app.apply(RenderItem::ToolResult {
             tool_call_id: "call_read".to_string(),
             name: "read".to_string(),
             ok: true,
             result: "ok".to_string(),
-        })
-        .unwrap();
+        });
 
         let buffer = render_buffer(&mut app, 60, 14);
         // Compact per-tool title + gray output, all inside one state-colored
@@ -1896,32 +1850,28 @@ mod tests {
         // with the same name" would swap the two outputs; pairing by call id
         // must keep each result with its own call.
         let mut app = seeded_app();
-        app.render(&DisplayItem::ToolStart {
+        app.apply(RenderItem::ToolStart {
             tool_call_id: "call_1".to_string(),
             name: "read".to_string(),
             arguments: r#"{"path":"a.txt"}"#.to_string(),
-        })
-        .unwrap();
-        app.render(&DisplayItem::ToolStart {
+        });
+        app.apply(RenderItem::ToolStart {
             tool_call_id: "call_2".to_string(),
             name: "read".to_string(),
             arguments: r#"{"path":"b.txt"}"#.to_string(),
-        })
-        .unwrap();
-        app.render(&DisplayItem::ToolResult {
+        });
+        app.apply(RenderItem::ToolResult {
             tool_call_id: "call_1".to_string(),
             name: "read".to_string(),
             ok: true,
             result: "alpha".to_string(),
-        })
-        .unwrap();
-        app.render(&DisplayItem::ToolResult {
+        });
+        app.apply(RenderItem::ToolResult {
             tool_call_id: "call_2".to_string(),
             name: "read".to_string(),
             ok: true,
             result: "beta".to_string(),
-        })
-        .unwrap();
+        });
 
         let rows = transcript_window(&mut app, 20);
         let pos = |needle: &str| {
@@ -1938,19 +1888,17 @@ mod tests {
     #[test]
     fn failed_tool_result_sets_error_block() {
         let mut app = seeded_app();
-        app.render(&DisplayItem::ToolStart {
+        app.apply(RenderItem::ToolStart {
             tool_call_id: "call_write".to_string(),
             name: "write".to_string(),
             arguments: "x".to_string(),
-        })
-        .unwrap();
-        app.render(&DisplayItem::ToolResult {
+        });
+        app.apply(RenderItem::ToolResult {
             tool_call_id: "call_write".to_string(),
             name: "write".to_string(),
             ok: false,
             result: "denied".to_string(),
-        })
-        .unwrap();
+        });
 
         // The failed result lands in the same block (no separate `✖` line).
         let buffer = render_buffer(&mut app, 60, 14);
@@ -1960,13 +1908,9 @@ mod tests {
     }
 
     #[test]
-    fn completed_stop_renders_nothing_and_turn_marker_is_ignored() {
+    fn transcript_has_no_turn_marker_or_done_line() {
         let mut app = seeded_app();
-        app.render(&DisplayItem::Turn { turn: 1 }).unwrap();
-        app.render(&DisplayItem::Stop(StopReason::Completed))
-            .unwrap();
-        app.render(&DisplayItem::Text("answer\n".to_string()))
-            .unwrap();
+        app.apply(RenderItem::Text("answer\n".to_string()));
 
         let buffer = render_buffer(&mut app, 60, 14);
         assert!(buffer_contains(&buffer, "answer"));
@@ -1975,14 +1919,11 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_stop_renders_nothing_like_completed() {
-        // Esc ends the turn silently: Stop(Cancelled) draws no marker and no
-        // red error line — the partial transcript is the feedback (ticket 07).
+    fn cancelled_turn_renders_no_marker() {
+        // Esc ends the turn silently: the partial transcript is the feedback
+        // (ticket 07), and no stop item reaches the app at all (ADR-0014 D1).
         let mut app = seeded_app();
-        app.render(&DisplayItem::Text("partial answer\n".to_string()))
-            .unwrap();
-        app.render(&DisplayItem::Stop(StopReason::Cancelled))
-            .unwrap();
+        app.apply(RenderItem::Text("partial answer\n".to_string()));
         let buffer = render_buffer(&mut app, 60, 12);
         assert!(buffer_contains(&buffer, "partial answer"));
         assert!(!buffer_contains(&buffer, "⚠"));
@@ -2043,8 +1984,7 @@ mod tests {
         let mut app = seeded_app();
         // Seed 12 single-line items so the transcript is taller than the pane.
         for i in 0..12 {
-            app.render(&DisplayItem::Text(format!("line {i}\n")))
-                .unwrap();
+            app.apply(RenderItem::Text(format!("line {i}\n")));
         }
 
         // Pane shows only the last couple of rows: follow is on.
@@ -2068,8 +2008,7 @@ mod tests {
         assert!(last.contains("line 11"), "expected bottom, got {last:?}");
 
         // A new streamed item re-follows to the newest line.
-        app.render(&DisplayItem::Text("line 12\n".to_string()))
-            .unwrap();
+        app.apply(RenderItem::Text("line 12\n".to_string()));
         let window = transcript_window(&mut app, 8);
         let last = window.last().unwrap().to_string();
         assert!(last.contains("line 12"), "expected newest, got {last:?}");
@@ -2078,8 +2017,7 @@ mod tests {
     #[test]
     fn resize_re_renders_layout() {
         let mut app = seeded_app();
-        app.render(&DisplayItem::Text("resize me\n".to_string()))
-            .unwrap();
+        app.apply(RenderItem::Text("resize me\n".to_string()));
 
         let small = render_buffer(&mut app, 60, 10);
         assert!(buffer_contains(&small, "resize me"));
@@ -2094,15 +2032,17 @@ mod tests {
     #[test]
     fn slash_new_clears_transcript() {
         let mut app = seeded_app();
-        app.render(&DisplayItem::Text("old content\n".to_string()))
-            .unwrap();
+        app.apply(RenderItem::Text("old content\n".to_string()));
 
         type_text(&mut app, "/new");
         let effect = app.handle_key(key(KeyCode::Enter));
         assert_eq!(effect, Some(Effect::NewSession));
 
         // The loop fulfils the effect by clearing the transcript.
-        app.clear_for_new_session("sess-2");
+        app.apply(RenderItem::SessionChanged {
+            id: "sess-2".into(),
+        });
+        app.apply(RenderItem::Notice("new session: sess-2".into()));
         let buffer = render_buffer(&mut app, 60, 12);
         assert!(!buffer_contains(&buffer, "old content"));
         assert!(buffer_contains(&buffer, "new session: sess-2"));
@@ -2112,14 +2052,16 @@ mod tests {
     #[test]
     fn slash_load_clears_transcript() {
         let mut app = seeded_app();
-        app.render(&DisplayItem::Text("old content\n".to_string()))
-            .unwrap();
+        app.apply(RenderItem::Text("old content\n".to_string()));
 
         type_text(&mut app, "/load sess-9");
         let effect = app.handle_key(key(KeyCode::Enter));
         assert_eq!(effect, Some(Effect::LoadSession("sess-9".to_string())));
 
-        app.apply_loaded_session("sess-9");
+        app.apply(RenderItem::SessionChanged {
+            id: "sess-9".into(),
+        });
+        app.apply(RenderItem::Notice("loaded session: sess-9".into()));
         let buffer = render_buffer(&mut app, 60, 12);
         assert!(!buffer_contains(&buffer, "old content"));
         assert!(buffer_contains(&buffer, "loaded session: sess-9"));
@@ -2148,7 +2090,9 @@ mod tests {
         );
 
         app.set_running(true);
-        app.push_error("provider exploded: model unreachable");
+        app.apply(RenderItem::Error(
+            "provider exploded: model unreachable".into(),
+        ));
         app.set_running(false);
 
         let buffer = render_buffer(&mut app, 80, 12);
@@ -2268,40 +2212,26 @@ mod tests {
     }
 
     #[test]
-    fn usage_renders_token_counts() {
+    fn usage_item_fills_the_footer_stats() {
         let mut app = seeded_app();
-        app.render(&DisplayItem::Usage(TokenUsage {
-            prompt_tokens: 10,
-            completion_tokens: 5,
-            total_tokens: 15,
-            ..Default::default()
-        }))
-        .unwrap();
+        app.apply(RenderItem::Usage(FooterUsage::new(10, 5, 0, 0)));
         let buffer = render_buffer(&mut app, 60, 12);
-        assert!(buffer_contains(
-            &buffer,
-            "tokens: 10 prompt (0 cached, 0%) + 5 completion = 15 total"
-        ));
+        assert!(buffer_contains(&buffer, "↑10"), "{}", line_at(&buffer, 11));
+        assert!(buffer_contains(&buffer, "↓5"), "{}", line_at(&buffer, 11));
     }
 
     #[test]
-    fn usage_renders_cached_count() {
+    fn usage_item_fills_the_cache_counters() {
         let mut app = seeded_app();
-        app.render(&DisplayItem::Usage(TokenUsage {
-            prompt_tokens: 10,
-            completion_tokens: 5,
-            total_tokens: 15,
-            prompt_tokens_details: Some(slimcode_ai::wire::PromptTokensDetails {
-                cached_tokens: 7,
-                cache_creation_input_tokens: 3,
-            }),
-        }))
-        .unwrap();
+        app.apply(RenderItem::Usage(FooterUsage::new(10, 5, 7, 3)));
         let buffer = render_buffer(&mut app, 80, 12);
-        assert!(buffer_contains(
-            &buffer,
-            "tokens: 10 prompt (7 cached, 70%) + 5 completion = 15 total"
-        ));
+        assert!(buffer_contains(&buffer, "R7"), "{}", line_at(&buffer, 11));
+        assert!(buffer_contains(&buffer, "W3"), "{}", line_at(&buffer, 11));
+        assert!(
+            buffer_contains(&buffer, "CH70%"),
+            "{}",
+            line_at(&buffer, 11)
+        );
     }
 
     // --- history recall (ticket 05) ---------------------------------------
@@ -2423,7 +2353,7 @@ mod tests {
         let entries = vec!["one".to_string(), "two".to_string()];
         let lines = render_history(&entries, HISTORY_DISPLAY);
         for line in lines {
-            app.push_notice(line);
+            app.apply(RenderItem::Notice(line));
         }
         let buffer = render_buffer(&mut app, 60, 12);
         assert!(buffer_contains(&buffer, "2: one"));
@@ -2649,8 +2579,7 @@ mod tests {
         let mut app = seeded_app();
         // Seed a transcript taller than the pane so scrolling is observable.
         for i in 0..12 {
-            app.render(&DisplayItem::Text(format!("line {i}\n")))
-                .unwrap();
+            app.apply(RenderItem::Text(format!("line {i}\n")));
         }
         type_text(&mut app, "/");
         let scroll_before = app.scroll;
@@ -2742,7 +2671,10 @@ mod tests {
 
         // A runtime `/install-skill` re-reads the store and pushes the fresh
         // snapshot into the app (the terminal loop wires this up).
-        app.set_skills(vec![skill("grill", "stress-test a plan")]);
+        app.apply(RenderItem::Skills(vec![skill(
+            "grill",
+            "stress-test a plan",
+        )]));
 
         // The next keystroke recomputes the popup: the new skill is
         // predictable without a restart.
@@ -2789,7 +2721,10 @@ mod tests {
         );
 
         // `/new` clears the header together with the transcript.
-        app.clear_for_new_session("sess-2");
+        app.apply(RenderItem::SessionChanged {
+            id: "sess-2".into(),
+        });
+        app.apply(RenderItem::Notice("new session: sess-2".into()));
         let buffer = render_buffer(&mut app, 60, 12);
         assert!(!buffer_contains(&buffer, "slimcode"));
         assert!(buffer_contains(&buffer, "new session: sess-2"));
@@ -2820,8 +2755,7 @@ mod tests {
     #[test]
     fn thinking_renders_italic_gray() {
         let mut app = seeded_app();
-        app.render(&DisplayItem::Reasoning("let me think".to_string()))
-            .unwrap();
+        app.apply(RenderItem::Reasoning("let me think".to_string()));
         let buffer = render_buffer(&mut app, 60, 12);
         assert!(buffer_contains(&buffer, "let me think"));
         let y = row_containing(&buffer, "let me think").unwrap();
@@ -2834,12 +2768,11 @@ mod tests {
     #[test]
     fn tool_block_pending_then_success_backgrounds() {
         let mut app = seeded_app();
-        app.render(&DisplayItem::ToolStart {
+        app.apply(RenderItem::ToolStart {
             tool_call_id: "call_read".to_string(),
             name: "read".to_string(),
             arguments: r#"{"path": "a.txt"}"#.to_string(),
-        })
-        .unwrap();
+        });
         let buffer = render_buffer(&mut app, 60, 14);
         // Pending: the title row sits on `toolPendingBg`.
         let y = row_containing(&buffer, "read a.txt").unwrap();
@@ -2848,13 +2781,12 @@ mod tests {
             Some(BgToken::ToolPendingBg.color())
         );
 
-        app.render(&DisplayItem::ToolResult {
+        app.apply(RenderItem::ToolResult {
             tool_call_id: "call_read".to_string(),
             name: "read".to_string(),
             ok: true,
             result: "ok".to_string(),
-        })
-        .unwrap();
+        });
         let buffer = render_buffer(&mut app, 60, 14);
         let y = row_containing(&buffer, "read a.txt").unwrap();
         assert_eq!(
@@ -2867,20 +2799,18 @@ mod tests {
     /// exists) and return its frame buffer at 60x18.
     fn completed_tool_block_buffer(ok: bool) -> Buffer {
         let mut app = seeded_app();
-        app.render(&DisplayItem::ToolStart {
+        app.apply(RenderItem::ToolStart {
             tool_call_id: "call_read".to_string(),
             name: "read".to_string(),
             arguments: r#"{"path": "a.txt"}"#.to_string(),
-        })
-        .unwrap();
+        });
         let output: String = (0..15).map(|i| format!("out line {i}\n")).collect();
-        app.render(&DisplayItem::ToolResult {
+        app.apply(RenderItem::ToolResult {
             tool_call_id: "call_read".to_string(),
             name: "read".to_string(),
             ok,
             result: output,
-        })
-        .unwrap();
+        });
         render_buffer(&mut app, 60, 30)
     }
 
@@ -2895,12 +2825,11 @@ mod tests {
 
         // Pending: the block is open and only the title row exists yet.
         let mut app = seeded_app();
-        app.render(&DisplayItem::ToolStart {
+        app.apply(RenderItem::ToolStart {
             tool_call_id: "call_read".to_string(),
             name: "read".to_string(),
             arguments: r#"{"path": "a.txt"}"#.to_string(),
-        })
-        .unwrap();
+        });
         let buffer = render_buffer(&mut app, w, 18);
         let y = row_containing(&buffer, "read").unwrap();
         assert_eq!(
@@ -2967,23 +2896,21 @@ mod tests {
     #[test]
     fn tool_block_padding_is_display_width_exact_for_wide_chars() {
         let mut app = seeded_app();
-        app.render(&DisplayItem::ToolStart {
+        app.apply(RenderItem::ToolStart {
             tool_call_id: "call_read".to_string(),
             name: "read".to_string(),
             arguments: r#"{"path": "a.txt"}"#.to_string(),
-        })
-        .unwrap();
+        });
         // 30 CJK chars = 60 display columns — wider than the 58-col content
         // area, so wrapping plus width-exact padding must still end at column
         // 59 with the state background (nothing truncated, nothing short).
         let output: String = (0..12).map(|i| format!("\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}\u{597d}line {i}\n")).collect();
-        app.render(&DisplayItem::ToolResult {
+        app.apply(RenderItem::ToolResult {
             tool_call_id: "call_read".to_string(),
             name: "read".to_string(),
             ok: true,
             result: output,
-        })
-        .unwrap();
+        });
         let buffer = render_buffer(&mut app, 60, 18);
         let bg = BgToken::ToolSuccessBg.color();
         // Every row between the first output row and the bottom spacer must be
@@ -3002,19 +2929,17 @@ mod tests {
     #[test]
     fn tool_block_error_background_and_compact_title() {
         let mut app = seeded_app();
-        app.render(&DisplayItem::ToolStart {
+        app.apply(RenderItem::ToolStart {
             tool_call_id: "call_edit".to_string(),
             name: "edit".to_string(),
             arguments: r#"{"path":"a.txt","old":"x"}"#.to_string(),
-        })
-        .unwrap();
-        app.render(&DisplayItem::ToolResult {
+        });
+        app.apply(RenderItem::ToolResult {
             tool_call_id: "call_edit".to_string(),
             name: "edit".to_string(),
             ok: false,
             result: "no match".to_string(),
-        })
-        .unwrap();
+        });
         let buffer = render_buffer(&mut app, 60, 16);
         let y = row_containing(&buffer, "edit a.txt").unwrap();
         assert_eq!(
@@ -3032,19 +2957,17 @@ mod tests {
         // read with a 1-indexed offset/limit range: the compact title carries
         // the range; the raw JSON never appears.
         let mut app = seeded_app();
-        app.render(&DisplayItem::ToolStart {
+        app.apply(RenderItem::ToolStart {
             tool_call_id: "call_read".to_string(),
             name: "read".to_string(),
             arguments: r#"{"path":"a.txt","offset":2,"limit":3}"#.to_string(),
-        })
-        .unwrap();
-        app.render(&DisplayItem::ToolResult {
+        });
+        app.apply(RenderItem::ToolResult {
             tool_call_id: "call_read".to_string(),
             name: "read".to_string(),
             ok: true,
             result: "line2\nline3\nline4".to_string(),
-        })
-        .unwrap();
+        });
         let buffer = render_buffer(&mut app, 60, 16);
         assert!(buffer_contains(&buffer, "read a.txt:2-4"));
         assert!(!buffer_contains(&buffer, "\"path\":"));
@@ -3053,32 +2976,28 @@ mod tests {
         // bash renders the whole call line as `$ command` (bold), and grep
         // its `/pattern/ in <scope>` shape — again without a JSON dump.
         let mut app = seeded_app();
-        app.render(&DisplayItem::ToolStart {
+        app.apply(RenderItem::ToolStart {
             tool_call_id: "call_bash".to_string(),
             name: "bash".to_string(),
             arguments: r#"{"command":"ls -la"}"#.to_string(),
-        })
-        .unwrap();
-        app.render(&DisplayItem::ToolResult {
+        });
+        app.apply(RenderItem::ToolResult {
             tool_call_id: "call_bash".to_string(),
             name: "bash".to_string(),
             ok: true,
             result: "total 8".to_string(),
-        })
-        .unwrap();
-        app.render(&DisplayItem::ToolStart {
+        });
+        app.apply(RenderItem::ToolStart {
             tool_call_id: "call_grep".to_string(),
             name: "grep".to_string(),
             arguments: r#"{"pattern":"TODO","path":"src"}"#.to_string(),
-        })
-        .unwrap();
-        app.render(&DisplayItem::ToolResult {
+        });
+        app.apply(RenderItem::ToolResult {
             tool_call_id: "call_grep".to_string(),
             name: "grep".to_string(),
             ok: true,
             result: "src/main.rs:1: TODO".to_string(),
-        })
-        .unwrap();
+        });
         let buffer = render_buffer(&mut app, 60, 22);
         assert!(buffer_contains(&buffer, "$ ls -la"));
         assert!(buffer_contains(&buffer, "grep /TODO/ in src"));
@@ -3089,19 +3008,17 @@ mod tests {
     #[test]
     fn unknown_tool_block_keeps_pretty_json_args_fallback() {
         let mut app = seeded_app();
-        app.render(&DisplayItem::ToolStart {
+        app.apply(RenderItem::ToolStart {
             tool_call_id: "call_fetch_web".to_string(),
             name: "fetch_web".to_string(),
             arguments: r#"{"url":"https://x","depth":2}"#.to_string(),
-        })
-        .unwrap();
-        app.render(&DisplayItem::ToolResult {
+        });
+        app.apply(RenderItem::ToolResult {
             tool_call_id: "call_fetch_web".to_string(),
             name: "fetch_web".to_string(),
             ok: true,
             result: "<html>".to_string(),
-        })
-        .unwrap();
+        });
         let buffer = render_buffer(&mut app, 60, 16);
         // Unknown tools have no compact shape: pi's fallback (bold name + the
         // args as pretty JSON) is what the user sees.
@@ -3120,19 +3037,17 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
-        app.render(&DisplayItem::ToolStart {
+        app.apply(RenderItem::ToolStart {
             tool_call_id: "call_bash".to_string(),
             name: "bash".to_string(),
             arguments: serde_json::json!({"command": long_command}).to_string(),
-        })
-        .unwrap();
-        app.render(&DisplayItem::ToolResult {
+        });
+        app.apply(RenderItem::ToolResult {
             tool_call_id: "call_bash".to_string(),
             name: "bash".to_string(),
             ok: true,
             result: "done".to_string(),
-        })
-        .unwrap();
+        });
         let buffer = render_buffer(&mut app, 60, 16);
         // The wrapped title keeps every word (the last one only appears on a
         // wrapped row) and the block stays a padded full-width band.
@@ -3148,20 +3063,18 @@ mod tests {
     #[test]
     fn tool_output_collapses_to_ten_lines_and_ctrl_o_expands() {
         let mut app = seeded_app();
-        app.render(&DisplayItem::ToolStart {
+        app.apply(RenderItem::ToolStart {
             tool_call_id: "call_grep".to_string(),
             name: "grep".to_string(),
             arguments: "{\"pattern\":\"x\"}".to_string(),
-        })
-        .unwrap();
+        });
         let output: String = (0..15).map(|i| format!("line{i}\n")).collect();
-        app.render(&DisplayItem::ToolResult {
+        app.apply(RenderItem::ToolResult {
             tool_call_id: "call_grep".to_string(),
             name: "grep".to_string(),
             ok: true,
             result: output.clone(),
-        })
-        .unwrap();
+        });
 
         let buffer = render_buffer(&mut app, 60, 30);
         let collapsed = line_at(&buffer, row_containing(&buffer, "line0").unwrap());
@@ -3191,19 +3104,17 @@ mod tests {
     #[test]
     fn tool_output_under_ten_lines_has_no_hint() {
         let mut app = seeded_app();
-        app.render(&DisplayItem::ToolStart {
+        app.apply(RenderItem::ToolStart {
             tool_call_id: "call_ls".to_string(),
             name: "ls".to_string(),
             arguments: "{\"path\":\".\"}".to_string(),
-        })
-        .unwrap();
-        app.render(&DisplayItem::ToolResult {
+        });
+        app.apply(RenderItem::ToolResult {
             tool_call_id: "call_ls".to_string(),
             name: "ls".to_string(),
             ok: true,
             result: "a\nb".to_string(),
-        })
-        .unwrap();
+        });
         let buffer = render_buffer(&mut app, 60, 14);
         assert!(buffer_contains(&buffer, "ls ."));
         assert!(buffer_contains(&buffer, "a"));
@@ -3215,8 +3126,7 @@ mod tests {
     fn scrollbar_appears_on_scroll_and_fades_on_ticks() {
         let mut app = seeded_app();
         for i in 0..12 {
-            app.render(&DisplayItem::Text(format!("line {i}\n")))
-                .unwrap();
+            app.apply(RenderItem::Text(format!("line {i}\n")));
         }
         // At the bottom (follow), no thumb.
         let buffer = render_buffer(&mut app, 60, 8);
@@ -3293,7 +3203,7 @@ mod tests {
     #[test]
     fn notice_renders_dim() {
         let mut app = seeded_app();
-        app.push_notice("hello notice");
+        app.apply(RenderItem::Notice("hello notice".into()));
         let buffer = render_buffer(&mut app, 60, 12);
         let y = row_containing(&buffer, "hello notice").unwrap();
         assert_eq!(cell_style(&buffer, 0, y).fg, Some(Token::Dim.color()));
@@ -3302,7 +3212,7 @@ mod tests {
     #[test]
     fn error_renders_red() {
         let mut app = seeded_app();
-        app.push_error("boom");
+        app.apply(RenderItem::Error("boom".into()));
         let buffer = render_buffer(&mut app, 60, 12);
         let y = row_containing(&buffer, "boom").unwrap();
         assert_eq!(cell_style(&buffer, 0, y).fg, Some(Token::Error.color()));
@@ -3313,13 +3223,8 @@ mod tests {
     #[test]
     fn footer_renders_two_dim_lines() {
         let mut app = seeded_app();
-        app.set_branch(Some("main".to_string()));
-        app.set_usage(crate::footer::FooterUsage {
-            input: 1500,
-            output: 500,
-            cache_read: 0,
-            cache_write: 0,
-        });
+        app.apply(RenderItem::Branch(Some("main".to_string())));
+        app.apply(RenderItem::Usage(FooterUsage::new(1500, 500, 0, 0)));
         let h: u16 = 12;
         let buffer = render_buffer(&mut app, 60, h);
         // Footer occupies the bottom two rows.

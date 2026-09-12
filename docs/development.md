@@ -288,8 +288,22 @@ tool_call_id，已不含日志专用字段），`core` 拥有会话单元 `Agent
 span，代码围栏行映射等）、`toolcall`（内置工具紧凑调用标题 composer，pi `format*Call`
 移植：`CallPart` 纯函数 + 逐工具单测）、`footer`（pi `footer.ts` 的 `formatTokens` /
 `formatCwdForFooter` /
-stats 纯函数移植）、`git`（`terminal_title` / `current_branch` 纯包装）、`app`（纯
+stats 纯函数移植）、`git`（`terminal_title` / `current_branch` 纯包装）、`render`
+（TUI 自己的显示词汇 `RenderItem` / `SkillInfo`，ADR-0014 D1）、`app`（纯
 reducer + draw）、`terminal`（薄壳 + worker-thread runner）。分层：
+
+- **自有显示词汇（ADR-0014 D1/D2）**：TUI 不再消费 `app` 的 `DisplayItem`。
+  `RenderItem` 载 agent 流输出（`Text` / `Reasoning` / `ToolStart` / `ToolResult`）
+  与 CLI 自有的状态（`Notice` / `Error` / `UserPrompt` / `Usage(FooterUsage)` /
+  `Skills(Vec<SkillInfo>)` / `Branch` / `SessionChanged`），不含任何 `ai`/`core`/`app`
+  类型；`App::apply(RenderItem)` 是唯一入口，transcript 合并与工具配对规则仍是私有实现。
+  三套词汇两层转换：`AgentEvent`（core）→ `DisplayItem`（app，共享 `map_event`）→
+  `RenderItem`（tui）；中间的适配器属于 **cli**（`cli/src/render.rs::TuiAdapter`，
+  `Renderer` 实现），在 turn 的 worker 线程上把每条 `DisplayItem` 转换为 `RenderItem`
+  并发进 TUI 通道；`Turn` 与 `Stop` 被丢弃（transcript 无 turn 标记、stop 不渲染）。
+  `FooterUsage` 只保留平凡构造函数，token 用量换算在 CLI 侧完成，故 TUI 源码不出现
+  provider 的用量类型。`app` 的显示契约（`DisplayItem` / `map_event` / `Renderer` /
+  `usage_summary` / 共享 runner）保持原样。
 
 - **主题（ADR-0006 D1）**：唯一风格来源是 pi `dark.json` 的逐字十六进制；TUI 渲染只
   引用 token（`Token` 前景 / `BgToken` 背景），不出现裸颜色。现有测试把每个 token
@@ -337,8 +351,9 @@ reducer + draw）、`terminal`（薄壳 + worker-thread runner）。分层：
   `slimcode - <session> - <cwd 目录名>`，`/new` `/load` 时更新），并尽力
   `git branch --show-current` 喂 footer。提交后把 `BailianProvider`（`Option`
   take/restore）+ `Vec<Tool>`（`mem::take`，`Tool::run` 已加宽为 `Box<dyn Fn(...) +
-  Send + Sync>`）移入 worker `thread::spawn` 跑共享 `run_turn`，经 mpsc `ChannelRenderer`
-  把 `DisplayItem` 流回 UI；UI 循环 `event::poll(80ms)` 同时当帧定时器，poll 事件 + 排空
+  Send + Sync>`）移入 worker `thread::spawn` 跑共享 `run_turn`，经 CLI 提供的
+  `TuiAdapter` 把 `RenderItem` 流回 UI（TUI 建通道、把 sender 交给 `AdapterFactory`）；
+  UI 循环 `event::poll(80ms)` 同时当帧定时器，poll 事件 + 排空
   通道 + `draw` + `app.tick()`，spinner 因此边 HTTP 等待边动画。运行中：裸 `Esc` →
   `Effect::CancelRunning`（`Tui` 持有每轮 `CancelToken`，`drive_turn` 开头 `reset()`，
   Esc 时 `cancel()`；worker 在下一 runner 边界 / 下个 socket chunk 中止在途请求，并杀掉
@@ -359,7 +374,8 @@ reducer + draw）、`terminal`（薄壳 + worker-thread runner）。分层：
   从不置位的 token。
 - **测试 seam**：决定逻辑都在 `app` 纯 core 与 `footer`/`git` 纯函数里（帧缓冲测试、
   纯单测）；`terminal` 只有原始 I/O + 通道搬移。worker 通道有端到端测试（脚本化
-  provider + 通道录制渲染器断言有序 `DisplayItem` 流与最终结果）；tmux 冒烟在
+  provider + 通道录制渲染器断言有序 `RenderItem` 流与最终结果）；cli 侧有表驱动的适配器
+  测试覆盖每个 `DisplayItem` 变体（含被丢弃的 `Turn`/`Stop`）；tmux 冒烟在
   `crates/cli/tests/tui_smoke.rs`（无 tmux 自动跳过）：对本地 mock SSE 服务器起真终端，
   capture-pane 断言头部/色块 prompt/markdown 思考/工具块/spinner 动画（已嵌入上边框）/footer 两行/补全
   弹框/滚动/改尺寸 dock 固定/OSC 0 标题/Ctrl+C 退出/Esc 中途取消（spinner 消失、已流式
@@ -393,9 +409,12 @@ reducer + draw）、`terminal`（薄壳 + worker-thread runner）。分层：
 
 模块：
 
-- `render`：`TextRenderer`（`Renderer` trait 的文本实现）——把共享 `DisplayItem` 流（流式文本 / 流式思考 / 结构行 / 用量汇总）渲染为终端输出，原始 tool_call delta 与
-  `Done` 事件被抑制；流式文本与思考（带 `> ` 前缀）按 delta 拼接、不逐 delta 换行，换行只来自内容本身的 `\n`，结构行（工具开始/结果、停止标记、turn 标记）总是另起一行；事件→DisplayItem 的映射是共享的 `app::render::map_event`，
-  cli 不再各自实现（见 ADR-0004）；
+- `render`：两个 `Renderer` 实现。`TextRenderer` 把共享 `DisplayItem` 流（流式文本 / 流式思考 / 结构行 / 用量汇总）渲染为终端输出，原始 tool_call delta 与
+  `Done` 事件被抑制；流式文本与思考（带 `> ` 前缀）按 delta 拼接、不逐 delta 换行，换行只来自内容本身的 `\n`，结构行（工具开始/结果、停止标记、turn 标记）总是另起一行；事件→DisplayItem 的映射是共享的 `app::render::map_event`。
+  `TuiAdapter`（ADR-0014 D2）在 turn 的 worker 线程上把每条 `DisplayItem` 转为
+  `slimcode_tui::render::RenderItem` 并发进 TUI 通道：`Turn`/`Stop` 丢弃，`Usage` 在此
+  完成 `TokenUsage → FooterUsage` 换算；TUI 因此不依赖 `app`、`ai`、`core`。表驱动单测
+  覆盖每个 `DisplayItem` 变体（含被丢弃的两个）。
 - provider + 工具构造经 `app::setup::setup` 与 TUI 共享，两端不会漂移。
 
 交互能力（历史 recall、`/` 命令、skills、`/new`、`/load`、`/exit`）已整体移入

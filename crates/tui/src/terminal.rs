@@ -7,11 +7,13 @@
 //! Setup (provider + tools) happens **before** the alternate screen opens, so
 //! config or API-key errors surface on the normal terminal (spec user story
 //! 28). One turn's `run_turn` runs on a worker thread (ADR-0006 D6) streaming
-//! `DisplayItem`s over an mpsc channel; the UI loop polls crossterm events and
-//! the channel with an 80ms timeout, so the status spinner animates and
-//! Ctrl+C/Ctrl+D work while a turn runs (they arm quit-after-turn; other keys
-//! are ignored). The `App` reducer and all rendering decisions stay pure and
-//! tested; this file keeps only the raw terminal I/O.
+//! `DisplayItem`s through the CLI's adapter into the TUI's own
+//! [`RenderItem`](crate::render::RenderItem) channel (ADR-0014 D2); the UI loop
+//! polls crossterm events and the channel with an 80ms timeout, so the status
+//! spinner animates and Ctrl+C/Ctrl+D work while a turn runs (they arm
+//! quit-after-turn; other keys are ignored). The `App` reducer and all
+//! rendering decisions stay pure and tested; this file keeps only the raw
+//! terminal I/O.
 
 use std::io::stdout;
 use std::path::{Path, PathBuf};
@@ -31,7 +33,7 @@ use slimcode_ai::{BailianConfig, BailianProvider};
 use slimcode_app::context::{Context, ContextBuilder, Environment};
 use slimcode_app::context_files::ContextFile;
 use slimcode_app::history::{HISTORY_DISPLAY, HistoryStore, render_history, resolve_replay_index};
-use slimcode_app::render::{DisplayItem, Renderer};
+use slimcode_app::render::{DisplayItem, Renderer, usage_summary};
 use slimcode_app::session::{SessionStore, infer_title};
 use slimcode_app::skills::{
     SkillScope, SkillStore, find_skill, is_builtin_command, parse_install_args,
@@ -40,18 +42,45 @@ use slimcode_core::agent::{CancelToken, RunConfig, StopReason, Tool};
 use slimcode_core::session::{AgentMessage, MessageStopReason, Role, Session};
 
 use crate::app::{App, Effect};
-use crate::footer::FooterUsage;
 use crate::git::{current_branch, terminal_title};
+use crate::render::{RenderItem, SkillInfo};
 
 /// One UI-loop frame: ~80ms, matching pi's loader interval so the status
 /// spinner animates at the same rate and the input stays responsive.
 const FRAME_MS: u64 = 80;
+
+/// Builds the CLI's `DisplayItem → RenderItem` [`Renderer`] for one turn
+/// (ADR-0014 D2). The TUI creates the turn's channel and hands the sender to
+/// the factory; the adapter the CLI returns runs on the turn's worker thread
+/// and owns that sender. Kept as a seam here because the display conversion
+/// belongs to the CLI — ticket 05 replaces it with the `UiHandler`.
+pub type AdapterFactory =
+    Box<dyn Fn(mpsc::Sender<RenderItem>) -> Box<dyn Renderer + Send> + Send + Sync>;
+
+/// Translate the store's skills into the TUI's own snapshot
+/// ([`SkillInfo`]), which is all the transcript, `/skills` list and `/`
+/// prediction need.
+fn skill_infos(skills: &[slimcode_app::skills::Skill]) -> Vec<SkillInfo> {
+    skills
+        .iter()
+        .map(|s| SkillInfo {
+            name: s.name.clone(),
+            description: s.description.clone(),
+            disable_model_invocation: s.disable_model_invocation,
+            scope: match s.scope {
+                slimcode_app::skills::SkillScope::User => crate::render::SkillScope::User,
+                slimcode_app::skills::SkillScope::Project => crate::render::SkillScope::Project,
+            },
+        })
+        .collect()
+}
 
 /// Run the TUI to completion: build the runtime, open the alternate screen,
 /// pump events, and restore the terminal on every exit path.
 ///
 /// `config` is already fully resolved (four-layer precedence); construction of
 /// the provider + tools happens here, before the screen opens.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     cwd: &Path,
     config: BailianConfig,
@@ -60,6 +89,7 @@ pub fn run(
     skills: &SkillStore,
     context_files: &[ContextFile],
     environment: Environment,
+    adapter_factory: AdapterFactory,
 ) -> Result<i32, String> {
     let model = config.model.clone();
     // One token shared by the cancellable tool set and every turn's worker:
@@ -79,6 +109,7 @@ pub fn run(
         cancel,
         context_files,
         environment,
+        adapter_factory,
     ) {
         Ok(ui) => ui,
         Err(e) => {
@@ -87,7 +118,7 @@ pub fn run(
         }
     };
     set_title(&ui.session.id, &ui.cwd);
-    ui.app.set_branch(current_branch(&ui.cwd));
+    ui.app.apply(RenderItem::Branch(current_branch(&ui.cwd)));
     let result = ui.run_loop();
     restore_terminal();
     result
@@ -140,6 +171,8 @@ struct Tui<'a> {
     /// observes it at every runner boundary and inside the provider's body
     /// read, so an in-flight request / tool aborts promptly.
     cancel: CancelToken,
+    /// The CLI's display adapter for each turn (ADR-0014 D2).
+    adapter_factory: AdapterFactory,
 }
 
 impl<'a> Tui<'a> {
@@ -159,6 +192,7 @@ impl<'a> Tui<'a> {
         cancel: CancelToken,
         context_files: &[ContextFile],
         environment: Environment,
+        adapter_factory: AdapterFactory,
     ) -> Result<Self, String> {
         enable_raw_mode().map_err(|e| format!("raw mode: {e}"))?;
         execute!(stdout(), EnterAlternateScreen).map_err(|e| format!("alternate screen: {e}"))?;
@@ -171,7 +205,7 @@ impl<'a> Tui<'a> {
             session.id.clone(),
             model,
             crate::VERSION,
-            skills.list().unwrap_or_default(),
+            skill_infos(&skills.list().unwrap_or_default()),
         );
         // Seed the ↑/↓ recall snapshot from the shared HistoryStore.
         app.set_history(history.load().unwrap_or_default());
@@ -190,6 +224,7 @@ impl<'a> Tui<'a> {
             cwd: cwd.to_path_buf(),
             quit_after_turn: false,
             cancel,
+            adapter_factory,
         };
         ui.draw()?;
         Ok(ui)
@@ -229,7 +264,7 @@ impl<'a> Tui<'a> {
     fn handle_effect(&mut self, effect: Effect) -> Result<bool, String> {
         let mut quit = false;
         if let Err(e) = self.apply_effect(effect, &mut quit) {
-            self.app.push_error(e);
+            self.app.apply(RenderItem::Error(e));
             self.draw()?;
         }
         Ok(quit)
@@ -257,50 +292,71 @@ impl<'a> Tui<'a> {
             Effect::TriggerSkill { name, arg } => self.trigger_skill(&name, arg.as_deref()),
             Effect::NewSession => {
                 self.session = self.store.new_session();
-                self.app.clear_for_new_session(&self.session.id);
-                self.app.set_branch(current_branch(&self.cwd));
+                self.app.apply(RenderItem::SessionChanged {
+                    id: self.session.id.clone(),
+                });
+                self.app.apply(RenderItem::Notice(format!(
+                    "new session: {}",
+                    self.session.id
+                )));
+                self.app
+                    .apply(RenderItem::Branch(current_branch(&self.cwd)));
                 set_title(&self.session.id, &self.cwd);
                 Ok(())
             }
             Effect::LoadSession(id) => {
                 let outcome = self.store.load(&id)?;
                 if let Some(title) = &outcome.session.title {
-                    self.app.push_notice(format!("  title: {title}"));
+                    self.app
+                        .apply(RenderItem::Notice(format!("  title: {title}")));
                 }
                 // Lenient replay surfaced something (ADR-0009 D3): say so.
                 if outcome.skipped_records > 0 {
-                    self.app.push_notice(format!(
+                    self.app.apply(RenderItem::Notice(format!(
                         "  skipped {} unreadable record(s)",
                         outcome.skipped_records
-                    ));
+                    )));
                 }
                 if outcome.repaired_tool_calls > 0 {
-                    self.app.push_notice(format!(
+                    self.app.apply(RenderItem::Notice(format!(
                         "  repaired {} interrupted tool call(s)",
                         outcome.repaired_tool_calls
-                    ));
+                    )));
                 }
                 self.session = outcome.session;
-                self.app.apply_loaded_session(&self.session.id);
-                self.app.set_branch(current_branch(&self.cwd));
+                self.app.apply(RenderItem::SessionChanged {
+                    id: self.session.id.clone(),
+                });
+                self.app.apply(RenderItem::Notice(format!(
+                    "loaded session: {}",
+                    self.session.id
+                )));
+                self.app
+                    .apply(RenderItem::Branch(current_branch(&self.cwd)));
                 set_title(&self.session.id, &self.cwd);
                 Ok(())
             }
             Effect::ListSessions => {
                 for id in self.store.list()? {
-                    self.app.push_notice(format!("  {id}"));
+                    self.app.apply(RenderItem::Notice(format!("  {id}")));
                 }
                 Ok(())
             }
             Effect::ShowUsage => {
-                let usage = self.total_usage();
-                self.app.render(&DisplayItem::Usage(usage))?;
+                // Wording stays the app layer's (`usage_summary`); the CLI
+                // renders it as a notice, exactly as before (ADR-0014 D1).
+                let usage = self
+                    .provider
+                    .as_ref()
+                    .map(|p| p.total_usage)
+                    .unwrap_or_default();
+                self.app.apply(RenderItem::Notice(usage_summary(&usage)));
                 Ok(())
             }
             Effect::ListHistory => {
                 let entries = self.history.load()?;
                 for line in render_history(&entries, HISTORY_DISPLAY) {
-                    self.app.push_notice(line);
+                    self.app.apply(RenderItem::Notice(line));
                 }
                 Ok(())
             }
@@ -309,25 +365,17 @@ impl<'a> Tui<'a> {
                     .and_then(|(path, scope)| install_skill(self.skills, &path, scope));
                 match result {
                     Ok(msg) => {
-                        self.app.push_notice(msg);
+                        self.app.apply(RenderItem::Notice(msg));
                         // Re-read the store so `/` completion, `did you mean`,
                         // and skill dispatch see the new skill without a restart.
                         let fresh = self.skills.list().unwrap_or_default();
-                        self.app.set_skills(fresh);
+                        self.app.apply(RenderItem::Skills(skill_infos(&fresh)));
                     }
-                    Err(e) => self.app.push_error(e),
+                    Err(e) => self.app.apply(RenderItem::Error(e)),
                 }
                 Ok(())
             }
         }
-    }
-
-    /// The provider's cumulative usage (session totals for the footer).
-    fn total_usage(&self) -> slimcode_ai::TokenUsage {
-        self.provider
-            .as_ref()
-            .map(|p| p.total_usage)
-            .unwrap_or_default()
     }
 
     /// Run a prompt as a fresh turn. `record` controls whether the raw prompt
@@ -357,7 +405,8 @@ impl<'a> Tui<'a> {
             .clone();
         self.session.messages.push(prompt_msg.clone());
         if let Err(e) = self.store.append(&self.session, &prompt_msg) {
-            self.app.push_notice(format!("session log: {e}"));
+            self.app
+                .apply(RenderItem::Notice(format!("session log: {e}")));
         }
         let record = if record { Some(prompt.as_str()) } else { None };
         self.finish_turn(context, record)
@@ -372,7 +421,7 @@ impl<'a> Tui<'a> {
         // Replay confirmation: spec requires replay confirmations to render as
         // frontend-owned display entries appended to the transcript (the same
         // boxed user-prompt block the typed path uses).
-        self.app.push_user_prompt(prompt);
+        self.app.apply(RenderItem::UserPrompt(prompt.to_string()));
         self.submit_prompt(prompt.to_string(), false)
     }
 
@@ -382,7 +431,8 @@ impl<'a> Tui<'a> {
     fn trigger_skill(&mut self, name: &str, arg: Option<&str>) -> Result<(), String> {
         let skills = self.skills.list().unwrap_or_default();
         let Some(skill) = find_skill(&skills, name) else {
-            self.app.push_error(format!("no such skill: /{name}"));
+            self.app
+                .apply(RenderItem::Error(format!("no such skill: /{name}")));
             return Ok(());
         };
         let context = ContextBuilder::new()
@@ -399,7 +449,8 @@ impl<'a> Tui<'a> {
             .clone();
         self.session.messages.push(prompt_msg.clone());
         if let Err(e) = self.store.append(&self.session, &prompt_msg) {
-            self.app.push_notice(format!("session log: {e}"));
+            self.app
+                .apply(RenderItem::Notice(format!("session log: {e}")));
         }
         self.finish_turn(context, None)
     }
@@ -429,18 +480,20 @@ impl<'a> Tui<'a> {
             && path.exists()
             && let Err(e) = self.store.append_title(&self.session, title)
         {
-            self.app.push_notice(format!("session log: {e}"));
+            self.app
+                .apply(RenderItem::Notice(format!("session log: {e}")));
         }
         if let Some(prompt) = record
             && let Err(e) = self.history.append(prompt)
         {
-            self.app.push_notice(format!("history: {e}"));
+            self.app.apply(RenderItem::Notice(format!("history: {e}")));
         }
         let outcome = self.drive_turn(context)?;
         // Adopt the worker's session: memory and the log now agree.
         self.session = outcome.session;
         for e in &outcome.append_errors {
-            self.app.push_notice(format!("session log: {e}"));
+            self.app
+                .apply(RenderItem::Notice(format!("session log: {e}")));
         }
         match outcome.result {
             Ok((_, StopReason::Completed)) => {}
@@ -460,10 +513,9 @@ impl<'a> Tui<'a> {
                 if outcome.appended > 0 {
                     self.close_turn(MessageStopReason::Error, Some(e.clone()));
                 }
-                self.app.push_error(e);
+                self.app.apply(RenderItem::Error(e));
             }
         }
-        self.app.set_usage(FooterUsage::from(&self.total_usage()));
         Ok(())
     }
 
@@ -483,28 +535,31 @@ impl<'a> Tui<'a> {
             self.store
                 .append_closing(&self.session, &message, &reason, error.as_deref())
         {
-            self.app.push_notice(format!("session log: {e}"));
+            self.app
+                .apply(RenderItem::Notice(format!("session log: {e}")));
         }
     }
 
     /// Drive one turn on a worker thread (ADR-0006 D6). The worker runs the
     /// shared runner against the moved provider + tools, streaming every
-    /// `DisplayItem` over an mpsc channel; every message that enters history
-    /// is forwarded to a sink that appends it to the session log and to a
-    /// session clone, so the log grows per message as the turn runs and the
-    /// clone mirrors memory (ADR-0009 D2/D5). `thread::scope` lets the worker
-    /// borrow the store; the UI loop polls terminal events and the channel at
-    /// [`FRAME_MS`], draining items into the app and redrawing so the spinner
-    /// animates. Ctrl+C/Ctrl+D record quit-after-turn (the turn keeps
-    /// streaming); bare Esc cancels the running turn (ticket 07 — the token is
-    /// reset here so every turn starts uncancelled); all other keys are
-    /// ignored while running. The provider and tools are always restored
+    /// `DisplayItem` through the CLI's adapter, which converts it into a
+    /// [`RenderItem`] on the TUI's channel (ADR-0014 D2); every message that
+    /// enters history is forwarded to a sink that appends it to the session
+    /// log and to a session clone, so the log grows per message as the turn
+    /// runs and the clone mirrors memory (ADR-0009 D2/D5). `thread::scope` lets
+    /// the worker borrow the store; the UI loop polls terminal events and the
+    /// channel at [`FRAME_MS`], draining items into the app and redrawing so
+    /// the spinner animates. Ctrl+C/Ctrl+D record quit-after-turn (the turn
+    /// keeps streaming); bare Esc cancels the running turn (ticket 07 — the
+    /// token is reset here so every turn starts uncancelled); all other keys
+    /// are ignored while running. The provider and tools are always restored
     /// before returning.
     fn drive_turn(&mut self, context: Context) -> Result<TurnOutcome, String> {
         self.cancel.reset();
         self.app.set_running(true);
         let cfg = RunConfig::default();
-        let (tx, rx) = mpsc::channel::<DisplayItem>();
+        let (tx, rx) = mpsc::channel::<RenderItem>();
+        let mut adapter = (self.adapter_factory)(tx);
         let mut provider = self.provider.take().expect("provider present while idle");
         let tools = std::mem::take(&mut self.tools);
         let cancel = self.cancel.clone();
@@ -521,7 +576,7 @@ impl<'a> Tui<'a> {
                     context,
                     &cfg,
                     &cancel,
-                    &mut ChannelRenderer { tx },
+                    &mut *adapter,
                     &mut |msg: &AgentMessage| -> Result<(), String> {
                         // The message entered history: mirror it into the
                         // session clone and append it to the log. Persistence
@@ -536,6 +591,11 @@ impl<'a> Tui<'a> {
                         Ok(())
                     },
                 );
+                // Feed the footer totals through the same adapter, so the
+                // `TokenUsage → FooterUsage` conversion stays the CLI's
+                // (ADR-0014 D1). The session totals are what the turn just
+                // produced plus everything before it.
+                let _ = adapter.render(&DisplayItem::Usage(provider.total_usage));
                 (
                     result,
                     provider,
@@ -579,11 +639,9 @@ impl<'a> Tui<'a> {
                     Err(e) if ui_error.is_none() => ui_error = Some(format!("event poll: {e}")),
                     Err(_) => {}
                 }
-                // Drain failures are recorded into `ui_error` by the drainer
-                // itself; nothing further to propagate here.
-                let _ = drain_channel(&rx, &mut self.app, &mut ui_error);
+                drain_channel(&rx, &mut self.app);
                 if handle.is_finished() {
-                    let _ = drain_channel(&rx, &mut self.app, &mut ui_error);
+                    drain_channel(&rx, &mut self.app);
                     break handle
                         .join()
                         .map_err(|_| "turn worker panicked".to_string())?;
@@ -624,36 +682,12 @@ impl<'a> Tui<'a> {
     }
 }
 
-/// Drain every item the worker has queued into the app's transcript,
-/// recording a render failure into `ui_error` (the drive loop reports it
-/// after the worker joins). Always drains what it can first.
-fn drain_channel(
-    rx: &mpsc::Receiver<DisplayItem>,
-    app: &mut App,
-    ui_error: &mut Option<String>,
-) -> Result<(), String> {
+/// Drain every item the worker has queued into the app, in order. Applying an
+/// item cannot fail, so the drive loop only has to report its own terminal
+/// errors.
+fn drain_channel(rx: &mpsc::Receiver<RenderItem>, app: &mut App) {
     while let Ok(item) = rx.try_recv() {
-        if let Err(e) = app.render(&item) {
-            if ui_error.is_none() {
-                *ui_error = Some(e);
-            }
-            // Re-rendering after a failure is unlikely to succeed; stop.
-            break;
-        }
-    }
-    Ok(())
-}
-
-/// A [`Renderer`] that forwards display items across the thread boundary to
-/// the UI loop's channel (ADR-0006 D6). The worker thread never touches the
-/// [`App`]; the UI loop applies items on the main thread.
-struct ChannelRenderer {
-    tx: mpsc::Sender<DisplayItem>,
-}
-
-impl Renderer for ChannelRenderer {
-    fn render(&mut self, item: &DisplayItem) -> Result<(), String> {
-        self.tx.send(item.clone()).map_err(|e| e.to_string())
+        app.apply(item);
     }
 }
 
@@ -688,9 +722,7 @@ mod tests {
     use super::*;
     use slimcode_app::render::DisplayItem;
     use slimcode_app::runner::run_turn;
-    use slimcode_core::agent::{
-        Delta, FinishReason, Provider, RunConfig, StopReason, Tool, ToolSpec,
-    };
+    use slimcode_core::agent::{Delta, FinishReason, Provider, RunConfig, Tool, ToolSpec};
     use slimcode_core::session::{Message, Role};
 
     // A scripted provider, mirroring the agent crate's FakeProvider: each
@@ -734,10 +766,53 @@ mod tests {
         )
     }
 
-    /// The channel worker, end to end: a scripted provider + ChannelRenderer
-    /// on a worker thread stream an ordered DisplayItem stream over the
-    /// channel, and `run_turn`'s result is the final message list (ticket 03
-    /// acceptance; ADR-0006 D6).
+    /// The test's stand-in for the CLI's adapter (ADR-0014 D1): it maps the
+    /// streamed agent output onto the TUI's vocabulary and drops the two items
+    /// the TUI never renders. The real mapping — and the token-usage
+    /// conversion — is the CLI's `TuiAdapter`, covered by its own tests.
+    struct TestAdapter {
+        tx: mpsc::Sender<RenderItem>,
+    }
+
+    impl Renderer for TestAdapter {
+        fn render(&mut self, item: &DisplayItem) -> Result<(), String> {
+            let mapped = match item {
+                DisplayItem::Text(t) => RenderItem::Text(t.clone()),
+                DisplayItem::Reasoning(t) => RenderItem::Reasoning(t.clone()),
+                DisplayItem::ToolStart {
+                    tool_call_id,
+                    name,
+                    arguments,
+                } => RenderItem::ToolStart {
+                    tool_call_id: tool_call_id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                },
+                DisplayItem::ToolResult {
+                    tool_call_id,
+                    name,
+                    ok,
+                    result,
+                } => RenderItem::ToolResult {
+                    tool_call_id: tool_call_id.clone(),
+                    name: name.clone(),
+                    ok: *ok,
+                    result: result.clone(),
+                },
+                // Dropped: the transcript has no turn markers and renders
+                // nothing for a stop; `Usage` never comes from the runner.
+                DisplayItem::Turn { .. } | DisplayItem::Stop(_) | DisplayItem::Usage(_) => {
+                    return Ok(());
+                }
+            };
+            self.tx.send(mapped).map_err(|e| e.to_string())
+        }
+    }
+
+    /// The channel worker, end to end: a scripted provider + the display
+    /// adapter on a worker thread stream an ordered `RenderItem` stream over
+    /// the channel, and `run_turn`'s result is the final message list
+    /// (ADR-0014 D2, ADR-0006 D6).
     #[test]
     fn channel_worker_streams_ordered_items_and_returns_messages() {
         let provider = FakeProvider::new(vec![
@@ -767,7 +842,7 @@ mod tests {
         let messages = vec![AgentMessage::text(Role::User, "hi")];
         let context = slimcode_app::context::Context { system, messages };
         let cfg = RunConfig::default();
-        let (tx, rx) = mpsc::channel::<DisplayItem>();
+        let (tx, rx) = mpsc::channel::<RenderItem>();
 
         let handle = thread::spawn(move || {
             let mut provider = provider;
@@ -779,64 +854,51 @@ mod tests {
                 context,
                 &cfg,
                 &cancel,
-                &mut ChannelRenderer { tx },
+                &mut TestAdapter { tx },
                 &mut |_| Ok(()),
             );
             (result, provider.calls)
         });
 
-        let mut items: Vec<DisplayItem> = Vec::new();
+        let mut items: Vec<RenderItem> = Vec::new();
         while let Ok(item) = rx.recv() {
             items.push(item);
         }
         let (result, calls) = handle.join().unwrap();
         let (updated, _) = result.expect("turn succeeds");
 
-        // The ordered stream the UI loop would apply: two turn markers, the
-        // streamed text fragments (each delta its own item), the tool
-        // start/result pair, and the completed stop. No Usage item: token
-        // usage is frontend-owned (the shell feeds the footer separately).
+        // The ordered stream the UI loop applies: the streamed text fragments
+        // (each delta its own item) and the tool start/result pair. The turn
+        // markers and the stop line were dropped by the adapter.
         let kinds: Vec<&str> = items
             .iter()
             .map(|i| match i {
-                DisplayItem::Turn { .. } => "turn",
-                DisplayItem::Reasoning(_) => "reasoning",
-                DisplayItem::Text(_) => "text",
-                DisplayItem::ToolStart { .. } => "tool-start",
-                DisplayItem::ToolResult { .. } => "tool-result",
-                DisplayItem::Stop(_) => "stop",
-                DisplayItem::Usage(_) => "usage",
+                RenderItem::Reasoning(_) => "reasoning",
+                RenderItem::Text(_) => "text",
+                RenderItem::ToolStart { .. } => "tool-start",
+                RenderItem::ToolResult { .. } => "tool-result",
+                other => panic!("unexpected item from the runner: {other:?}"),
             })
             .collect();
         assert_eq!(
             kinds,
-            vec![
-                "turn",
-                "text",
-                "text",
-                "tool-start",
-                "tool-result",
-                "turn",
-                "text",
-                "stop"
-            ]
+            vec!["text", "text", "tool-start", "tool-result", "text"]
         );
         // The individual items match the scripted stream.
-        assert!(items.contains(&DisplayItem::Text("hello ".to_string())));
-        assert!(items.contains(&DisplayItem::Text("world".to_string())));
-        assert!(items.contains(&DisplayItem::ToolStart {
+        assert!(items.contains(&RenderItem::Text("hello ".to_string())));
+        assert!(items.contains(&RenderItem::Text("world".to_string())));
+        assert!(items.contains(&RenderItem::ToolStart {
             tool_call_id: "tc-1".to_string(),
             name: "get_weather".to_string(),
             arguments: r#"{"city": "Tokyo"}"#.to_string(),
         }));
-        assert!(items.contains(&DisplayItem::ToolResult {
+        assert!(items.contains(&RenderItem::ToolResult {
             tool_call_id: "tc-1".to_string(),
             name: "get_weather".to_string(),
             ok: true,
             result: r#"{"city": "Tokyo", "temp": "25C"}"#.to_string(),
         }));
-        assert!(items.contains(&DisplayItem::Text("it is 25C".to_string())));
-        assert!(items.contains(&DisplayItem::Stop(StopReason::Completed)));
+        assert!(items.contains(&RenderItem::Text("it is 25C".to_string())));
         // Two provider calls: the streaming+tool batch, then the answer batch.
         assert_eq!(calls, 2);
         // The final messages include the assistant turn + tool result.

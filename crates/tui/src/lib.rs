@@ -5,13 +5,15 @@
 //! machine with a draw-to-frame function and an on-key reducer — and a thin
 //! crossterm/ratatui terminal loop that wraps it ([`terminal`]). The pure core
 //! renders through ratatui's `TestBackend` in tests, with no real terminal
-//! required, and depends on the shared renderer/runner seam in
-//! `slimcode-app`.
+//! required. Its display vocabulary is its own ([`render::RenderItem`]): the
+//! CLI converts the application layer's `DisplayItem`s into `RenderItem`s
+//! (ADR-0014).
 
 pub mod app;
 pub mod footer;
 pub mod git;
 pub mod markdown;
+pub mod render;
 pub mod terminal;
 pub mod text;
 pub mod theme;

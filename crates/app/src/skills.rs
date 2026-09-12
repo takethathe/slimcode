@@ -150,13 +150,31 @@ impl SkillStore {
     }
 }
 
+/// The read-only view of a skill that prediction and dispatch need. `Skill`
+/// implements it, and so does a frontend's own snapshot (the TUI's
+/// `SkillInfo`), so the matching rules stay in one place (ADR-0014 D3).
+pub trait SkillView {
+    fn name(&self) -> &str;
+    fn description(&self) -> &str;
+}
+
+impl SkillView for Skill {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+}
+
 /// Resolve a skill by its canonical name or `/`-prefixed spelling, in either
 /// the `/skill:name` (canonical) or bare `/name` (legacy) form — exact,
 /// case-sensitive.
-pub fn find_skill<'a>(skills: &'a [Skill], name: &str) -> Option<&'a Skill> {
+pub fn find_skill<'a, S: SkillView>(skills: &'a [S], name: &str) -> Option<&'a S> {
     let name = name.strip_prefix('/').unwrap_or(name);
     let name = name.strip_prefix("skill:").unwrap_or(name);
-    skills.iter().find(|s| s.name == name)
+    skills.iter().find(|s| s.name() == name)
 }
 
 /// The canonical slash trigger spelling for a skill (`/skill:name`).
@@ -183,7 +201,7 @@ pub fn normalize_skill_trigger(prompt: &str) -> String {
 /// Predict skills matching a partial `/` input. A non-`/` input yields none;
 /// `/` alone yields every skill. The `/skill:` prefix of the canonical trigger
 /// is stripped so `/skill:gr` matches skill `gr…`.
-pub fn suggest_skills<'a>(skills: &'a [Skill], input: &str) -> Vec<&'a Skill> {
+pub fn suggest_skills<'a, S: SkillView>(skills: &'a [S], input: &str) -> Vec<&'a S> {
     let input = input.trim();
     if !input.starts_with('/') {
         return Vec::new();
@@ -192,7 +210,7 @@ pub fn suggest_skills<'a>(skills: &'a [Skill], input: &str) -> Vec<&'a Skill> {
     let prefix = prefix.strip_prefix("skill:").unwrap_or(prefix);
     skills
         .iter()
-        .filter(|s| s.name.starts_with(prefix))
+        .filter(|s| s.name().starts_with(prefix))
         .collect()
 }
 
@@ -545,10 +563,10 @@ fn set_once<T>(slot: &mut Option<T>, value: T, what: &str) -> Result<(), String>
 
 /// Combine built-in command suggestions with skill suggestions (both triggered
 /// via `/`) for a partial `/` input.
-pub fn combined_suggestions(skills: &[Skill], input: &str) -> Vec<String> {
+pub fn combined_suggestions<S: SkillView>(skills: &[S], input: &str) -> Vec<String> {
     let mut out: Vec<String> = suggest(input).iter().map(|c| c.usage.to_string()).collect();
     for s in suggest_skills(skills, input) {
-        out.push(skill_trigger(&s.name));
+        out.push(skill_trigger(s.name()));
     }
     out
 }
@@ -572,7 +590,7 @@ pub struct CompletionItem {
 /// is never scored, so its letters cannot match every skill — and advertised
 /// under their canonical `/skill:name` spelling (a typed `/skill:name`
 /// trigger is likewise matched by its name part).
-pub fn complete(input: &str, skills: &[Skill]) -> Vec<CompletionItem> {
+pub fn complete<S: SkillView>(input: &str, skills: &[S]) -> Vec<CompletionItem> {
     let trimmed = input.trim();
     if !trimmed.starts_with('/') {
         return Vec::new();
@@ -599,7 +617,7 @@ pub fn complete(input: &str, skills: &[Skill]) -> Vec<CompletionItem> {
     // rebuilt as the canonical `/skill:name` trigger below.
     let skill_pool: Vec<(String, String)> = skills
         .iter()
-        .map(|s| (s.name.clone(), s.description.clone()))
+        .map(|s| (s.name().to_string(), s.description().to_string()))
         .collect();
 
     let mut scored: Vec<(i64, usize, CompletionItem)> = Vec::new();
@@ -659,6 +677,10 @@ pub fn complete(input: &str, skills: &[Skill]) -> Vec<CompletionItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A typed empty skill slice: the prediction helpers are generic over the
+    /// caller's skill view, so an untyped `&[]` cannot infer `S`.
+    const NO_SKILLS: &[Skill] = &[];
     use crate::testutil::unique_temp_dir;
 
     fn skill_md(extra: &str) -> String {
@@ -1194,13 +1216,13 @@ mod tests {
 
     #[test]
     fn complete_non_slash_input_is_empty() {
-        assert!(complete("hist", &[]).is_empty());
-        assert!(complete("", &[]).is_empty());
+        assert!(complete("hist", NO_SKILLS).is_empty());
+        assert!(complete("", NO_SKILLS).is_empty());
     }
 
     #[test]
     fn complete_prefix_matches_command_name() {
-        let items = complete("/us", &[]);
+        let items = complete("/us", NO_SKILLS);
         let values: Vec<&str> = items.iter().map(|i| i.value.as_str()).collect();
         assert_eq!(values, vec!["/usage"]);
         assert_eq!(items[0].description, "show token usage");
@@ -1208,7 +1230,7 @@ mod tests {
 
     #[test]
     fn complete_matches_command_alias() {
-        let items = complete("/res", &[]);
+        let items = complete("/res", NO_SKILLS);
         let values: Vec<&str> = items.iter().map(|i| i.value.as_str()).collect();
         assert!(values.contains(&"/resume"), "got: {values:?}");
     }
@@ -1310,7 +1332,7 @@ mod tests {
 
     #[test]
     fn complete_unknown_is_empty() {
-        assert!(complete("/zzz", &[]).is_empty());
+        assert!(complete("/zzz", NO_SKILLS).is_empty());
     }
 
     #[test]
@@ -1318,7 +1340,7 @@ mod tests {
         // The value must be commit-able (no `<id>` placeholder), unlike the
         // usage strings combined_suggestions surfaces. Querying the exact
         // canonical name yields its bare spelling, not `/load <id>`.
-        let items = complete("/load", &[]);
+        let items = complete("/load", NO_SKILLS);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].value, "/load");
         assert_eq!(items[0].description, "load a saved session");

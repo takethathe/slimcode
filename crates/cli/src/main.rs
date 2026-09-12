@@ -126,6 +126,9 @@ fn run_tui(
         skills,
         context_files,
         environment,
+        // The CLI owns the `DisplayItem → RenderItem` adapter (ADR-0014 D2):
+        // the TUI builds the turn's channel and the adapter sends over it.
+        Box::new(|tx| Box::new(render::TuiAdapter::new(tx)) as Box<dyn Renderer + Send>),
     )
 }
 

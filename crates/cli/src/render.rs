@@ -10,11 +10,82 @@
 //! streamed line didn't end with a newline. Raw `ToolCallStart`/
 //! `ToolCallArgs`/`Done` deltas never reach a renderer — they are suppressed by
 //! `map_event` in `slimcode-app`.
+//!
+//! The same module owns the TUI's adapter: [`TuiAdapter`] implements the same
+//! `Renderer` trait but converts each `DisplayItem` into the
+//! [`RenderItem`](slimcode_tui::render::RenderItem) the TUI applies
+//! (ADR-0014 D1/D2). That is why the TUI crate needs no application-layer
+//! dependency of its own.
 
 use std::io::Write;
+use std::sync::mpsc;
 
 use slimcode_app::render::{DisplayItem, Renderer, usage_summary};
 use slimcode_core::agent::StopReason;
+use slimcode_tui::footer::FooterUsage;
+use slimcode_tui::render::RenderItem;
+
+/// Convert one display item into the TUI's vocabulary (ADR-0014 D1).
+///
+/// Two items are dropped: turn markers (the pi-aligned transcript has none)
+/// and stop markers (the TUI renders nothing for a stop). Token usage becomes
+/// the TUI's own [`FooterUsage`], so the provider's usage type never reaches
+/// the TUI crate.
+pub fn to_render_item(item: &DisplayItem) -> Option<RenderItem> {
+    Some(match item {
+        DisplayItem::Text(t) => RenderItem::Text(t.clone()),
+        DisplayItem::Reasoning(t) => RenderItem::Reasoning(t.clone()),
+        DisplayItem::ToolStart {
+            tool_call_id,
+            name,
+            arguments,
+        } => RenderItem::ToolStart {
+            tool_call_id: tool_call_id.clone(),
+            name: name.clone(),
+            arguments: arguments.clone(),
+        },
+        DisplayItem::ToolResult {
+            tool_call_id,
+            name,
+            ok,
+            result,
+        } => RenderItem::ToolResult {
+            tool_call_id: tool_call_id.clone(),
+            name: name.clone(),
+            ok: *ok,
+            result: result.clone(),
+        },
+        DisplayItem::Usage(u) => RenderItem::Usage(FooterUsage::new(
+            u.prompt_tokens,
+            u.completion_tokens,
+            u.cached_tokens(),
+            u.cache_creation_tokens(),
+        )),
+        DisplayItem::Turn { .. } | DisplayItem::Stop(_) => return None,
+    })
+}
+
+/// The CLI's TUI adapter (ADR-0014 D2): a [`Renderer`] that runs on the turn's
+/// worker thread and sends [`RenderItem`]s over the TUI's channel. The TUI
+/// creates the channel and hands the sender to [`TuiAdapter::new`].
+pub struct TuiAdapter {
+    tx: mpsc::Sender<RenderItem>,
+}
+
+impl TuiAdapter {
+    pub fn new(tx: mpsc::Sender<RenderItem>) -> Self {
+        Self { tx }
+    }
+}
+
+impl Renderer for TuiAdapter {
+    fn render(&mut self, item: &DisplayItem) -> Result<(), String> {
+        match to_render_item(item) {
+            Some(render_item) => self.tx.send(render_item).map_err(|e| e.to_string()),
+            None => Ok(()),
+        }
+    }
+}
 
 /// The kind of streamed line currently open (no trailing newline yet), if any.
 /// Text and reasoning never share a row: when one is open and the other kind
@@ -362,5 +433,96 @@ mod tests {
     }
     fn agent_stop() -> AgentEvent {
         AgentEvent::Stop(StopReason::Completed)
+    }
+
+    // --- the TUI adapter (ADR-0014 D1/D2) --------------------------------
+
+    /// Every `DisplayItem` variant maps 1:1 onto the TUI's vocabulary, except
+    /// the two the TUI never renders. Kept table-driven so a new display
+    /// variant cannot be added without deciding what the TUI shows.
+    #[test]
+    fn adapter_maps_every_display_item_variant() {
+        let usage = TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            prompt_tokens_details: Some(slimcode_ai::wire::PromptTokensDetails {
+                cached_tokens: 8,
+                cache_creation_input_tokens: 2,
+            }),
+        };
+        let cases: Vec<(DisplayItem, Option<RenderItem>)> = vec![
+            (
+                DisplayItem::Text("hi".to_string()),
+                Some(RenderItem::Text("hi".to_string())),
+            ),
+            (
+                DisplayItem::Reasoning("why".to_string()),
+                Some(RenderItem::Reasoning("why".to_string())),
+            ),
+            (
+                DisplayItem::ToolStart {
+                    tool_call_id: "c1".to_string(),
+                    name: "read".to_string(),
+                    arguments: "{}".to_string(),
+                },
+                Some(RenderItem::ToolStart {
+                    tool_call_id: "c1".to_string(),
+                    name: "read".to_string(),
+                    arguments: "{}".to_string(),
+                }),
+            ),
+            (
+                DisplayItem::ToolResult {
+                    tool_call_id: "c1".to_string(),
+                    name: "read".to_string(),
+                    ok: true,
+                    result: "hello".to_string(),
+                },
+                Some(RenderItem::ToolResult {
+                    tool_call_id: "c1".to_string(),
+                    name: "read".to_string(),
+                    ok: true,
+                    result: "hello".to_string(),
+                }),
+            ),
+            (
+                DisplayItem::Usage(usage),
+                Some(RenderItem::Usage(FooterUsage::new(10, 5, 8, 2))),
+            ),
+            (DisplayItem::Turn { turn: 3 }, None),
+            (DisplayItem::Stop(StopReason::Completed), None),
+            (DisplayItem::Stop(StopReason::Cancelled), None),
+        ];
+        for (display, expected) in cases {
+            assert_eq!(to_render_item(&display), expected, "for {display:?}");
+        }
+    }
+
+    #[test]
+    fn tui_adapter_sends_mapped_items_and_skips_dropped_ones() {
+        let (tx, rx) = mpsc::channel::<RenderItem>();
+        let mut adapter = TuiAdapter::new(tx);
+        adapter
+            .render(&DisplayItem::Text("answer".to_string()))
+            .unwrap();
+        adapter.render(&DisplayItem::Turn { turn: 1 }).unwrap();
+        adapter
+            .render(&DisplayItem::Stop(StopReason::Completed))
+            .unwrap();
+        drop(adapter);
+
+        let items: Vec<RenderItem> = rx.iter().collect();
+        assert_eq!(items, vec![RenderItem::Text("answer".to_string())]);
+    }
+
+    #[test]
+    fn tui_adapter_reports_a_closed_channel() {
+        let (tx, rx) = mpsc::channel::<RenderItem>();
+        drop(rx);
+        let mut adapter = TuiAdapter::new(tx);
+        assert!(adapter.render(&DisplayItem::Text("x".to_string())).is_err());
+        // A dropped item never touches the channel, so it still succeeds.
+        assert!(adapter.render(&DisplayItem::Turn { turn: 1 }).is_ok());
     }
 }

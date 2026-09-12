@@ -7,8 +7,6 @@
 //! plain strings. The `App` composes them into styled `Line`s at draw time;
 //! the terminal shell only feeds in the cwd / session / model / usage.
 
-use slimcode_ai::TokenUsage;
-
 /// Port of pi `formatTokens(count)`: compact token count formatting.
 /// `<1000` plain; `<10000` one-decimal `k`; `<1e6` rounded `k`; `<1e7`
 /// one-decimal `M`; else rounded `M`.
@@ -63,13 +61,15 @@ pub struct FooterUsage {
     pub cache_write: u64,
 }
 
-impl From<&TokenUsage> for FooterUsage {
-    fn from(u: &TokenUsage) -> Self {
+impl FooterUsage {
+    /// Plain constructor (ADR-0014 D1): the CLI maps the provider's usage into
+    /// these four counters, so this crate never names the AI type.
+    pub fn new(input: u64, output: u64, cache_read: u64, cache_write: u64) -> Self {
         Self {
-            input: u.prompt_tokens,
-            output: u.completion_tokens,
-            cache_read: u.cached_tokens(),
-            cache_write: u.cache_creation_tokens(),
+            input,
+            output,
+            cache_read,
+            cache_write,
         }
     }
 }
@@ -279,18 +279,8 @@ mod tests {
     }
 
     #[test]
-    fn from_token_usage_maps_cache_fields() {
-        use slimcode_ai::wire::PromptTokensDetails;
-        let u = TokenUsage {
-            prompt_tokens: 10,
-            completion_tokens: 5,
-            total_tokens: 15,
-            prompt_tokens_details: Some(PromptTokensDetails {
-                cached_tokens: 8,
-                cache_creation_input_tokens: 2,
-            }),
-        };
-        let f = FooterUsage::from(&u);
+    fn new_stores_the_four_counters() {
+        let f = FooterUsage::new(10, 5, 8, 2);
         assert_eq!(f.input, 10);
         assert_eq!(f.output, 5);
         assert_eq!(f.cache_read, 8);
