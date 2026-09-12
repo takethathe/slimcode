@@ -305,6 +305,20 @@ markdown 结构冲突。与 Skill 的区别：Skill 按需触发（`/skill:name`
 项目根 `AGENTS.md` 放本仓库约定（如“提交前先跑 `cargo fmt`”）与工程纪律；项目
 要求声明在全局之上。
 
+### 系统环境信息（`## Environment`）
+
+每轮新会话首轮 system 消息还包含一个 `## Environment` 章节，把启动时的环境
+告诉模型，让它无需探测文件系统就知道平台与目录根：
+
+- **OS**：操作系统名（`macos` / `linux` / `windows`）；
+- **global home**：slimcode home（`$SLIMCODE_HOME` 或 `~/.slimcode`），全局
+  AGENTS.md 与 skills 所在；
+- **project home**：当前工作目录向上找最近的含 `.git` 的祖先目录；不在任何
+  git 仓库内时回退到 OS 用户主目录（`$HOME`）。
+
+环境信息在会话首轮冻结：`/load` 恢复的会话沿用首轮的值，不会因当前启动目录
+不同而刷新（会话不记录工作目录）。
+
 ### 输入历史与多行 prompt
 
 输入历史（`input history`，区别于会话的消息历史 `message history`）记录你提交过的
@@ -322,7 +336,8 @@ markdown 结构冲突。与 Skill 的区别：Skill 按需触发（`/skill:name`
 
 每个会话以 JSON 存于 `~/.slimcode/sessions/`，消息模型为
 `Message{role, parts, tool_calls, tool_call_id}` + `Session{id, created_at,
-messages, title}`。`/load` 恢复会话后，历史消息（含系统提示）原样继续。
+messages, title}`。`/load` 恢复会话后，历史消息（含系统提示与 `## Environment`
+环境信息）原样继续，环境沿用首轮冻结值。
 会话不记录工作目录——恢复后工具作用于当前启动目录。
 
 ### 工具集

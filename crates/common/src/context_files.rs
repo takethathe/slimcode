@@ -102,6 +102,18 @@ fn find_git_root(cwd: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Resolve the project home for the environment info: the nearest ancestor of
+/// `cwd` holding a `.git` entry (the same git-root discovery used for project
+/// context files), falling back to the OS user home directory when no
+/// ancestor is a git repo, then to `cwd` itself when no user home is known.
+pub fn resolve_project_home(cwd: &Path, user_home: Option<&Path>) -> PathBuf {
+    find_git_root(cwd).unwrap_or_else(|| {
+        user_home
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| cwd.to_path_buf())
+    })
+}
+
 /// Canonicalize `p` for dedup, falling back to the raw path when the file
 /// cannot be resolved (e.g. a broken symlink).
 fn canonical_or_self(p: &Path) -> PathBuf {
@@ -215,6 +227,49 @@ mod tests {
         let paths: Vec<&Path> = files.iter().map(|f| f.path.as_path()).collect();
         assert_eq!(paths, vec![repo.join("AGENTS.md").as_path()]);
         assert_eq!(files[0].scope, ContextScope::Project);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_project_home_uses_git_root() {
+        let dir = unique_temp_dir("slimcode-env-git");
+        let repo = dir.join("repo");
+        let cwd = repo.join("src");
+        write(&repo.join(".git"), "");
+
+        assert_eq!(resolve_project_home(&cwd, Some(&dir.join("home"))), repo);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_project_home_falls_back_to_user_home() {
+        let dir = unique_temp_dir("slimcode-env-nogit");
+        let cwd = dir.join("loose");
+        fs::create_dir_all(&cwd).unwrap();
+        let user_home = dir.join("home");
+
+        assert_eq!(resolve_project_home(&cwd, Some(&user_home)), user_home);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_project_home_falls_back_to_cwd_when_no_home() {
+        let dir = unique_temp_dir("slimcode-env-nohome");
+        let cwd = dir.join("loose");
+        fs::create_dir_all(&cwd).unwrap();
+
+        assert_eq!(resolve_project_home(&cwd, None), cwd);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_project_home_handles_git_file_marker() {
+        let dir = unique_temp_dir("slimcode-env-gitfile");
+        let repo = dir.join("repo");
+        let cwd = repo.join("src");
+        write(&repo.join(".git"), "gitdir: /elsewhere/repo.git\n");
+
+        assert_eq!(resolve_project_home(&cwd, Some(&dir.join("home"))), repo);
         let _ = fs::remove_dir_all(&dir);
     }
 

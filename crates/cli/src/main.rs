@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 use slimcode_agent::agent::Message;
 use slimcode_ai::BailianConfig;
 use slimcode_common::config::{self, Overrides};
-use slimcode_common::context::ContextBuilder;
-use slimcode_common::context_files::{ContextFile, load_context_files};
+use slimcode_common::context::{ContextBuilder, Environment};
+use slimcode_common::context_files::{ContextFile, load_context_files, resolve_project_home};
 use slimcode_common::history::HistoryStore;
 use slimcode_common::render::{DisplayItem, Renderer};
 use slimcode_common::session::{SessionStore, infer_title};
@@ -66,6 +66,7 @@ fn run_once(
     store: &SessionStore,
     skills: &[Skill],
     context_files: &[ContextFile],
+    environment: Environment,
     out: &mut dyn Write,
 ) -> Result<i32, String> {
     let (mut provider, tools) = slimcode_common::setup::setup(cwd, config)?;
@@ -79,6 +80,7 @@ fn run_once(
         prompt.as_str(),
     )]);
     let messages = ContextBuilder::new()
+        .with_environment(environment)
         .with_context_files(context_files)
         .with_skills(skills)
         .with_user_prompt(prompt)
@@ -112,8 +114,17 @@ fn run_tui(
     history: &HistoryStore,
     skills: &SkillStore,
     context_files: &[ContextFile],
+    environment: Environment,
 ) -> Result<i32, String> {
-    slimcode_tui::terminal::run(cwd, config, store, history, skills, context_files)
+    slimcode_tui::terminal::run(
+        cwd,
+        config,
+        store,
+        history,
+        skills,
+        context_files,
+        environment,
+    )
 }
 
 fn main() {
@@ -215,9 +226,27 @@ fn run(args: &[String], out: &mut dyn Write, tty: bool) -> Result<i32, String> {
     let skills = skills_store.list().unwrap_or_default();
     // AGENTS.md discovery is infallible: missing files simply yield none.
     let context_files = load_context_files(&home, &cwd);
+    // System environment info: OS name, global home (slimcode home), and the
+    // project home (git root, falling back to the OS user home). Frozen at
+    // startup; a restored session keeps the environment from its first turn.
+    let user_home = std::env::var_os("HOME").map(PathBuf::from);
+    let environment = Environment {
+        os: std::env::consts::OS.to_string(),
+        global_home: home.clone(),
+        project_home: resolve_project_home(&cwd, user_home.as_deref()),
+    };
 
     match parsed.prompt {
-        Some(p) => run_once(&p, &cwd, app_config, &store, &skills, &context_files, out),
+        Some(p) => run_once(
+            &p,
+            &cwd,
+            app_config,
+            &store,
+            &skills,
+            &context_files,
+            environment,
+            out,
+        ),
         None => run_tui(
             &cwd,
             app_config,
@@ -225,6 +254,7 @@ fn run(args: &[String], out: &mut dyn Write, tty: bool) -> Result<i32, String> {
             &history,
             &skills_store,
             &context_files,
+            environment,
         ),
     }
 }

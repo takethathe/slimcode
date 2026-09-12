@@ -30,7 +30,7 @@ use ratatui::backend::CrosstermBackend;
 use slimcode_agent::agent::{CancelToken, RunConfig, Tool};
 use slimcode_agent::session::{Message, Session};
 use slimcode_ai::{BailianConfig, BailianProvider};
-use slimcode_common::context::ContextBuilder;
+use slimcode_common::context::{ContextBuilder, Environment};
 use slimcode_common::context_files::ContextFile;
 use slimcode_common::history::{
     HISTORY_DISPLAY, HistoryStore, render_history, resolve_replay_index,
@@ -61,6 +61,7 @@ pub fn run(
     history: &HistoryStore,
     skills: &SkillStore,
     context_files: &[ContextFile],
+    environment: Environment,
 ) -> Result<i32, String> {
     let model = config.model.clone();
     // One token shared by the cancellable tool set and every turn's worker:
@@ -79,6 +80,7 @@ pub fn run(
         model,
         cancel,
         context_files,
+        environment,
     ) {
         Ok(ui) => ui,
         Err(e) => {
@@ -115,6 +117,10 @@ struct Tui<'a> {
     /// Discovered `AGENTS.md` files (global + project), injected into every
     /// fresh system message via `ContextBuilder::with_context_files`.
     context_files: Vec<ContextFile>,
+    /// System environment info (OS, global home, project home), injected into
+    /// every fresh system message via `ContextBuilder::with_environment`.
+    /// Frozen at session start: a restored session keeps its first-turn value.
+    environment: Environment,
     session: Session,
     cwd: PathBuf,
     /// Set while a turn runs when the user presses Ctrl+C/Ctrl+D: the current
@@ -143,6 +149,7 @@ impl<'a> Tui<'a> {
         model: String,
         cancel: CancelToken,
         context_files: &[ContextFile],
+        environment: Environment,
     ) -> Result<Self, String> {
         enable_raw_mode().map_err(|e| format!("raw mode: {e}"))?;
         execute!(stdout(), EnterAlternateScreen).map_err(|e| format!("alternate screen: {e}"))?;
@@ -169,6 +176,7 @@ impl<'a> Tui<'a> {
             history,
             skills,
             context_files: context_files.to_vec(),
+            environment,
             session,
             cwd: cwd.to_path_buf(),
             quit_after_turn: false,
@@ -313,6 +321,7 @@ impl<'a> Tui<'a> {
     fn submit_prompt(&mut self, prompt: String, record: bool) -> Result<(), String> {
         let skills = self.skills.list().unwrap_or_default();
         let context = ContextBuilder::new()
+            .with_environment(self.environment.clone())
             .with_context_files(&self.context_files)
             .with_skills(&skills)
             .with_history(self.session.messages.clone())
@@ -343,6 +352,7 @@ impl<'a> Tui<'a> {
             return Ok(());
         };
         let context = ContextBuilder::new()
+            .with_environment(self.environment.clone())
             .with_context_files(&self.context_files)
             .with_skills(&skills)
             .with_history(self.session.messages.clone())

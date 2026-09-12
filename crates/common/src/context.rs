@@ -6,6 +6,8 @@
 //! builds a turn through [`ContextBuilder`] and hands the result straight to
 //! `run_agent_from_messages`. See `.scratch/context-builder` spec.
 
+use std::path::PathBuf;
+
 use slimcode_agent::session::{Message, Role};
 
 use crate::context_files::{ContextFile, format_context_files};
@@ -24,7 +26,42 @@ pub const DEFAULT_SYSTEM_PROMPT: &str = concat!(
     "- When a tool fails, read the error and retry with a corrected approach."
 );
 
-/// Assemble the full system prompt: the base grounding plus a
+/// System environment info injected into the system prompt's `## Environment`
+/// section: the OS name, the global home (the slimcode home dir), and the
+/// project home (the git repository root, or the OS user home as a fallback).
+/// The frontends resolve these at startup and pass them via
+/// [`ContextBuilder::with_environment`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Environment {
+    /// OS name (`std::env::consts::OS`): "macos", "linux", "windows".
+    pub os: String,
+    /// Global home: the slimcode home dir (`$SLIMCODE_HOME` or `~/.slimcode`),
+    /// where global context files and skills live.
+    pub global_home: PathBuf,
+    /// Project home: the nearest ancestor of the working directory holding a
+    /// `.git` entry, falling back to the OS user home (`$HOME`) when no
+    /// ancestor is a git repo.
+    pub project_home: PathBuf,
+}
+
+/// Render the `## Environment` markdown section for the system prompt: one
+/// bullet per field (OS, global home, project home), so the model knows the
+/// platform and where the global/project roots live without probing the
+/// filesystem. Starts with a blank-line separator (aligned with
+/// [`format_context_files`]) and ends with a single newline, so the following
+/// `## Project context` / `## Skills` section sits one blank line below.
+fn format_environment(env: &Environment) -> String {
+    format!(
+        "\n\n## Environment\n\n- OS: {}\n- global home: {}\n- project home: {}\n",
+        env.os,
+        env.global_home.display(),
+        env.project_home.display(),
+    )
+}
+
+/// Assemble the full system prompt: the base grounding plus an optional
+/// `## Environment` markdown section of OS / global home / project home (when
+/// [`ContextBuilder::with_environment`] was called), plus a
 /// `## Project context` markdown section of context files (global + project
 /// `AGENTS.md`, pi-style, with scope-labelled XML blocks and a
 /// project-overrides-global note), plus a `## Skills` markdown index of
@@ -33,8 +70,16 @@ pub const DEFAULT_SYSTEM_PROMPT: &str = concat!(
 /// model can `read`. Skills marked
 /// `disable-model-invocation` stay out of the system prompt and are only
 /// reachable through an explicit `/skill:name` trigger.
-fn build_system_prompt(base: &str, skills: &[Skill], context_files: &[ContextFile]) -> String {
+fn build_system_prompt(
+    base: &str,
+    environment: Option<&Environment>,
+    skills: &[Skill],
+    context_files: &[ContextFile],
+) -> String {
     let mut prompt = base.to_string();
+    if let Some(env) = environment {
+        prompt.push_str(&format_environment(env));
+    }
     prompt.push_str(&format_context_files(context_files));
     prompt.push_str(&format_skills_for_prompt(skills));
     prompt
@@ -62,12 +107,13 @@ fn skill_loaded_in(history: &[Message], skill: &Skill) -> bool {
 ///
 /// Components are optional and added as needed: the system prompt defaults to
 /// [`DEFAULT_SYSTEM_PROMPT`] (overridable via [`ContextBuilder::with_system`]),
-/// context files and skills are injected only when supplied, and a non-empty
-/// history is never re-seeded. `build()` returns the assembled
+/// environment info and context files are injected only when supplied, and a
+/// non-empty history is never re-seeded. `build()` returns the assembled
 /// `Vec<Message>`, ready for `run_agent_from_messages`.
 #[derive(Debug)]
 pub struct ContextBuilder {
     system: String,
+    environment: Option<Environment>,
     skills: Vec<Skill>,
     context_files: Vec<ContextFile>,
     history: Vec<Message>,
@@ -79,6 +125,7 @@ impl ContextBuilder {
     pub fn new() -> Self {
         Self {
             system: DEFAULT_SYSTEM_PROMPT.to_string(),
+            environment: None,
             skills: Vec::new(),
             context_files: Vec::new(),
             history: Vec::new(),
@@ -89,6 +136,15 @@ impl ContextBuilder {
     /// Override the base system prompt.
     pub fn with_system(mut self, system: impl Into<String>) -> Self {
         self.system = system.into();
+        self
+    }
+
+    /// Inject system environment info (OS, global home, project home) as a
+    /// `## Environment` markdown section between the base prompt and the
+    /// context files. Skipped entirely when not called, so the default system
+    /// prompt stays byte-identical.
+    pub fn with_environment(mut self, environment: Environment) -> Self {
+        self.environment = Some(environment);
         self
     }
 
@@ -156,7 +212,12 @@ impl ContextBuilder {
         if messages.is_empty() {
             messages.push(Message::text(
                 Role::System,
-                build_system_prompt(&base, &self.skills, &self.context_files),
+                build_system_prompt(
+                    &base,
+                    self.environment.as_ref(),
+                    &self.skills,
+                    &self.context_files,
+                ),
             ));
         }
         messages.push(Message::text(Role::User, user));
@@ -545,5 +606,85 @@ mod tests {
         let system = messages[0].text_content();
         assert!(!system.contains("## Project context"), "got: {system}");
         assert!(!system.contains("AGENTS.md"), "got: {system}");
+    }
+
+    // --- environment info (## Environment) -------------------------------
+
+    fn environment() -> Environment {
+        Environment {
+            os: "macos".to_string(),
+            global_home: std::path::PathBuf::from("/home/u/.slimcode"),
+            project_home: std::path::PathBuf::from("/home/u/work/repo"),
+        }
+    }
+
+    #[test]
+    fn no_environment_has_no_environment_section() {
+        let messages = ContextBuilder::new()
+            .with_user_prompt("hello")
+            .build()
+            .unwrap();
+        let system = messages[0].text_content();
+        assert!(!system.contains("## Environment"), "got: {system}");
+        assert!(!system.contains("global home"), "got: {system}");
+    }
+
+    #[test]
+    fn environment_injects_between_base_and_context_files() {
+        use crate::context_files::ContextScope;
+        use std::path::PathBuf;
+
+        let files = vec![ContextFile {
+            path: PathBuf::from("/tmp/AGENTS.md"),
+            content: "do the thing".to_string(),
+            scope: ContextScope::Project,
+        }];
+        let messages = ContextBuilder::new()
+            .with_environment(environment())
+            .with_context_files(&files)
+            .with_skills(&[skill("auto", "runs automatically", false)])
+            .with_user_prompt("hello")
+            .build()
+            .unwrap();
+        let system = messages[0].text_content();
+        let base = system.find("You are slimcode").unwrap();
+        let env = system.find("## Environment").unwrap();
+        let ctx = system.find("## Project context").unwrap();
+        let skills_idx = system.find("## Skills").unwrap();
+        assert!(base < env, "environment must follow the base prompt");
+        assert!(env < ctx, "environment must precede context files");
+        assert!(ctx < skills_idx, "skills index must follow context files");
+        assert!(system.contains("- OS: macos"), "got: {system}");
+        assert!(
+            system.contains("- global home: /home/u/.slimcode"),
+            "got: {system}"
+        );
+        assert!(
+            system.contains("- project home: /home/u/work/repo"),
+            "got: {system}"
+        );
+    }
+
+    #[test]
+    fn environment_section_precedes_skills_without_context_files() {
+        let messages = ContextBuilder::new()
+            .with_environment(environment())
+            .with_skills(&[skill("auto", "runs automatically", false)])
+            .with_user_prompt("hello")
+            .build()
+            .unwrap();
+        let system = messages[0].text_content();
+        let env = system.find("## Environment").unwrap();
+        let skills_idx = system.find("## Skills").unwrap();
+        assert!(env < skills_idx, "got: {system}");
+        assert!(system.contains("- OS: macos"), "got: {system}");
+        assert!(
+            system.contains("- global home: /home/u/.slimcode"),
+            "got: {system}"
+        );
+        assert!(
+            system.contains("- project home: /home/u/work/repo"),
+            "got: {system}"
+        );
     }
 }

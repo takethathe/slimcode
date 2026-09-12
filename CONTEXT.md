@@ -70,6 +70,18 @@ global scope. Distinct from a Skill (instructions on demand via
 `/skill:name`) — a context file is always loaded into the system message.
 _Avoid_: project instructions file (ambiguity with scope), rules file
 
+**Global home**:
+The slimcode home directory (`$SLIMCODE_HOME` or `~/.slimcode`) as named in the system prompt's `## Environment` info — the global scope where context files and skills live. Same directory as `home`; the "global" modifier mirrors the `global|project` scope labels of context files.
+_Avoid_: user home, OS home
+
+**Project home**:
+The directory the agent is grounded in, surfaced in the system prompt's `## Environment` info: the nearest ancestor of the working directory holding a `.git` entry (a directory or a `gitdir:` file marker, per `context_files::find_git_root`), falling back to the user home when no ancestor is a git repo. Distinct from the working directory (cwd, which may be a subdirectory of the project home) and from the slimcode home (home / global home).
+_Avoid_: project root (ambiguous with git root), working directory
+
+**User home**:
+The OS user home directory (`$HOME`); the fallback value of project home when no ancestor of the working directory holds a `.git` entry. Distinct from `home` / global home (the slimcode home, which defaults to `~/.slimcode` under the user home).
+_Avoid_: home (bare — collides with slimcode home), global home
+
 **Multi-line prompt**:
 A Prompt entered across multiple lines in the TUI input box (Shift+Enter or Ctrl+J inserts a newline; Enter submits). Stored and submitted as a single Prompt.
 _Avoid_: block, paste

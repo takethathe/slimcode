@@ -182,6 +182,9 @@ cargo workspace，六个 crate：
   才在后续输入里粘住当前选中值（直到该值被过滤掉或弹框关闭）；
 - `context`：`ContextBuilder`（前端无关）把一轮 prompt 的上下文组装收敛为单一
   入口：基础系统提示（默认 `DEFAULT_SYSTEM_PROMPT` 或 `with_system` 覆盖）+
+  可选环境信息（`with_environment`，注入 `## Environment` markdown 章节：OS /
+  global home / project home，位于基础提示之后、上下文文件之前；不调用则
+  整个章节省略，默认提示词保持逐字节不变）+
   可自动调用 skill 广告（`with_skills`，build 时经 `format_skills_for_prompt` 过滤
   `disable-model-invocation`，产出 `## Skills` markdown 索引）+
   可选 message history（`with_history`，非空不重复插 system）+ user prompt（
@@ -201,6 +204,9 @@ cargo workspace，六个 crate：
   冲突），段首声明项目要求可覆盖全局要求；没有可注入的 AGENTS.md 时整个章节
   省略，system 与未启用该功能时逐字节一致；注入位置在基础 system 之后、
   `## Skills` 索引之前；发现逻辑无失败路径（文件缺失即返回空列表）。
+  同模块的 `resolve_project_home(cwd, user_home)` 供环境信息复用同一套 git 根
+  发现：取最近含 `.git` 的祖先，无则回退到 OS 用户主目录（`$HOME`），再无则回退
+  到 cwd 自身。
 - `tools`：把七工具 factory 绑定到启动 `cwd`。
 - `render`（ADR-0004）：前端无关的显示模型。`DisplayItem` 是渲染单元（turn 标记 /
   流式文本片段 / 思考行 / 工具开始与结果 / 停止标记 / token 用量）；
