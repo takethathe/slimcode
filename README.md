@@ -12,7 +12,7 @@
 - 流式渲染 agent 输出，会话按消息逐条追加保存
 - 基于 DashScope（百炼）OpenAI 兼容接口，默认使用 `qwen-plus` 模型
 - 多行 prompt（以 `\` 结尾续行）与跨运行输入历史
-- 前端无关的命令注册表与预测逻辑（`slimcode-commands`）与公共应用模块（`slimcode-common`），可供其它前端复用
+- 前端无关的命令注册表与预测逻辑（`slimcode-commands`）与公共应用模块（`slimcode-app`），可供其它前端复用
 
 ## 架构
 
@@ -21,9 +21,9 @@ cargo workspace，五个 crate：
 | crate | 包名 | 职责 |
 | --- | --- | --- |
 | `crates/ai` | `slimcode-ai` | 统一 LLM provider 层（Provider trait + OpenAI-compatible/Bailian） |
-| `crates/agent` | `slimcode-agent` | agent 运行时、七工具引擎、会话消息模型 |
+| `crates/core` | `slimcode-core` | agent 运行时、七工具引擎、会话消息模型 |
 | `crates/commands` | `slimcode-commands` | 前端无关的 `/` 命令注册表与预测提示（suggest/find） |
-| `crates/common` | `slimcode-common` | 前端无关的应用模块：配置解析 / 会话与输入历史持久化 / 七工具绑定 |
+| `crates/app` | `slimcode-app` | 前端无关的应用模块：配置解析 / 会话与输入历史持久化 / 七工具绑定 |
 | `crates/cli` | `slimcode` | 二进制入口 + 终端前端（非交互模式 + REPL） |
 
 ## 安装

@@ -1,7 +1,7 @@
 # slimcode 配置文档
 
 > 本文件说明 slimcode 的配置方式：四层配置来源、每个配置项的取值规则与常见用法。
-> 随代码变更同步维护。实现见 `crates/common/src/config.rs`（单一解析 owner）与
+> 随代码变更同步维护。实现见 `crates/app/src/config.rs`（单一解析 owner）与
 > `crates/ai/src/config.rs`（纯 provider 数据）。
 
 ## 配置总览

@@ -16,7 +16,7 @@ token 用量统计、会话可保存/恢复（详见 `docs/development.md`）。
 
 一次 agent 运行需要一组按序排列的 `Message`（system → user → assistant →
 tool → …）。这组消息在交给运行时之前，由前端无关的 `ContextBuilder`（
-`slimcode-common::context`）组装：基础系统提示（默认 `DEFAULT_SYSTEM_PROMPT`
+`slimcode-app::context`）组装：基础系统提示（默认 `DEFAULT_SYSTEM_PROMPT`
 或 `with_system` 覆盖）+ 可自动调用 skill 的广告段落 + 可选 message history
 + 当轮 user prompt 或 skill 触发。`build()` 返回的 `Vec<Message>` 可直接交给
 `run_agent_from_messages`，无需二次转换。前端启动时还会注入系统环境信息
@@ -50,7 +50,7 @@ history**（`session.messages`）是会话中已发生的消息，可被当作 C
 ### AGENTS.md 上下文文件注入（pi 对齐）
 
 slimcode 会把 `AGENTS.md` 上下文文件注入到 system 消息里（对齐 pi 的 project
-context 加载，见 `slimcode-common::context_files`）。发现规则：
+context 加载，见 `slimcode-app::context_files`）。发现规则：
 
 - **全局**：`<home>/AGENTS.md`（`$SLIMCODE_HOME` 或 `~/.slimcode`，跨项目生效），
   scope 标为 `global`。
@@ -69,7 +69,7 @@ context 加载，见 `slimcode-common::context_files`）。发现规则：
 
 ### DisplayItem / Renderer / run_turn（前端无关的渲染与运行 seam）
 
-渲染与 turn 执行收敛为 `slimcode-common` 的前端无关 seam（ADR-0004）：
+渲染与 turn 执行收敛为 `slimcode-app` 的前端无关 seam（ADR-0004）：
 
 - **DisplayItem**：前端无关的显示单元（turn 标记、流式文本片段、思考行、工具
   开始/结果、停止标记、token 用量），由共享纯映射 `map_event(AgentEvent) ->
@@ -118,12 +118,12 @@ notice 行（措辞与 CLI 共用 `usage_summary`，含同样式汇总）。`{pc
 
 上下文组装曾散落在 CLI 两个入口（非交互 `run_once` 与交互前端的 `submit_prompt`）
 各自实现一遍「system / message history / user」规则，skill 触发再绕一层，规则
-重复、容易漂移。把组装收敛为 `slimcode-common::context` 的单一 `ContextBuilder`
+重复、容易漂移。把组装收敛为 `slimcode-app::context` 的单一 `ContextBuilder`
 后，one-shot 入口与 TUI 消费同一套规则，未来 Web 前端也可直接复用。
 
 同样地，渲染与 turn 执行曾由 CLI 独占：事件→输出的映射和 turn 循环只在
 `crates/cli` 里，TUI 若另写一套必然漂移。把 `map_event` / `DisplayItem` /
-`Renderer` / `run_turn` 上收到 `slimcode-common`（ADR-0004）后，CLI 与 TUI
+`Renderer` / `run_turn` 上收到 `slimcode-app`（ADR-0004）后，CLI 与 TUI
 共享同一份事件到显示的映射与同一个 turn 循环，每个前端只实现自己的 `Renderer`，
 行为可预测、不漂移。
 

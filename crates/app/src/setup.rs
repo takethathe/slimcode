@@ -5,8 +5,8 @@
 
 use std::path::Path;
 
-use slimcode_agent::agent::{CancelToken, Tool};
 use slimcode_ai::{BailianConfig, BailianProvider};
+use slimcode_core::agent::{CancelToken, Tool};
 
 use crate::tools;
 

@@ -6,8 +6,8 @@
 
 use std::path::Path;
 
-use slimcode_agent::agent::{CancelToken, Tool};
-use slimcode_agent::tools::files;
+use slimcode_core::agent::{CancelToken, Tool};
+use slimcode_core::tools::files;
 
 /// The six non-bash tools shared by the plain and the cancellable tool set
 /// (the bash variant differs: cancellable for the TUI, plain for the CLI).

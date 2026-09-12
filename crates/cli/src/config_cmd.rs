@@ -4,13 +4,13 @@
 //! when an API key ends up in the file.
 //!
 //! The merge core is a pure function in `slimcode-common::config`
-//! ([`slimcode_common::config::merge_config_toml`]); this module is the thin
+//! ([`slimcode_app::config::merge_config_toml`]); this module is the thin
 //! I/O shell around it (stdin/stdout prompting + file write + chmod).
 
 use std::io::{BufRead, Write};
 use std::path::Path;
 
-use slimcode_common::config::{self, ConfigAnswers};
+use slimcode_app::config::{self, ConfigAnswers};
 
 /// Entry for `slimcode config` (invoked when `args.first() == Some("config")`).
 /// Rejects extra arguments and non-TTY runs (both stdout and stdin must be
@@ -128,7 +128,7 @@ fn tighten_permissions(_path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use slimcode_common::testutil::unique_temp_dir;
+    use slimcode_app::testutil::unique_temp_dir;
 
     /// Run `run_config` against a fresh temp config path with scripted answers.
     /// Creates the (absent) temp directory first.

@@ -1,5 +1,5 @@
 [package]
-name = "slimcode-agent"
+name = "slimcode-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -33,7 +33,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use slimcode_agent::session::{Message, Role, Session};
+use slimcode_core::session::{Message, Role, Session};
 
 /// Max title length before truncation.
 const TITLE_MAX: usize = 48;
@@ -705,7 +705,7 @@ fn remove_empty_subdirs(base: &Path) {
 mod tests {
     use super::*;
     use crate::testutil::unique_temp_dir;
-    use slimcode_agent::session::{MessageStopReason, Part, ToolCall};
+    use slimcode_core::session::{MessageStopReason, Part, ToolCall};
     use std::time::Duration;
 
     /// Unique temp dir per test (tests run in parallel and must not share).

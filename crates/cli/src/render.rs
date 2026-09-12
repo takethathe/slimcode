@@ -13,8 +13,8 @@
 
 use std::io::Write;
 
-use slimcode_agent::agent::StopReason;
-use slimcode_common::render::{DisplayItem, Renderer, usage_summary};
+use slimcode_app::render::{DisplayItem, Renderer, usage_summary};
+use slimcode_core::agent::StopReason;
 
 /// The kind of streamed line currently open (no trailing newline yet), if any.
 /// Text and reasoning never share a row: when one is open and the other kind
@@ -134,9 +134,9 @@ fn render_structural(item: &DisplayItem) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use slimcode_agent::agent::{AgentEvent, Delta, FinishReason};
     use slimcode_ai::TokenUsage;
-    use slimcode_common::render::map_event;
+    use slimcode_app::render::map_event;
+    use slimcode_core::agent::{AgentEvent, Delta, FinishReason};
 
     /// Feed a stream of agent events through the shared mapping and the
     /// `TextRenderer`, returning the rendered bytes as a string.

@@ -16,7 +16,7 @@
 //! display item, never touching disk — so a session layer can persist each
 //! message at the moment it exists.
 
-use slimcode_agent::agent::{
+use slimcode_core::agent::{
     AgentEvent, CancelToken, Message, Provider, RunConfig, StopReason, Tool,
 };
 
@@ -44,7 +44,7 @@ pub fn run_turn<P: Provider>(
     renderer: &mut dyn Renderer,
     on_message: &mut dyn FnMut(&Message) -> Result<(), String>,
 ) -> Result<(Vec<Message>, StopReason), String> {
-    slimcode_agent::agent::run_agent_from_messages_sink(
+    slimcode_core::agent::run_agent_from_messages_sink(
         provider,
         tools,
         messages,
@@ -69,8 +69,8 @@ mod tests {
     use super::*;
     use crate::render::DisplayItem;
     use serde_json::Value;
-    use slimcode_agent::agent::{Delta, FinishReason, StopReason};
-    use slimcode_agent::session::{Message, Role};
+    use slimcode_core::agent::{Delta, FinishReason, StopReason};
+    use slimcode_core::session::{Message, Role};
 
     // --- helpers (the agent crate's scripted FakeProvider pattern) ----------
 
@@ -297,7 +297,7 @@ mod tests {
         .unwrap();
 
         let mut provider2 = FakeProvider::new(script);
-        let result = slimcode_agent::agent::run_agent_from_messages(
+        let result = slimcode_core::agent::run_agent_from_messages(
             &mut provider2,
             &[weather_tool()],
             messages,

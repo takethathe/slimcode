@@ -11,9 +11,9 @@
 //!   continuation chunks carry `""` / `null` there.
 
 use serde::{Deserialize, Serialize};
-use slimcode_agent::agent::Tool;
-use slimcode_agent::agent::{Delta, FinishReason};
-use slimcode_agent::session::{Message, Role};
+use slimcode_core::agent::Tool;
+use slimcode_core::agent::{Delta, FinishReason};
+use slimcode_core::session::{Message, Role};
 
 // ---------------------------------------------------------------------------
 // Response (streaming chunks)
@@ -385,7 +385,7 @@ pub fn parse_stream(body: &str) -> Result<ParsedStream, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use slimcode_agent::session::{Role, ToolCall};
+    use slimcode_core::session::{Role, ToolCall};
 
     const TEXT_STREAM: &str = concat!(
         "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",",
@@ -627,7 +627,7 @@ mod tests {
         // `stop_reason` and `error` are log-schema fields (ADR-0009 D5): they
         // must never leak onto the provider wire. The failure-closing assistant
         // message still goes out as plain assistant text.
-        use slimcode_agent::session::MessageStopReason;
+        use slimcode_core::session::MessageStopReason;
         let mut m = Message::text(Role::Assistant, "The turn ended with an error: boom");
         m.stop_reason = Some(MessageStopReason::Error);
         m.error = Some("boom".to_string());

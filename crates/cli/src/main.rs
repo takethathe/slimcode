@@ -23,13 +23,13 @@ use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use slimcode_ai::BailianConfig;
-use slimcode_common::config::{self, Overrides};
-use slimcode_common::context::{ContextBuilder, Environment};
-use slimcode_common::context_files::{ContextFile, load_context_files, resolve_project_home};
-use slimcode_common::history::HistoryStore;
-use slimcode_common::render::{DisplayItem, Renderer};
-use slimcode_common::session::{SessionStore, project_key};
-use slimcode_common::skills::{Skill, SkillStore, normalize_skill_trigger};
+use slimcode_app::config::{self, Overrides};
+use slimcode_app::context::{ContextBuilder, Environment};
+use slimcode_app::context_files::{ContextFile, load_context_files, resolve_project_home};
+use slimcode_app::history::HistoryStore;
+use slimcode_app::render::{DisplayItem, Renderer};
+use slimcode_app::session::{SessionStore, project_key};
+use slimcode_app::skills::{Skill, SkillStore, normalize_skill_trigger};
 
 fn usage() -> String {
     format!(
@@ -77,7 +77,7 @@ fn run_once(
     environment: Environment,
     out: &mut dyn Write,
 ) -> Result<i32, String> {
-    let (mut provider, tools) = slimcode_common::setup::setup(cwd, config)?;
+    let (mut provider, tools) = slimcode_app::setup::setup(cwd, config)?;
     // The CLI one-shot path has no command parser, so a leading `/skill:{name}`
     // trigger is normalized to the `/{name}` form the model understands before
     // it becomes a user message (the TUI already embeds the skill content).
@@ -88,11 +88,11 @@ fn run_once(
         .with_skills(skills)
         .with_user_prompt(prompt)
         .build()?;
-    let cfg = slimcode_agent::agent::RunConfig::default();
-    let cancel = slimcode_agent::agent::CancelToken::new();
+    let cfg = slimcode_core::agent::RunConfig::default();
+    let cancel = slimcode_core::agent::CancelToken::new();
     let mut renderer = render::TextRenderer::new(out);
     // One-shot: no session persistence, so the per-message sink is a no-op.
-    let (_updated, _stop) = slimcode_common::runner::run_turn(
+    let (_updated, _stop) = slimcode_app::runner::run_turn(
         &mut provider,
         &tools,
         messages,
@@ -561,7 +561,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn chmod_warning_fires_for_loose_file_with_file_key() {
-        let dir = slimcode_common::testutil::unique_temp_dir("chmod-loose");
+        let dir = slimcode_app::testutil::unique_temp_dir("chmod-loose");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         std::fs::write(&path, "[ai]\napi_key = \"sk-x\"\n").unwrap();
@@ -575,7 +575,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn chmod_warning_silent_for_tight_file() {
-        let dir = slimcode_common::testutil::unique_temp_dir("chmod-tight");
+        let dir = slimcode_app::testutil::unique_temp_dir("chmod-tight");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         std::fs::write(&path, "[ai]\napi_key = \"sk-x\"\n").unwrap();
@@ -586,7 +586,7 @@ mod tests {
 
     #[test]
     fn chmod_warning_silent_when_key_not_from_file() {
-        let dir = slimcode_common::testutil::unique_temp_dir("chmod-env");
+        let dir = slimcode_app::testutil::unique_temp_dir("chmod-env");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         std::fs::write(&path, "[ai]\napi_key = \"sk-x\"\n").unwrap();
@@ -596,7 +596,7 @@ mod tests {
 
     #[test]
     fn chmod_warning_silent_when_config_missing() {
-        let dir = slimcode_common::testutil::unique_temp_dir("chmod-missing");
+        let dir = slimcode_app::testutil::unique_temp_dir("chmod-missing");
         let path = dir.join("config.toml");
         assert_eq!(chmod_warning(&path, config::ApiKeySource::File), None);
     }

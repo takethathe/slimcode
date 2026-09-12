@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/ai", "crates/agent", "crates/common", "crates/cli", "crates/commands", "crates/tui"]
+members = ["crates/ai", "crates/core", "crates/app", "crates/cli", "crates/commands", "crates/tui"]
 
 [workspace.package]
 version = "0.1.0"
@@ -9,7 +9,7 @@ license = "MIT"
 
 [workspace.dependencies]
 slimcode-ai = { path = "crates/ai" }
-slimcode-agent = { path = "crates/agent" }
-slimcode-common = { path = "crates/common" }
+slimcode-core = { path = "crates/core" }
+slimcode-app = { path = "crates/app" }
 slimcode-commands = { path = "crates/commands" }
 slimcode-tui = { path = "crates/tui" }

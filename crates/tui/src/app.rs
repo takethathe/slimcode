@@ -15,12 +15,12 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use slimcode_agent::agent::StopReason;
-use slimcode_commands::{COMMANDS, find};
-use slimcode_common::render::{DisplayItem, Renderer, usage_summary};
-use slimcode_common::skills::{
+use slimcode_app::render::{DisplayItem, Renderer, usage_summary};
+use slimcode_app::skills::{
     CompletionItem, Skill, SkillScope, combined_suggestions, complete, find_skill,
 };
+use slimcode_commands::{COMMANDS, find};
+use slimcode_core::agent::StopReason;
 use tui_textarea::{CursorMove, TextArea};
 use unicode_width::UnicodeWidthChar;
 
@@ -1697,8 +1697,8 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
     use slimcode_ai::wire::TokenUsage;
-    use slimcode_common::history::{HISTORY_DISPLAY, render_history};
-    use slimcode_common::skills::{Skill, SkillScope};
+    use slimcode_app::history::{HISTORY_DISPLAY, render_history};
+    use slimcode_app::skills::{Skill, SkillScope};
 
     // --- helpers -----------------------------------------------------------
 

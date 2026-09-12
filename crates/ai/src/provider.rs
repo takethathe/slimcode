@@ -12,8 +12,8 @@ use std::time::Duration;
 use crate::config::BailianConfig;
 use crate::wire;
 use crate::wire::{PromptTokensDetails, TokenUsage};
-use slimcode_agent::agent::{CancelToken, Delta, Provider, Tool};
-use slimcode_agent::session::Message;
+use slimcode_core::agent::{CancelToken, Delta, Provider, Tool};
+use slimcode_core::session::Message;
 
 /// Sum a usage sample into an accumulator (pure, unit-testable). Cache-hit
 /// details (`prompt_tokens_details`) accumulate alongside the three headline
@@ -188,8 +188,8 @@ impl Provider for BailianProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use slimcode_agent::agent::FinishReason;
-    use slimcode_agent::session::Role;
+    use slimcode_core::agent::FinishReason;
+    use slimcode_core::session::Role;
     use std::io::Cursor;
 
     /// A reader handing out at most `chunk_size` bytes per `read` call.
@@ -351,7 +351,7 @@ mod tests {
     }
 
     // --- usage accumulation + live smoke (existing suite) ------------------
-    use slimcode_common::config::{
+    use slimcode_app::config::{
         DEFAULT_BASE_URL, DEFAULT_MODEL, ENV_API_KEY, ENV_BASE_URL, ENV_MODEL,
     };
 

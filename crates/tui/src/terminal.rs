@@ -27,19 +27,17 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use slimcode_agent::agent::{CancelToken, RunConfig, StopReason, Tool};
-use slimcode_agent::session::{Message, MessageStopReason, Part, Role, Session};
 use slimcode_ai::{BailianConfig, BailianProvider};
-use slimcode_common::context::{ContextBuilder, Environment};
-use slimcode_common::context_files::ContextFile;
-use slimcode_common::history::{
-    HISTORY_DISPLAY, HistoryStore, render_history, resolve_replay_index,
-};
-use slimcode_common::render::{DisplayItem, Renderer};
-use slimcode_common::session::{SessionStore, infer_title};
-use slimcode_common::skills::{
+use slimcode_app::context::{ContextBuilder, Environment};
+use slimcode_app::context_files::ContextFile;
+use slimcode_app::history::{HISTORY_DISPLAY, HistoryStore, render_history, resolve_replay_index};
+use slimcode_app::render::{DisplayItem, Renderer};
+use slimcode_app::session::{SessionStore, infer_title};
+use slimcode_app::skills::{
     SkillScope, SkillStore, find_skill, is_builtin_command, parse_install_args,
 };
+use slimcode_core::agent::{CancelToken, RunConfig, StopReason, Tool};
+use slimcode_core::session::{Message, MessageStopReason, Part, Role, Session};
 
 use crate::app::{App, Effect};
 use crate::footer::FooterUsage;
@@ -67,7 +65,7 @@ pub fn run(
     // One token shared by the cancellable tool set and every turn's worker:
     // Esc cancels whichever phase the run is in (ticket 07).
     let cancel = CancelToken::new();
-    let (provider, tools) = slimcode_common::setup::setup_with_cancel(cwd, config, &cancel)?;
+    let (provider, tools) = slimcode_app::setup::setup_with_cancel(cwd, config, &cancel)?;
     let session = store.new_session();
     let mut ui = match Tui::new(
         provider,
@@ -518,7 +516,7 @@ impl<'a> Tui<'a> {
 
         let worker = thread::scope(|scope| {
             let handle = scope.spawn(move || {
-                let result = slimcode_common::runner::run_turn(
+                let result = slimcode_app::runner::run_turn(
                     &mut provider,
                     &tools,
                     messages,
@@ -689,10 +687,10 @@ fn restore_terminal() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use slimcode_agent::agent::{Delta, FinishReason, Provider, RunConfig, StopReason, Tool};
-    use slimcode_agent::session::{Message, Role};
-    use slimcode_common::render::DisplayItem;
-    use slimcode_common::runner::run_turn;
+    use slimcode_app::render::DisplayItem;
+    use slimcode_app::runner::run_turn;
+    use slimcode_core::agent::{Delta, FinishReason, Provider, RunConfig, StopReason, Tool};
+    use slimcode_core::session::{Message, Role};
 
     // A scripted provider, mirroring the agent crate's FakeProvider: each
     // `chat` call returns the next delta batch from the script.
@@ -706,7 +704,7 @@ mod tests {
             &mut self,
             _m: &[Message],
             _tools: &[Tool],
-            _cancel: &slimcode_agent::agent::CancelToken,
+            _cancel: &slimcode_core::agent::CancelToken,
         ) -> Result<Vec<Delta>, String> {
             let d = self.script.get(self.calls).cloned().unwrap_or_default();
             self.calls += 1;
@@ -771,7 +769,7 @@ mod tests {
         let handle = thread::spawn(move || {
             let mut provider = provider;
             let tools = vec![weather_tool()];
-            let cancel = slimcode_agent::agent::CancelToken::new();
+            let cancel = slimcode_core::agent::CancelToken::new();
             let result = run_turn(
                 &mut provider,
                 &tools,

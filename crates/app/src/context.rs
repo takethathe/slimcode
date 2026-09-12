@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use slimcode_agent::session::{Message, Role};
+use slimcode_core::session::{Message, Role};
 
 use crate::context_files::{ContextFile, format_context_files};
 use crate::skills::{Skill, format_skills_for_prompt, skill_prompt};

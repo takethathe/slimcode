@@ -40,7 +40,7 @@ cargo workspace，六个 crate，唯一二进制 `slimcode`：
 | `crates/tui` | `slimcode-tui` | 终端图形库：`RenderItem` / `Effect` / `App`(new/apply/draw/handle_key) / `run(terminal, app, handler)` / `UiHandler` / 组件（theme/markdown/toolcall/footer/text/git） | **无 slimcode 依赖** |
 | `crates/cli` | `slimcode` | 唯一二进制 = 总入口：argv / 模式选择（one-shot 文本 vs 交互 TUI）/ 配置解析 / 服务构建 / 命令语义 / 会话落盘 / `TextRenderer` / `TuiAdapter` / 补全与文案 | → 全部 |
 
-重命名：`crates/agent` → `crates/core`、`crates/common` → `crates/app`。关键依赖反转：`Provider` trait 与 LLM `Message` 由 `ai` 拥有（现状是 `ai` 反向依赖 `agent`）。
+重命名：`crates/core` → `crates/core`、`crates/app` → `crates/app`。关键依赖反转：`Provider` trait 与 LLM `Message` 由 `ai` 拥有（现状是 `ai` 反向依赖 `core`）。
 
 依赖方向由测试断言（ticket 06，`crates/cli/tests/architecture.rs`）：`ai` 无 slimcode 依赖；`core` → 仅 `ai`；`app` → `ai`/`core`/`commands`；`tui` 无 slimcode 依赖；`cli` → 全部；`tui` 源码不得出现 `SessionStore`/`SkillStore`/`Config`。
 
@@ -51,15 +51,15 @@ cargo workspace，六个 crate：
 | crate | 包名 | 职责 | 状态 |
 | --- | --- | --- | --- |
 | `crates/ai` | `slimcode-ai` | 统一 LLM provider 层（Provider trait + OpenAI-compatible/Bailian） | 起步（Bailian provider + wire 模型） |
-| `crates/agent` | `slimcode-agent` | agent 运行时、工具、会话状态 | 起步（edit 引擎 + 运行时循环 + 消息模型） |
+| `crates/core` | `slimcode-core` | agent 运行时、工具、会话状态 | 起步（edit 引擎 + 运行时循环 + 消息模型） |
 | `crates/commands` | `slimcode-commands` | 前端无关的 `/` 命令注册表与预测提示 | v1 新增（registry + suggest/find） |
-| `crates/common` | `slimcode-common` | 前端无关的应用模块（配置解析 / 会话与输入历史持久化 / skills 发现与安装 / 上下文组装 / 七工具绑定 / 共享渲染模型与 turn runner / setup seam） | v1 新增（自 cli 抽出 + TUI 共享 seam） |
+| `crates/app` | `slimcode-app` | 前端无关的应用模块（配置解析 / 会话与输入历史持久化 / skills 发现与安装 / 上下文组装 / 七工具绑定 / 共享渲染模型与 turn runner / setup seam） | v1 新增（自 cli 抽出 + TUI 共享 seam） |
 | `crates/tui` | `slimcode-tui` | 交互式全屏 TUI（纯 App core + crossterm/ratatui 终端循环；theme/markdown/toolcall/footer/git 纯函数模块） | v1 完成（pi 对齐：header/blocks/layout/footer/status） |
 | `crates/cli` | `slimcode` | 二进制入口 + 非交互 one-shot 前端（共享 runner + TextRenderer） | v1 完成（render/main） |
 
 ### crates/ai Bailian provider
 
-实现 `agent::Provider` seam（ticket 04/05），栈与 serde 容忍清单自 ticket 01/02/05：
+实现 `core::Provider` seam（ticket 04/05），栈与 serde 容忍清单自 ticket 01/02/05：
 
 - **HTTP**：`reqwest 0.13` blocking（features `json` + `blocking` + `rustls`，`default-features=false`）。
   `Provider` trait 是同步 seam，真实阻塞边界收在 provider 内部，不引入 tokio；ticket 02 文档中 `stream` feature
@@ -78,7 +78,7 @@ cargo workspace，六个 crate：
   （`cached_tokens` / `cache_creation_input_tokens`，缺省视为 0；整块缺省为 None），
   访问器 `cached_tokens()` / `cache_creation_tokens()` 缺省返回 0；`accumulate_usage` 把两个缓存字段
   随 prompt/completion/total 一起并入 `total_usage`；汇总行措辞由
-  `common::render::usage_summary` 共享（cli 与 TUI 各渲染点都消费它，两端不漂移）；
+  `app::render::usage_summary` 共享（cli 与 TUI 各渲染点都消费它，两端不漂移）；
 - **serde 容忍清单**（全部不设 `deny_unknown_fields`，未知字段自动忽略）：
   - `reasoning_content`：思考模型每个 chunk 都带，`Option<String>`；
   - `usage`：key 每 chunk 都在但多为 `null`，`Option<TokenUsage>`（解析后进入 `last_usage` / `total_usage`）；
@@ -88,12 +88,12 @@ cargo workspace，六个 crate：
 - **tool_call 拼接**：首片段带 `id`/`name`（`arguments: ""`）→ `ToolCallStart`，续传只有 `index`+`arguments` → `ToolCallArgs`，按 index 拼接；
 - **配置**：`BailianConfig` 为纯 provider 数据（api key / base URL / model / cache，保留
   `chat_completions_url()`）。四层优先级解析、env 变量名与默认值（`DEFAULT_BASE_URL` /
-  `DEFAULT_MODEL`）的唯一 owner 是 `slimcode-common::config`（frontend overrides > env >
+  `DEFAULT_MODEL`）的唯一 owner 是 `slimcode-app::config`（frontend overrides > env >
   `config.toml` > 默认值），产出 `BailianConfig`；ai 不再提供 `from_env`，消除与 cli 重复
   解析同一组 env/默认值的问题；
 - 两个 `#[ignore]` 冒烟测试（文本 + 工具调用）需真实 key + 网络，默认跳过，一次性手动验证已通过。
 
-### crates/agent 工具
+### crates/core 工具
 
 - `tools::edit`：`edit` 工具引擎（纯函数，无文件 I/O）。语义锁定自 `.scratch/slimcode-v1` ticket 03：
   - 一次调用多个**不相交** edit，全部匹配**原始**内容（非增量），按 offset 逆序应用；
@@ -103,7 +103,7 @@ cargo workspace，六个 crate：
   - **轻量 fuzzy（选项 C）**：exact 优先，找不到时仅做每行 `trim_end` 归一重试（不做 NFKC/智能引号折叠），命中后按行回映射、未触碰行保留原始字节；
   - 成功返回 `{ new_content, replaced_blocks, diff, first_changed_line }`（替换块数、带行号 diff、首个变更行）。
 
-### crates/agent 会话模型（`session`）
+### crates/core 会话模型（`session`）
 
 消息/会话数据模型，折入自 ticket 04（ADR-0009 起扩展了日志专用字段）：
 
@@ -116,7 +116,7 @@ cargo workspace，六个 crate：
 - `Session { id, created_at, messages, title }` 包一层元数据（为 `~/.slimcode/sessions/` 准备）；
 - JSON 边界：`tool_calls`/`tool_call_id` 缺省时省略，整图无损 round-trip。
 
-### crates/agent 运行时循环（`agent`）
+### crates/core 运行时循环（`core`）
 
 折入自 ticket 04 原型，决策：
 
@@ -153,10 +153,10 @@ cargo workspace，六个 crate：
   纯函数、无依赖、可独立单测，供 `/` 补全弹框的候选排序使用。
 
 这里只登记**内置**命令；安装的 **skill** 是另一组动态 `/` 触发
-（`slimcode-common::skills`），前端在预测部分 `/` 输入时把两者合并
-（`combined_suggestions`，同样在 `slimcode-common::skills`）。
+（`slimcode-app::skills`），前端在预测部分 `/` 输入时把两者合并
+（`combined_suggestions`，同样在 `slimcode-app::skills`）。
 
-### crates/common 前端无关应用模块（`slimcode-common`）
+### crates/app 前端无关应用模块（`slimcode-app`）
 
 自 cli 抽出的前端无关 module，任何前端（one-shot CLI、TUI、未来 Web）可直接复用，不依赖终端
 二进制：
@@ -346,7 +346,7 @@ reducer + draw）、`terminal`（薄壳 + worker-thread runner）。分层：
   capture-pane 断言头部/色块 prompt/markdown 思考/工具块/spinner 动画（已嵌入上边框）/footer 两行/补全
   弹框/滚动/改尺寸 dock 固定/OSC 0 标题/Ctrl+C 退出/Esc 中途取消（spinner 消失、已流式
   partial 文本保留、无错误文本、下一 prompt 正常运行）。
-- **CLI 并行不变**：one-shot 前端字节不变地复用 `common`（`render::map_event` 共享；
+- **CLI 并行不变**：one-shot 前端字节不变地复用 `app`（`render::map_event` 共享；
   TUI 的 `DisplayItem::Usage` 在前端侧消费、绝不出自 `map_event`，/usage 汇总措辞与
   CLI 共用 `usage_summary`）。
 
@@ -359,7 +359,7 @@ reducer + draw）、`terminal`（薄壳 + worker-thread runner）。分层：
 - `slimcode config`：第一个参数为 `config` 时特判为子命令（先于 prompt 解析）→
   `config_cmd` 模块（交互壳 + 写回）：stdin/stdout 行输入逐项询问缺失的
   model / base_url / api_key（已有值显示为默认、回车保留），合并核心是
-  `common::config::merge_config_toml` 纯函数，写回后（Unix）若含 api_key 则
+  `app::config::merge_config_toml` 纯函数，写回后（Unix）若含 api_key 则
   chmod 600 并打印文件路径；非 TTY / 多余参数报错；不处理 cache（保持手动编辑）；
 - **one-shot**：`slimcode "<prompt>"`（可 `--cwd <dir>`、`--model <model>`、
   `--base-url <url>`、`--api-key <key>`）经共享 `ContextBuilder` 组装消息列表（新会话首轮前置系统
@@ -376,12 +376,12 @@ reducer + draw）、`terminal`（薄壳 + worker-thread runner）。分层：
 模块：
 
 - `render`：`TextRenderer`（`Renderer` trait 的文本实现）——把共享 `DisplayItem` 流（流式文本 / 流式思考 / 结构行 / 用量汇总）渲染为终端输出，原始 tool_call delta 与
-  `Done` 事件被抑制；流式文本与思考（带 `> ` 前缀）按 delta 拼接、不逐 delta 换行，换行只来自内容本身的 `\n`，结构行（工具开始/结果、停止标记、turn 标记）总是另起一行；事件→DisplayItem 的映射是共享的 `common::render::map_event`，
+  `Done` 事件被抑制；流式文本与思考（带 `> ` 前缀）按 delta 拼接、不逐 delta 换行，换行只来自内容本身的 `\n`，结构行（工具开始/结果、停止标记、turn 标记）总是另起一行；事件→DisplayItem 的映射是共享的 `app::render::map_event`，
   cli 不再各自实现（见 ADR-0004）；
-- provider + 工具构造经 `common::setup::setup` 与 TUI 共享，两端不会漂移。
+- provider + 工具构造经 `app::setup::setup` 与 TUI 共享，两端不会漂移。
 
 交互能力（历史 recall、`/` 命令、skills、`/new`、`/load`、`/exit`）已整体移入
 TUI（`slimcode-tui`，见上节），行式 REPL 已移除（见 ADR-0003）。
 
-agent crate 的 `agent` 模块 `pub use session::{Message, Role, ToolCall}`，CLI 统一从
-`slimcode_agent::agent` 引用消息类型。
+core crate 的 `core` 模块 `pub use session::{Message, Role, ToolCall}`，CLI 统一从
+`slimcode_core::agent` 引用消息类型。

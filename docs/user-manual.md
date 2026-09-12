@@ -181,7 +181,7 @@ recall 状态下按 `Enter` 会把选中的历史 prompt 作为**新一轮**运�
 - 输入 `/` 后无候选时弹框不显示。
 
 弹框只在前端 TUI 出现；命令定义、模糊匹配与候选合并都在前端无关的
-`slimcode-commands` / `slimcode-common` 中（见 ADR-0005），匹配逻辑可独立单测。
+`slimcode-commands` / `slimcode-app` 中（见 ADR-0005），匹配逻辑可独立单测。
 
 **命令**（与行式 REPL 相同的 `/` 命令集，经共享命令注册表 `slimcode-commands`）：
 

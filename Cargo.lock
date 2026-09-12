@@ -1358,19 +1358,11 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 name = "slimcode"
 version = "0.1.0"
 dependencies = [
- "slimcode-agent",
  "slimcode-ai",
+ "slimcode-app",
  "slimcode-commands",
- "slimcode-common",
+ "slimcode-core",
  "slimcode-tui",
-]
-
-[[package]]
-name = "slimcode-agent"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -1380,8 +1372,20 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "slimcode-agent",
- "slimcode-common",
+ "slimcode-app",
+ "slimcode-core",
+]
+
+[[package]]
+name = "slimcode-app"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "slimcode-ai",
+ "slimcode-commands",
+ "slimcode-core",
+ "toml",
 ]
 
 [[package]]
@@ -1389,15 +1393,11 @@ name = "slimcode-commands"
 version = "0.1.0"
 
 [[package]]
-name = "slimcode-common"
+name = "slimcode-core"
 version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
- "slimcode-agent",
- "slimcode-ai",
- "slimcode-commands",
- "toml",
 ]
 
 [[package]]
@@ -1408,10 +1408,10 @@ dependencies = [
  "pulldown-cmark",
  "ratatui",
  "serde_json",
- "slimcode-agent",
  "slimcode-ai",
+ "slimcode-app",
  "slimcode-commands",
- "slimcode-common",
+ "slimcode-core",
  "tui-textarea",
  "unicode-width 0.2.0",
 ]
