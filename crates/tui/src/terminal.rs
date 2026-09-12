@@ -28,7 +28,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use slimcode_ai::{BailianConfig, BailianProvider};
-use slimcode_app::context::{ContextBuilder, Environment};
+use slimcode_app::context::{Context, ContextBuilder, Environment};
 use slimcode_app::context_files::ContextFile;
 use slimcode_app::history::{HISTORY_DISPLAY, HistoryStore, render_history, resolve_replay_index};
 use slimcode_app::render::{DisplayItem, Renderer};
@@ -37,7 +37,7 @@ use slimcode_app::skills::{
     SkillScope, SkillStore, find_skill, is_builtin_command, parse_install_args,
 };
 use slimcode_core::agent::{CancelToken, RunConfig, StopReason, Tool};
-use slimcode_core::session::{Message, MessageStopReason, Part, Role, Session};
+use slimcode_core::session::{AgentMessage, MessageStopReason, Role, Session};
 
 use crate::app::{App, Effect};
 use crate::footer::FooterUsage;
@@ -105,7 +105,7 @@ fn set_title(session_id: &str, cwd: &Path) {
 /// append failures the worker collected (persistence is best-effort).
 struct TurnOutcome {
     session: Session,
-    result: Result<(Vec<Message>, StopReason), String>,
+    result: Result<(Vec<AgentMessage>, StopReason), String>,
     appended: usize,
     append_errors: Vec<String>,
 }
@@ -341,7 +341,6 @@ impl<'a> Tui<'a> {
     /// message sequence.
     fn submit_prompt(&mut self, prompt: String, record: bool) -> Result<(), String> {
         let skills = self.skills.list().unwrap_or_default();
-        let first_turn = self.session.messages.is_empty();
         let context = ContextBuilder::new()
             .with_environment(self.environment.clone())
             .with_context_files(&self.context_files)
@@ -349,14 +348,16 @@ impl<'a> Tui<'a> {
             .with_history(self.session.messages.clone())
             .with_user_prompt(&prompt)
             .build()?;
-        // This turn's new messages are the tail of the context: the system
-        // message on the first turn only, then the user prompt.
-        let new_count = if first_turn { 2 } else { 1 };
-        for msg in &context[context.len() - new_count..] {
-            self.session.messages.push(msg.clone());
-            if let Err(e) = self.store.append(&self.session, msg) {
-                self.app.push_notice(format!("session log: {e}"));
-            }
+        // A turn adds exactly one message to history — the user prompt. The
+        // system prompt is assembled per turn and never stored (ADR-0012 D3).
+        let prompt_msg = context
+            .messages
+            .last()
+            .expect("context always has a prompt message")
+            .clone();
+        self.session.messages.push(prompt_msg.clone());
+        if let Err(e) = self.store.append(&self.session, &prompt_msg) {
+            self.app.push_notice(format!("session log: {e}"));
         }
         let record = if record { Some(prompt.as_str()) } else { None };
         self.finish_turn(context, record)
@@ -384,7 +385,6 @@ impl<'a> Tui<'a> {
             self.app.push_error(format!("no such skill: /{name}"));
             return Ok(());
         };
-        let first_turn = self.session.messages.is_empty();
         let context = ContextBuilder::new()
             .with_environment(self.environment.clone())
             .with_context_files(&self.context_files)
@@ -392,12 +392,14 @@ impl<'a> Tui<'a> {
             .with_history(self.session.messages.clone())
             .with_skill(skill, arg)
             .build()?;
-        let new_count = if first_turn { 2 } else { 1 };
-        for msg in &context[context.len() - new_count..] {
-            self.session.messages.push(msg.clone());
-            if let Err(e) = self.store.append(&self.session, msg) {
-                self.app.push_notice(format!("session log: {e}"));
-            }
+        let prompt_msg = context
+            .messages
+            .last()
+            .expect("context always has a prompt message")
+            .clone();
+        self.session.messages.push(prompt_msg.clone());
+        if let Err(e) = self.store.append(&self.session, &prompt_msg) {
+            self.app.push_notice(format!("session log: {e}"));
         }
         self.finish_turn(context, None)
     }
@@ -410,10 +412,10 @@ impl<'a> Tui<'a> {
     /// closes the log with a short assistant message (`stop_reason` =
     /// `error`/`aborted`); a turn that never produced an assistant message
     /// leaves no log at all (ADR-0009 D5).
-    fn finish_turn(&mut self, context: Vec<Message>, record: Option<&str>) -> Result<(), String> {
+    fn finish_turn(&mut self, context: Context, record: Option<&str>) -> Result<(), String> {
         let title_was_none = self.session.title.is_none();
         if title_was_none {
-            self.session.title = infer_title(&context);
+            self.session.title = infer_title(&context.messages);
         }
         // A title that only became known now (e.g. a restored session whose
         // earlier turn had an empty prompt) must reach the log: the log may
@@ -466,24 +468,21 @@ impl<'a> Tui<'a> {
     }
 
     /// Close the log after a failed/cancelled turn: an assistant message with
-    /// a short, non-empty text and the failure's `stop_reason` enters memory
-    /// and is appended, so the live session adopts the partial turn and the
-    /// log ends on an assistant boundary (ADR-0009 D3).
+    /// a short, non-empty text enters memory and is appended, so the live
+    /// session adopts the partial turn and the log ends on an assistant
+    /// boundary (ADR-0009 D3). The turn's reason rides the record envelope
+    /// (ADR-0012 D4), never the message payload.
     fn close_turn(&mut self, reason: MessageStopReason, error: Option<String>) {
         let text = match &error {
             Some(e) => format!("The turn ended with an error: {e}"),
             None => "The turn was cancelled.".to_string(),
         };
-        let message = Message {
-            role: Role::Assistant,
-            parts: vec![Part::Text { text }],
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            stop_reason: Some(reason),
-            error,
-        };
+        let message = AgentMessage::text(Role::Assistant, text);
         self.session.messages.push(message.clone());
-        if let Err(e) = self.store.append(&self.session, &message) {
+        if let Err(e) =
+            self.store
+                .append_closing(&self.session, &message, &reason, error.as_deref())
+        {
             self.app.push_notice(format!("session log: {e}"));
         }
     }
@@ -501,7 +500,7 @@ impl<'a> Tui<'a> {
     /// reset here so every turn starts uncancelled); all other keys are
     /// ignored while running. The provider and tools are always restored
     /// before returning.
-    fn drive_turn(&mut self, messages: Vec<Message>) -> Result<TurnOutcome, String> {
+    fn drive_turn(&mut self, context: Context) -> Result<TurnOutcome, String> {
         self.cancel.reset();
         self.app.set_running(true);
         let cfg = RunConfig::default();
@@ -519,11 +518,11 @@ impl<'a> Tui<'a> {
                 let result = slimcode_app::runner::run_turn(
                     &mut provider,
                     &tools,
-                    messages,
+                    context,
                     &cfg,
                     &cancel,
                     &mut ChannelRenderer { tx },
-                    &mut |msg: &Message| -> Result<(), String> {
+                    &mut |msg: &AgentMessage| -> Result<(), String> {
                         // The message entered history: mirror it into the
                         // session clone and append it to the log. Persistence
                         // is best-effort — a storage hiccup must not abort the
@@ -764,7 +763,9 @@ mod tests {
                 Delta::Done(FinishReason::Stop),
             ],
         ]);
-        let messages = vec![Message::text(Role::User, "hi")];
+        let system = Message::text(Role::System, "sys");
+        let messages = vec![AgentMessage::text(Role::User, "hi")];
+        let context = slimcode_app::context::Context { system, messages };
         let cfg = RunConfig::default();
         let (tx, rx) = mpsc::channel::<DisplayItem>();
 
@@ -775,7 +776,7 @@ mod tests {
             let result = run_turn(
                 &mut provider,
                 &tools,
-                messages,
+                context,
                 &cfg,
                 &cancel,
                 &mut ChannelRenderer { tx },
@@ -839,6 +840,6 @@ mod tests {
         // Two provider calls: the streaming+tool batch, then the answer batch.
         assert_eq!(calls, 2);
         // The final messages include the assistant turn + tool result.
-        assert!(updated.iter().any(|m| m.role == Role::Assistant));
+        assert!(updated.iter().any(|m| m.role() == &Role::Assistant));
     }
 }

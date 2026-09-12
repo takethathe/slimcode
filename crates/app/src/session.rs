@@ -33,7 +33,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use slimcode_core::session::{Message, Role, Session};
+use slimcode_core::session::{AgentMessage, Message, MessageStopReason, Role, Session};
 
 /// Max title length before truncation.
 const TITLE_MAX: usize = 48;
@@ -122,11 +122,11 @@ pub fn now_rfc3339() -> String {
 }
 
 /// Infer a session title from the first user message (truncated).
-pub fn infer_title(messages: &[Message]) -> Option<String> {
+pub fn infer_title(messages: &[AgentMessage]) -> Option<String> {
     let text = messages
         .iter()
-        .find(|m| m.role == Role::User)
-        .map(Message::text_content)?;
+        .find(|m| m.role() == &Role::User)
+        .map(AgentMessage::text_content)?;
     let text = text.trim();
     if text.is_empty() {
         return None;
@@ -166,14 +166,47 @@ impl LogHeader {
     }
 }
 
-/// One record line after the header (ADR-0009 D4). Internally tagged on
-/// `type` so the log stays self-describing and future versions can skip
-/// unknown record types on read.
+/// One record line after the header (ADR-0009 D4, ADR-0012 D4). Internally
+/// tagged on `type` so the log stays self-describing and future versions can
+/// skip unknown record types on read. A message record carries the log-only
+/// `stop_reason` / `error` in the record envelope (omitted when absent).
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum LogRecord<'a> {
-    Message { message: &'a Message },
-    Title { title: &'a str },
+    Message {
+        message: &'a AgentMessage,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stop_reason: Option<&'a MessageStopReason>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<&'a str>,
+    },
+    Title {
+        title: &'a str,
+    },
+}
+
+impl<'a> LogRecord<'a> {
+    /// An ordinary message record (empty envelope).
+    fn message(message: &'a AgentMessage) -> Self {
+        Self::Message {
+            message,
+            stop_reason: None,
+            error: None,
+        }
+    }
+
+    /// A turn-closing message record: the reason lives in the envelope.
+    fn closing(
+        message: &'a AgentMessage,
+        stop_reason: &'a MessageStopReason,
+        error: Option<&'a str>,
+    ) -> Self {
+        Self::Message {
+            message,
+            stop_reason: Some(stop_reason),
+            error,
+        }
+    }
 }
 
 /// What a lenient log replay produced (ADR-0009 D3): the session plus how much
@@ -284,16 +317,47 @@ impl SessionStore {
     /// Nothing here validates or fsyncs (ADR-0009 D6) — appends are
     /// fire-and-forget; the store quota is enforced best-effort after each
     /// write.
-    pub fn append(&self, session: &Session, message: &Message) -> Result<Option<PathBuf>, String> {
+    pub fn append(
+        &self,
+        session: &Session,
+        message: &AgentMessage,
+    ) -> Result<Option<PathBuf>, String> {
+        self.append_with_envelope(session, message, None, None)
+    }
+
+    /// Append the assistant message that closes a failed/cancelled turn
+    /// (ADR-0009 D5, ADR-0012 D4): the log-only `stop_reason` / `error` ride
+    /// the record envelope, never the message payload.
+    pub fn append_closing(
+        &self,
+        session: &Session,
+        message: &AgentMessage,
+        stop_reason: &MessageStopReason,
+        error: Option<&str>,
+    ) -> Result<Option<PathBuf>, String> {
+        self.append_with_envelope(session, message, Some(stop_reason), error)
+    }
+
+    fn append_with_envelope(
+        &self,
+        session: &Session,
+        message: &AgentMessage,
+        stop_reason: Option<&MessageStopReason>,
+        error: Option<&str>,
+    ) -> Result<Option<PathBuf>, String> {
         let path = self.session_path(&session.id)?;
         if path.exists() {
-            let line = serde_json::to_string(&LogRecord::Message { message })
-                .map_err(|e| format!("serialize record: {e}"))?;
+            let record = match stop_reason {
+                Some(reason) => LogRecord::closing(message, reason, error),
+                None => LogRecord::message(message),
+            };
+            let line =
+                serde_json::to_string(&record).map_err(|e| format!("serialize record: {e}"))?;
             append_line(&path, &line)?;
             self.evict_over_quota(&session.id);
             return Ok(None);
         }
-        if message.role != Role::Assistant {
+        if message.role() != &Role::Assistant {
             // Nothing worth persisting yet: no file until the first assistant
             // message (ADR-0009 D5).
             return Ok(None);
@@ -312,8 +376,19 @@ impl SessionStore {
         if let Some(title) = &session.title {
             write_record(&mut file, &path, &LogRecord::Title { title })?;
         }
-        for m in &session.messages {
-            write_record(&mut file, &path, &LogRecord::Message { message: m })?;
+        // The closing call's envelope belongs to the message that was just
+        // pushed, i.e. the backlog's last one.
+        let last = session.messages.len().saturating_sub(1);
+        for (i, m) in session.messages.iter().enumerate() {
+            let record = if i == last {
+                match stop_reason {
+                    Some(reason) => LogRecord::closing(m, reason, error),
+                    None => LogRecord::message(m),
+                }
+            } else {
+                LogRecord::message(m)
+            };
+            write_record(&mut file, &path, &record)?;
         }
         drop(file);
         self.evict_over_quota(&session.id);
@@ -388,7 +463,7 @@ impl SessionStore {
         let mut skipped_records = 0usize;
         let mut repaired_tool_calls = 0usize;
         let mut title: Option<String> = None;
-        let mut messages: Vec<Message> = Vec::new();
+        let mut messages: Vec<AgentMessage> = Vec::new();
         let mut batch: Option<OpenBatch> = None;
 
         for line in record_lines {
@@ -401,37 +476,45 @@ impl SessionStore {
             };
             match record {
                 Record::Message(message) => {
-                    if message.role == Role::Assistant && !message.tool_calls.is_empty() {
+                    // A legacy system record is skipped on load (ADR-0012 D3):
+                    // the system prompt is rebuilt on the next turn. No log
+                    // rewrite, no version bump.
+                    if message.role() == &Role::System {
+                        continue;
+                    }
+                    if message.role() == &Role::Assistant && !message.tool_calls().is_empty() {
                         // A new tool batch starts; any previous dangling batch
                         // closes first (later results cannot repair it). The
                         // requested ids stay in tool_calls order (a Vec) so a
                         // dangling batch is repaired deterministically
                         // (ADR-0009 D3); the HashSet is only a membership test.
                         close_batch(&mut batch, &mut messages, &mut repaired_tool_calls);
-                        let ids: Vec<String> =
-                            message.tool_calls.iter().map(|tc| tc.id.clone()).collect();
+                        let ids: Vec<String> = message
+                            .tool_calls()
+                            .iter()
+                            .map(|tc| tc.id.clone())
+                            .collect();
                         let matched: HashSet<String> = HashSet::new();
                         batch = Some(OpenBatch { ids, matched });
                         messages.push(message);
-                    } else if message.role == Role::Tool {
+                    } else if message.role() == &Role::Tool {
                         // A result belongs to the open batch only when its id
                         // was actually requested; anything else is an orphan
                         // and is dropped (ADR-0009 D3).
                         let belongs = batch.as_ref().is_some_and(|b| {
                             message
-                                .tool_call_id
-                                .as_ref()
-                                .is_some_and(|id| b.ids.contains(id))
+                                .tool_call_id()
+                                .is_some_and(|id| b.ids.iter().any(|x| x == id))
                         });
                         if belongs {
-                            let id = message.tool_call_id.clone().unwrap();
+                            let id = message.tool_call_id().unwrap().to_string();
                             batch.as_mut().unwrap().matched.insert(id);
                             messages.push(message);
                         }
                     } else {
-                        // Any other message (user/system text, or an assistant
-                        // message without tool calls) closes a dangling batch,
-                        // then passes through.
+                        // Any other message (user text, or an assistant message
+                        // without tool calls) closes a dangling batch, then
+                        // passes through.
                         close_batch(&mut batch, &mut messages, &mut repaired_tool_calls);
                         messages.push(message);
                     }
@@ -578,9 +661,10 @@ fn seal_tail(path: &Path) -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// A replayed record line.
+/// A replayed record line. The record envelope's `stop_reason` / `error` are
+/// log-only metadata; the load replays the message itself and drops them.
 enum Record {
-    Message(Message),
+    Message(AgentMessage),
     Title(String),
 }
 
@@ -594,9 +678,7 @@ fn parse_record(line: &str) -> Result<Record, String> {
                 .get("message")
                 .cloned()
                 .ok_or_else(|| "message record without message".to_string())?;
-            let message: Message = serde_json::from_value(message)
-                .map_err(|e| format!("invalid message record: {e}"))?;
-            Ok(Record::Message(message))
+            Ok(Record::Message(parse_agent_message(message)?))
         }
         Some("title") => {
             let title = value
@@ -607,6 +689,20 @@ fn parse_record(line: &str) -> Result<Record, String> {
         }
         Some(other) => Err(format!("unknown record type {other:?}")),
         None => Err("record without a type".to_string()),
+    }
+}
+
+/// Parse a message record payload. Tagged payloads (`{"kind":"llm",…}`) are
+/// the current shape; a payload without `kind` is a legacy (pre-ADR-0012)
+/// record whose payload was a bare wire message (possibly with the log-only
+/// `stop_reason`/`error` fields inline, ignored here).
+fn parse_agent_message(value: Value) -> Result<AgentMessage, String> {
+    if value.get("kind").is_some() {
+        serde_json::from_value(value).map_err(|e| format!("invalid message record: {e}"))
+    } else {
+        let message: Message = serde_json::from_value(value)
+            .map_err(|e| format!("invalid legacy message record: {e}"))?;
+        Ok(AgentMessage::llm(message))
     }
 }
 
@@ -621,13 +717,17 @@ struct OpenBatch {
 /// Close a dangling batch: every requested call that never got a result is
 /// patched in memory with `Error: interrupted` (ADR-0009 D3) — in history
 /// order relative to the results that did arrive — and the batch is cleared.
-fn close_batch(batch: &mut Option<OpenBatch>, messages: &mut Vec<Message>, repaired: &mut usize) {
+fn close_batch(
+    batch: &mut Option<OpenBatch>,
+    messages: &mut Vec<AgentMessage>,
+    repaired: &mut usize,
+) {
     let Some(open) = batch.take() else {
         return;
     };
     for id in &open.ids {
         if !open.matched.contains(id) {
-            messages.push(Message::tool_result(id.clone(), "Error: interrupted"));
+            messages.push(AgentMessage::tool_result(id.clone(), "Error: interrupted"));
             *repaired += 1;
         }
     }
@@ -705,7 +805,7 @@ fn remove_empty_subdirs(base: &Path) {
 mod tests {
     use super::*;
     use crate::testutil::unique_temp_dir;
-    use slimcode_core::session::{MessageStopReason, Part, ToolCall};
+    use slimcode_core::session::{AgentMessage, Message, MessageStopReason, ToolCall};
     use std::time::Duration;
 
     /// Unique temp dir per test (tests run in parallel and must not share).
@@ -724,7 +824,7 @@ mod tests {
             id: id.to_string(),
             created_at: now_rfc3339(),
             title: None,
-            messages: vec![Message::text(Role::User, "hi")],
+            messages: vec![AgentMessage::text(Role::User, "hi")],
         }
     }
 
@@ -741,8 +841,8 @@ mod tests {
     }
 
     /// A message record line.
-    fn msg_line(m: &Message) -> String {
-        serde_json::to_string(&LogRecord::Message { message: m }).unwrap()
+    fn msg_line(m: &AgentMessage) -> String {
+        serde_json::to_string(&LogRecord::message(m)).unwrap()
     }
 
     /// A title record line.
@@ -800,9 +900,9 @@ mod tests {
     #[test]
     fn title_from_first_user_message_truncated() {
         let msgs = vec![
-            Message::text(Role::System, "be helpful"),
-            Message::text(Role::User, "short prompt"),
-            Message::text(Role::User, "second"),
+            AgentMessage::text(Role::System, "be helpful"),
+            AgentMessage::text(Role::User, "short prompt"),
+            AgentMessage::text(Role::User, "second"),
         ];
         assert_eq!(infer_title(&msgs).unwrap(), "short prompt");
     }
@@ -810,7 +910,7 @@ mod tests {
     #[test]
     fn title_truncates_long_prompts() {
         let long = "x".repeat(100);
-        let msgs = vec![Message::text(Role::User, &long)];
+        let msgs = vec![AgentMessage::text(Role::User, &long)];
         let t = infer_title(&msgs).unwrap();
         assert!(t.chars().count() <= TITLE_MAX + 1); // +1 for ellipsis
         assert!(t.ends_with('…'));
@@ -818,7 +918,7 @@ mod tests {
 
     #[test]
     fn title_none_without_user_message() {
-        let msgs = vec![Message::text(Role::System, "sys")];
+        let msgs = vec![AgentMessage::text(Role::System, "sys")];
         assert!(infer_title(&msgs).is_none());
     }
 
@@ -898,10 +998,7 @@ mod tests {
         let dir = temp_dir();
         let store = store(&dir);
         let mut session = store.new_session();
-        let sys = Message::text(Role::System, "be helpful");
-        let user = Message::text(Role::User, "hi");
-        session.messages.push(sys.clone());
-        assert!(store.append(&session, &sys).unwrap().is_none());
+        let user = AgentMessage::text(Role::User, "hi");
         session.messages.push(user.clone());
         assert!(store.append(&session, &user).unwrap().is_none());
         // No file exists before the first assistant message.
@@ -918,9 +1015,8 @@ mod tests {
             created_at: "2026-08-29T00:00:00Z".to_string(),
             title: Some("hello".to_string()),
             messages: vec![
-                Message::text(Role::System, "be helpful"),
-                Message::text(Role::User, "hi"),
-                Message::text(Role::Assistant, "hey!"),
+                AgentMessage::text(Role::User, "hi"),
+                AgentMessage::text(Role::Assistant, "hey!"),
             ],
         };
         let asst = session.messages.last().unwrap().clone();
@@ -929,7 +1025,7 @@ mod tests {
         let text = fs::read_to_string(&created).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         // header + title + the whole message backlog
-        assert_eq!(lines.len(), 1 + 1 + 3);
+        assert_eq!(lines.len(), 1 + 1 + 2);
         let v: Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(v["type"], "session");
         assert_eq!(v["v"], 1);
@@ -957,17 +1053,16 @@ mod tests {
             created_at: "2026-08-29T00:00:00Z".to_string(),
             title: None,
             messages: vec![
-                Message::text(Role::System, "sys"),
-                Message::text(Role::User, "hi"),
-                Message::text(Role::Assistant, "first reply"),
+                AgentMessage::text(Role::User, "hi"),
+                AgentMessage::text(Role::Assistant, "first reply"),
             ],
         };
-        let asst = session.messages[2].clone();
+        let asst = session.messages[1].clone();
         store.append(&session, &asst).unwrap();
-        let m4 = Message::text(Role::User, "again");
+        let m4 = AgentMessage::text(Role::User, "again");
         session.messages.push(m4.clone());
         store.append(&session, &m4).unwrap();
-        let m5 = Message::text(Role::Assistant, "second reply");
+        let m5 = AgentMessage::text(Role::Assistant, "second reply");
         session.messages.push(m5.clone());
         store.append(&session, &m5).unwrap();
         let lines: Vec<String> = fs::read_to_string(store.session_path("slimcode-1").unwrap())
@@ -976,10 +1071,10 @@ mod tests {
             .map(str::to_string)
             .collect();
         // header + one line per message, exactly
-        assert_eq!(lines.len(), 1 + 5);
+        assert_eq!(lines.len(), 1 + 4);
         assert_eq!(lines[1], msg_line(&session.messages[0]));
-        assert_eq!(lines[4], msg_line(&m4));
-        assert_eq!(lines[5], msg_line(&m5));
+        assert_eq!(lines[3], msg_line(&m4));
+        assert_eq!(lines[4], msg_line(&m5));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -988,7 +1083,7 @@ mod tests {
         let dir = temp_dir();
         let store = store(&dir);
         let mut session = session_with("slimcode-1");
-        let asst = Message::text(Role::Assistant, "hi");
+        let asst = AgentMessage::text(Role::Assistant, "hi");
         session.messages.push(asst.clone());
         store.append(&session, &asst).unwrap();
         store.append_title(&session, "first title").unwrap();
@@ -1019,12 +1114,9 @@ mod tests {
             id: "slimcode-1".to_string(),
             created_at: "2026-08-29T00:00:00Z".to_string(),
             title: None,
-            messages: vec![
-                Message::text(Role::System, "sys"),
-                Message::text(Role::User, "hi"),
-            ],
+            messages: vec![AgentMessage::text(Role::User, "hi")],
         };
-        let asst = Message::text(Role::Assistant, "hello");
+        let asst = AgentMessage::text(Role::Assistant, "hello");
         session.messages.push(asst.clone());
         store.append(&session, &asst).unwrap();
         let outcome = store.load("slimcode-1").unwrap();
@@ -1044,10 +1136,10 @@ mod tests {
             &path,
             &[
                 &raw_header("slimcode-1", "2026-08-29T00:00:00Z"),
-                &msg_line(&Message::text(Role::User, "hi")),
+                &msg_line(&AgentMessage::text(Role::User, "hi")),
                 "{ not json",                        // malformed
                 r#"{"type":"future_record","x":1}"#, // unknown type
-                &msg_line(&Message::text(Role::Assistant, "hello")),
+                &msg_line(&AgentMessage::text(Role::Assistant, "hello")),
             ],
         );
         let outcome = store.load("slimcode-1").unwrap();
@@ -1107,8 +1199,8 @@ mod tests {
         let partial = format!(
             "{}\n{}\n{}\n{{\"type\":\"mess",
             raw_header("slimcode-1", "2026-08-29T00:00:00Z"),
-            msg_line(&Message::text(Role::User, "hi")),
-            msg_line(&Message::text(Role::Assistant, "hello")),
+            msg_line(&AgentMessage::text(Role::User, "hi")),
+            msg_line(&AgentMessage::text(Role::Assistant, "hello")),
         );
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, partial).unwrap();
@@ -1118,7 +1210,7 @@ mod tests {
         // The torn tail was sealed with a newline so a later append stays
         // aligned on its own line.
         assert!(fs::read_to_string(&path).unwrap().ends_with('\n'));
-        let m = Message::text(Role::Assistant, "after");
+        let m = AgentMessage::text(Role::Assistant, "after");
         let mut sess = outcome.session.clone();
         sess.messages.push(m.clone());
         store.append(&sess, &m).unwrap();
@@ -1138,8 +1230,8 @@ mod tests {
         let content = format!(
             "{}\n{}\n{}",
             raw_header("slimcode-1", "2026-08-29T00:00:00Z"),
-            msg_line(&Message::text(Role::User, "hi")),
-            msg_line(&Message::text(Role::Assistant, "hello")),
+            msg_line(&AgentMessage::text(Role::User, "hi")),
+            msg_line(&AgentMessage::text(Role::Assistant, "hello")),
         );
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, content).unwrap();
@@ -1155,8 +1247,8 @@ mod tests {
         let dir = temp_dir();
         let store = store(&dir);
         let path = store.session_path("slimcode-1").unwrap();
-        let mut asst = Message::text(Role::Assistant, "");
-        asst.tool_calls = vec![
+        let mut wire = Message::text(Role::Assistant, "");
+        wire.tool_calls = vec![
             ToolCall {
                 id: "call_a".to_string(),
                 name: "t".to_string(),
@@ -1178,37 +1270,38 @@ mod tests {
                 arguments: "{}".to_string(),
             },
         ];
+        let asst = AgentMessage::Llm(wire);
         write_raw(
             &path,
             &[
                 &raw_header("slimcode-1", "2026-08-29T00:00:00Z"),
-                &msg_line(&Message::text(Role::System, "sys")),
-                &msg_line(&Message::text(Role::User, "hi")),
+                &msg_line(&AgentMessage::text(Role::System, "sys")),
+                &msg_line(&AgentMessage::text(Role::User, "hi")),
                 &msg_line(&asst),
-                &msg_line(&Message::tool_result("call_a", "{\"a\":1}")),
-                &msg_line(&Message::tool_result("call_c", "{\"c\":1}")),
+                &msg_line(&AgentMessage::tool_result("call_a", "{\"a\":1}")),
+                &msg_line(&AgentMessage::tool_result("call_c", "{\"c\":1}")),
                 // An orphan result: no batch ever requested this id — dropped.
-                &msg_line(&Message::tool_result("call_orphan", "x")),
+                &msg_line(&AgentMessage::tool_result("call_orphan", "x")),
             ],
         );
         let before = fs::read(&path).unwrap();
         let outcome = store.load("slimcode-1").unwrap();
         assert_eq!(outcome.repaired_tool_calls, 2);
         assert_eq!(outcome.skipped_records, 0);
-        // sys, user, asst, tool(a), tool(c), tool(b interrupted), tool(d
-        // interrupted) — the missing results land in history order after the
-        // results that did arrive, and the two repairs are in tool_calls
-        // order (deterministic: same file replays to the same history, ADR-0009
-        // D3).
+        // user, asst, tool(a), tool(c), tool(b interrupted), tool(d
+        // interrupted) — the legacy system record is skipped (ADR-0012 D3);
+        // the missing results land in history order after the results that did
+        // arrive, and the two repairs are in tool_calls order (deterministic:
+        // same file replays to the same history, ADR-0009 D3).
         let msgs = &outcome.session.messages;
-        assert_eq!(msgs.len(), 7);
-        assert_eq!(msgs[3].role, Role::Tool);
-        assert_eq!(msgs[3].tool_call_id.as_deref(), Some("call_a"));
-        assert_eq!(msgs[4].tool_call_id.as_deref(), Some("call_c"));
-        assert_eq!(msgs[5].tool_call_id.as_deref(), Some("call_b"));
+        assert_eq!(msgs.len(), 6);
+        assert_eq!(msgs[2].role(), &Role::Tool);
+        assert_eq!(msgs[2].tool_call_id(), Some("call_a"));
+        assert_eq!(msgs[3].tool_call_id(), Some("call_c"));
+        assert_eq!(msgs[4].tool_call_id(), Some("call_b"));
+        assert_eq!(msgs[4].text_content(), "Error: interrupted");
+        assert_eq!(msgs[5].tool_call_id(), Some("call_d"));
         assert_eq!(msgs[5].text_content(), "Error: interrupted");
-        assert_eq!(msgs[6].tool_call_id.as_deref(), Some("call_d"));
-        assert_eq!(msgs[6].text_content(), "Error: interrupted");
         // Repair is in memory only: the log bytes are untouched.
         assert_eq!(fs::read(&path).unwrap(), before);
         let _ = fs::remove_dir_all(&dir);
@@ -1219,31 +1312,29 @@ mod tests {
         let dir = temp_dir();
         let store = store(&dir);
         let path = store.session_path("slimcode-1").unwrap();
-        let mut asst = Message::text(Role::Assistant, "");
-        asst.tool_calls = vec![ToolCall {
+        let mut wire = Message::text(Role::Assistant, "");
+        wire.tool_calls = vec![ToolCall {
             id: "call_a".to_string(),
             name: "t".to_string(),
             arguments: "{}".to_string(),
         }];
+        let asst = AgentMessage::Llm(wire);
         write_raw(
             &path,
             &[
                 &raw_header("slimcode-1", "2026-08-29T00:00:00Z"),
-                &msg_line(&Message::text(Role::User, "hi")),
+                &msg_line(&AgentMessage::text(Role::User, "hi")),
                 &msg_line(&asst),
                 // The next assistant message closes the dangling batch before
                 // it is replayed itself.
-                &msg_line(&Message::text(Role::Assistant, "hello")),
+                &msg_line(&AgentMessage::text(Role::Assistant, "hello")),
             ],
         );
         let outcome = store.load("slimcode-1").unwrap();
         assert_eq!(outcome.repaired_tool_calls, 1);
         // user, asst, tool(interrupted), assistant(hello)
         assert_eq!(outcome.session.messages.len(), 4);
-        assert_eq!(
-            outcome.session.messages[2].tool_call_id.as_deref(),
-            Some("call_a")
-        );
+        assert_eq!(outcome.session.messages[2].tool_call_id(), Some("call_a"));
         assert_eq!(outcome.session.messages[3].text_content(), "hello");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1255,24 +1346,93 @@ mod tests {
         let mut session = session_with("slimcode-1");
         let user = session.messages[0].clone();
         store.append(&session, &user).unwrap(); // no-op pre-assistant
-        let closing = Message {
-            role: Role::Assistant,
-            parts: vec![Part::Text {
-                text: "The turn ended with an error: boom".to_string(),
-            }],
-            tool_calls: vec![],
-            tool_call_id: None,
-            stop_reason: Some(MessageStopReason::Error),
-            error: Some("boom".to_string()),
-        };
+        let closing = AgentMessage::text(Role::Assistant, "The turn ended with an error: boom");
         session.messages.push(closing.clone());
-        store.append(&session, &closing).unwrap();
+        store
+            .append_closing(&session, &closing, &MessageStopReason::Error, Some("boom"))
+            .unwrap();
+        // The reason lives in the record envelope, never in the message payload
+        // (ADR-0012 D4).
+        let text = fs::read_to_string(store.session_path("slimcode-1").unwrap()).unwrap();
+        let v: Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert_eq!(v["stop_reason"], "error");
+        assert_eq!(v["error"], "boom");
+        assert!(v["message"].get("stop_reason").is_none());
+        assert!(v["message"].get("error").is_none());
+        // Load replays the message itself; the envelope is metadata.
         let outcome = store.load("slimcode-1").unwrap();
         assert_eq!(outcome.session.messages, session.messages);
         let loaded = &outcome.session.messages[1];
-        assert_eq!(loaded.role, Role::Assistant);
-        assert_eq!(loaded.stop_reason, Some(MessageStopReason::Error));
-        assert_eq!(loaded.error.as_deref(), Some("boom"));
+        assert_eq!(loaded.role(), &Role::Assistant);
+        assert_eq!(loaded.text_content(), "The turn ended with an error: boom");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ordinary_message_record_omits_the_envelope() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let mut session = session_with("slimcode-1");
+        let asst = AgentMessage::text(Role::Assistant, "hey");
+        session.messages.push(asst.clone());
+        store.append(&session, &asst).unwrap();
+        let text = fs::read_to_string(store.session_path("slimcode-1").unwrap()).unwrap();
+        let v: Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert!(v.get("stop_reason").is_none());
+        assert!(v.get("error").is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_skips_a_legacy_system_record() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let path = store.session_path("slimcode-1").unwrap();
+        // A pre-ADR-0012 log: a system record (bare wire payload, with the
+        // log-only fields inline) precedes the user/assistant messages.
+        write_raw(
+            &path,
+            &[
+                &raw_header("slimcode-1", "2026-08-29T00:00:00Z"),
+                r#"{"type":"message","message":{"role":"system","parts":[{"type":"text","text":"be helpful"}]}}"#,
+                &msg_line(&AgentMessage::text(Role::User, "hi")),
+                &msg_line(&AgentMessage::text(Role::Assistant, "hello")),
+            ],
+        );
+        let outcome = store.load("slimcode-1").unwrap();
+        // The system record is skipped without being counted as a bad record,
+        // and the file is not rewritten.
+        assert_eq!(outcome.skipped_records, 0);
+        assert_eq!(outcome.session.messages.len(), 2);
+        assert!(
+            outcome
+                .session
+                .messages
+                .iter()
+                .all(|m| m.role() != &Role::System)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_accepts_a_legacy_bare_message_payload() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let path = store.session_path("slimcode-1").unwrap();
+        // Pre-ADR-0012 payloads had no `kind` tag and carried the log-only
+        // fields inline; they still load (the extra fields are ignored).
+        write_raw(
+            &path,
+            &[
+                &raw_header("slimcode-1", "2026-08-29T00:00:00Z"),
+                r#"{"type":"message","message":{"role":"user","parts":[{"type":"text","text":"hi"}]}}"#,
+                r#"{"type":"message","message":{"role":"assistant","parts":[{"type":"text","text":"boom"}],"stop_reason":"error","error":"boom"}}"#,
+            ],
+        );
+        let outcome = store.load("slimcode-1").unwrap();
+        assert_eq!(outcome.skipped_records, 0);
+        assert_eq!(outcome.session.messages.len(), 2);
+        assert_eq!(outcome.session.messages[1].text_content(), "boom");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1284,15 +1444,15 @@ mod tests {
         let a = store(&dir);
         let b = SessionStore::new(&dir, "proj-b", dir.join("home"));
         let mut s1 = session_with("slimcode-1-a");
-        let asst = Message::text(Role::Assistant, "hi");
+        let asst = AgentMessage::text(Role::Assistant, "hi");
         s1.messages.push(asst.clone());
         a.append(&s1, &asst).unwrap();
         let mut s2 = session_with("slimcode-2-b");
-        let asst = Message::text(Role::Assistant, "hi");
+        let asst = AgentMessage::text(Role::Assistant, "hi");
         s2.messages.push(asst.clone());
         b.append(&s2, &asst).unwrap();
         let mut s3 = session_with("slimcode-3-a");
-        let asst = Message::text(Role::Assistant, "hi");
+        let asst = AgentMessage::text(Role::Assistant, "hi");
         s3.messages.push(asst.clone());
         a.append(&s3, &asst).unwrap();
         assert_eq!(a.list().unwrap(), vec!["slimcode-1-a", "slimcode-3-a"]);
@@ -1309,13 +1469,13 @@ mod tests {
         // Another project's file must not be loadable either.
         let other = SessionStore::new(&dir, "proj-b", dir.join("home"));
         let mut s2 = session_with("slimcode-2-b");
-        let asst = Message::text(Role::Assistant, "hi");
+        let asst = AgentMessage::text(Role::Assistant, "hi");
         s2.messages.push(asst.clone());
         other.append(&s2, &asst).unwrap();
         // The current project's own file loads fine.
         let store = store(&dir);
         let mut s3 = session_with("slimcode-3-a");
-        let asst = Message::text(Role::Assistant, "hi");
+        let asst = AgentMessage::text(Role::Assistant, "hi");
         s3.messages.push(asst.clone());
         store.append(&s3, &asst).unwrap();
         assert!(store.load("slimcode-3-a").is_ok());
@@ -1329,7 +1489,7 @@ mod tests {
         let dir = temp_dir();
         let store = store(&dir);
         let mut s = session_with("slimcode-real");
-        let asst = Message::text(Role::Assistant, "hi");
+        let asst = AgentMessage::text(Role::Assistant, "hi");
         s.messages.push(asst.clone());
         store.append(&s, &asst).unwrap();
         // A directory whose name ends in `.jsonl` must not be listed.
@@ -1343,7 +1503,7 @@ mod tests {
         let dir = temp_dir();
         let store = store(&dir);
         let mut s = session_with("slimcode-jsonl");
-        let asst = Message::text(Role::Assistant, "hi");
+        let asst = AgentMessage::text(Role::Assistant, "hi");
         s.messages.push(asst.clone());
         store.append(&s, &asst).unwrap();
         // A legacy whole-file session stays invisible to the listing.
@@ -1362,7 +1522,7 @@ mod tests {
         fs::create_dir_all(&proj).unwrap();
         // A live log with an assistant message.
         let mut live = session_with("slimcode-live");
-        let asst = Message::text(Role::Assistant, "hello");
+        let asst = AgentMessage::text(Role::Assistant, "hello");
         live.messages.push(asst.clone());
         store.append(&live, &asst).unwrap();
         // A zero-byte log and a header-only residue (crash during creation).
@@ -1389,7 +1549,7 @@ mod tests {
         fs::write(dir.join("proj-a/slimcode-empty-a.jsonl"), "").unwrap();
         // A live log in another project must be untouched.
         let mut live = session_with("slimcode-keep-b");
-        let asst = Message::text(Role::Assistant, "hello");
+        let asst = AgentMessage::text(Role::Assistant, "hello");
         live.messages.push(asst.clone());
         b.append(&live, &asst).unwrap();
         // Legacy whole-file sessions are out of scope too.
@@ -1435,7 +1595,7 @@ mod tests {
         );
         // A create-triggering append enforces the quota.
         let mut session = session_with("slimcode-new");
-        let asst = Message::text(Role::Assistant, "hi");
+        let asst = AgentMessage::text(Role::Assistant, "hi");
         session.messages.push(asst.clone());
         store.append(&session, &asst).unwrap();
         // Oldest two (450+450) evicted to get the total ≤ half (500); the
@@ -1470,7 +1630,7 @@ mod tests {
             Duration::from_secs(2 * 3600),
         );
         let mut session = session_with("slimcode-new");
-        let asst = Message::text(Role::Assistant, "hi");
+        let asst = AgentMessage::text(Role::Assistant, "hi");
         session.messages.push(asst.clone());
         store.append(&session, &asst).unwrap();
         // Oldest first across both formats: the .jsonl (2h) then the legacy
@@ -1507,7 +1667,7 @@ mod tests {
             Duration::from_secs(3 * 3600),
         );
         let mut session = session_with("slimcode-a-new");
-        let asst = Message::text(Role::Assistant, "hi");
+        let asst = AgentMessage::text(Role::Assistant, "hi");
         session.messages.push(asst.clone());
         store.append(&session, &asst).unwrap();
         // All three old files (1800 bytes) are evicted, the active one stays,
@@ -1535,7 +1695,7 @@ mod tests {
             Duration::from_secs(3600),
         );
         let mut session = session_with("slimcode-new");
-        let asst = Message::text(Role::Assistant, "hi");
+        let asst = AgentMessage::text(Role::Assistant, "hi");
         session.messages.push(asst.clone());
         store.append(&session, &asst).unwrap();
         assert!(proj.join("slimcode-old.jsonl").exists());
@@ -1550,7 +1710,7 @@ mod tests {
         // append overshoots; the active session must still be kept.
         let store = store(&dir).with_max_bytes(100);
         let mut session = session_with("slimcode-new");
-        let asst = Message::text(Role::Assistant, "hi");
+        let asst = AgentMessage::text(Role::Assistant, "hi");
         session.messages.push(asst.clone());
         store.append(&session, &asst).unwrap();
         assert!(dir.join("proj-a/slimcode-new.jsonl").exists());

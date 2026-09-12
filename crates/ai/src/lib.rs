@@ -13,6 +13,6 @@ pub mod wire;
 
 pub use config::{BailianConfig, DEFAULT_BASE_URL, DEFAULT_MODEL};
 pub use llm::{CancelToken, Delta, FinishReason, Provider, ToolSpec};
-pub use message::{Message, MessageStopReason, Part, Role, ToolCall};
+pub use message::{Message, Part, Role, ToolCall};
 pub use provider::BailianProvider;
 pub use wire::TokenUsage;

@@ -82,7 +82,7 @@ fn run_once(
     // trigger is normalized to the `/{name}` form the model understands before
     // it becomes a user message (the TUI already embeds the skill content).
     let prompt = normalize_skill_trigger(prompt);
-    let messages = ContextBuilder::new()
+    let context = ContextBuilder::new()
         .with_environment(environment)
         .with_context_files(context_files)
         .with_skills(skills)
@@ -95,7 +95,7 @@ fn run_once(
     let (_updated, _stop) = slimcode_app::runner::run_turn(
         &mut provider,
         &tools,
-        messages,
+        context,
         &cfg,
         &cancel,
         &mut renderer,

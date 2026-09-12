@@ -7,11 +7,11 @@
 //! - `ToolCall { id, name, arguments }` — `arguments` keeps the raw JSON string
 //!   the model emitted; it is parsed only at execution time.
 //!
-//! JSON boundary: `tool_calls` and `tool_call_id` are omitted when absent so
-//! plain text messages stay compact; `stop_reason` and `error` (the log
-//! schema's turn-closing fields, ADR-0009 D5) are also omitted when absent, so
-//! an ordinary message serializes byte-identically to before. The whole graph
-//! round-trips losslessly.
+//! This is the wire shape only (ADR-0012 D1): the log-only `stop_reason` /
+//! `error` fields live in the session log's record envelope (`slimcode-app`),
+//! never on the message. JSON boundary: `tool_calls` and `tool_call_id` are
+//! omitted when absent so plain text messages stay compact, and the whole
+//! graph round-trips losslessly.
 
 use serde::{Deserialize, Serialize};
 
@@ -42,24 +42,7 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
-/// Why a message closed a turn (the session-log schema's `stop_reason` field,
-/// ADR-0009 D5). `stop` / `tool_calls` mirror the provider finish reasons;
-/// `error` / `aborted` mark a turn that failed or was cancelled, carried by the
-/// assistant message that closes the log. Omitted on ordinary messages.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MessageStopReason {
-    /// The model stopped with a final answer.
-    Stop,
-    /// The model requested tools.
-    ToolCalls,
-    /// The turn ended because of an error.
-    Error,
-    /// The turn was cancelled (Esc).
-    Aborted,
-}
-
-/// One message in the conversation history.
+/// One LLM-visible message: the wire shape the provider sees.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
@@ -68,14 +51,6 @@ pub struct Message {
     pub tool_calls: Vec<ToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
-    /// Why this message closed a turn (log schema, ADR-0009 D5). `None` on
-    /// ordinary messages; wire-invisible (the provider mapping ignores it).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stop_reason: Option<MessageStopReason>,
-    /// Error text carried by a failure-closing message
-    /// (`stop_reason == Some(MessageStopReason::Error)`). Wire-invisible.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
 }
 
 impl Message {
@@ -88,8 +63,6 @@ impl Message {
             }],
             tool_calls: Vec::new(),
             tool_call_id: None,
-            stop_reason: None,
-            error: None,
         }
     }
 
@@ -102,8 +75,6 @@ impl Message {
             }],
             tool_calls: Vec::new(),
             tool_call_id: Some(id.into()),
-            stop_reason: None,
-            error: None,
         }
     }
 
@@ -163,49 +134,15 @@ mod tests {
             ],
             tool_calls: vec![],
             tool_call_id: None,
-            stop_reason: None,
-            error: None,
         };
         assert_eq!(m.text_content(), "ab");
     }
 
     #[test]
-    fn stop_reason_and_error_round_trip_and_are_omitted_when_absent() {
-        let closing = Message {
-            role: Role::Assistant,
-            parts: vec![Part::Text {
-                text: "The turn ended with an error: boom".into(),
-            }],
-            tool_calls: vec![],
-            tool_call_id: None,
-            stop_reason: Some(MessageStopReason::Error),
-            error: Some("boom".to_string()),
-        };
-        let json = serde_json::to_string(&closing).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["stop_reason"], "error");
-        assert_eq!(v["error"], "boom");
-        let back: Message = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, closing);
-
-        // Every stop reason value round-trips.
-        for reason in [
-            MessageStopReason::Stop,
-            MessageStopReason::ToolCalls,
-            MessageStopReason::Error,
-            MessageStopReason::Aborted,
-        ] {
-            let mut m = Message::text(Role::Assistant, "x");
-            m.stop_reason = Some(reason.clone());
-            let back: Message = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
-            assert_eq!(back.stop_reason, Some(reason));
-        }
-    }
-
-    #[test]
-    fn ordinary_message_serializes_without_new_fields() {
-        // An ordinary message (both new fields None) keeps the exact byte
-        // shape of the pre-log model: the new fields are omitted, not empty.
+    fn message_serializes_without_log_only_fields() {
+        // The wire message has no `stop_reason`/`error` (ADR-0012 D4): those
+        // live in the session log record envelope. The payload keeps the exact
+        // byte shape of the pre-log model.
         let m = Message::text(Role::User, "hello");
         let v: serde_json::Value = serde_json::to_value(&m).unwrap();
         assert!(v.get("stop_reason").is_none());
@@ -214,5 +151,15 @@ mod tests {
         let old = r#"{"role":"user","parts":[{"type":"text","text":"hello"}]}"#;
         let back: Message = serde_json::from_str(old).unwrap();
         assert_eq!(back, m);
+    }
+
+    #[test]
+    fn message_tolerates_legacy_log_only_fields() {
+        // A session written before the split carried `stop_reason`/`error` on
+        // the message; reading it as a wire message ignores them.
+        let legacy = r#"{"role":"assistant","parts":[{"type":"text","text":"x"}],"stop_reason":"error","error":"boom"}"#;
+        let m: Message = serde_json::from_str(legacy).unwrap();
+        assert_eq!(m.role, Role::Assistant);
+        assert_eq!(m.text_content(), "x");
     }
 }

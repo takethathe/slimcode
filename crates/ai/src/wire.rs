@@ -385,7 +385,7 @@ pub fn parse_stream(body: &str) -> Result<ParsedStream, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::{MessageStopReason, Role, ToolCall};
+    use crate::message::{Role, ToolCall};
 
     const TEXT_STREAM: &str = concat!(
         "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",",
@@ -623,13 +623,11 @@ mod tests {
     }
 
     #[test]
-    fn message_to_wire_ignores_log_only_fields() {
-        // `stop_reason` and `error` are log-schema fields (ADR-0009 D5): they
-        // must never leak onto the provider wire. The failure-closing assistant
-        // message still goes out as plain assistant text.
-        let mut m = Message::text(Role::Assistant, "The turn ended with an error: boom");
-        m.stop_reason = Some(MessageStopReason::Error);
-        m.error = Some("boom".to_string());
+    fn message_to_wire_carries_no_log_only_fields() {
+        // The wire message has no `stop_reason`/`error` at all (ADR-0012 D4);
+        // the failure-closing assistant message still goes out as plain
+        // assistant text.
+        let m = Message::text(Role::Assistant, "The turn ended with an error: boom");
         let w = message_to_wire(&m, false);
         assert_eq!(w.role, "assistant");
         assert_eq!(

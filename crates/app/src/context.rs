@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use slimcode_core::session::{Message, Role};
+use slimcode_core::session::{AgentMessage, Message, Role};
 
 use crate::context_files::{ContextFile, format_context_files};
 use crate::skills::{Skill, format_skills_for_prompt, skill_prompt};
@@ -98,25 +98,37 @@ enum UserInput {
 /// Has this skill's `<skill name="...">` block already been injected into one
 /// of the history messages? Detected from the XML wrapper the trigger inserts,
 /// so the check is stateless and survives session reloads.
-fn skill_loaded_in(history: &[Message], skill: &Skill) -> bool {
+fn skill_loaded_in(history: &[AgentMessage], skill: &Skill) -> bool {
     let marker = format!("<skill name=\"{}\"", skill.name);
     history.iter().any(|m| m.text_content().contains(&marker))
 }
 
-/// A fluent builder for one turn's message list.
+/// One turn's assembled context (ADR-0012 D3): the system message is
+/// assembled fresh from live state and handed to the runtime separately; only
+/// the `messages` (history plus this turn's prompt) ever enter a Session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Context {
+    /// The system message for this turn — never stored in a Session.
+    pub system: Message,
+    /// The history plus this turn's user message (prompt or skill trigger).
+    pub messages: Vec<AgentMessage>,
+}
+
+/// A fluent builder for one turn's context.
 ///
 /// Components are optional and added as needed: the system prompt defaults to
 /// [`DEFAULT_SYSTEM_PROMPT`] (overridable via [`ContextBuilder::with_system`]),
 /// environment info and context files are injected only when supplied, and a
-/// non-empty history is never re-seeded. `build()` returns the assembled
-/// `Vec<Message>`, ready for `run_agent_from_messages`.
+/// non-empty history is kept as-is. `build()` returns a [`Context`] whose
+/// system message is separate from the messages, so a turn adds only its
+/// prompt message to history.
 #[derive(Debug)]
 pub struct ContextBuilder {
     system: String,
     environment: Option<Environment>,
     skills: Vec<Skill>,
     context_files: Vec<ContextFile>,
-    history: Vec<Message>,
+    history: Vec<AgentMessage>,
     user: Option<UserInput>,
 }
 
@@ -161,9 +173,9 @@ impl ContextBuilder {
         self
     }
 
-    /// Continue from an existing message history. A non-empty history is not
-    /// re-seeded with a system message.
-    pub fn with_history(mut self, history: Vec<Message>) -> Self {
+    /// Continue from an existing message history. The system message is not
+    /// part of it (ADR-0012 D3) and is assembled per request.
+    pub fn with_history(mut self, history: Vec<AgentMessage>) -> Self {
         self.history = history;
         self
     }
@@ -186,17 +198,18 @@ impl ContextBuilder {
         self
     }
 
-    /// Assemble the message list. Errors when no user content is set.
+    /// Assemble the turn's context. Errors when no user content is set.
     ///
     /// Semantics (aligned with the CLI's former `messages_for_prompt`):
-    /// - The final system text is the base system (default or overridden) plus
-    ///   the `## Skills` markdown index for auto-invokable skills.
-    /// - An empty history seeds exactly one leading `Role::System` message;
-    ///   a non-empty history is not re-seeded.
-    /// - A `Role::User` message (prompt or skill trigger) is appended last; a
-    ///   skill trigger whose `<skill name="...">` block already appears in the
-    ///   history is deduplicated (body replaced, base-dir reference kept).
-    pub fn build(self) -> Result<Vec<Message>, String> {
+    /// - The system message is the base system (default or overridden) plus
+    ///   the `## Environment` / `## Project context` / `## Skills` sections
+    ///   for whatever was supplied. It is returned separately and never enters
+    ///   the message list (ADR-0012 D3).
+    /// - The message list is the supplied history followed by exactly one
+    ///   `Role::User` message (prompt or skill trigger); a skill trigger whose
+    ///   `<skill name="...">` block already appears in the history is
+    ///   deduplicated (body replaced, base-dir reference kept).
+    pub fn build(self) -> Result<Context, String> {
         let user = match self.user {
             Some(UserInput::Prompt(prompt)) => prompt,
             Some(UserInput::Skill { skill, arg }) => {
@@ -207,21 +220,18 @@ impl ContextBuilder {
                 return Err("no user message set: call with_user_prompt or with_skill".to_string());
             }
         };
-        let base = self.system;
+        let system = Message::text(
+            Role::System,
+            build_system_prompt(
+                &self.system,
+                self.environment.as_ref(),
+                &self.skills,
+                &self.context_files,
+            ),
+        );
         let mut messages = self.history;
-        if messages.is_empty() {
-            messages.push(Message::text(
-                Role::System,
-                build_system_prompt(
-                    &base,
-                    self.environment.as_ref(),
-                    &self.skills,
-                    &self.context_files,
-                ),
-            ));
-        }
-        messages.push(Message::text(Role::User, user));
-        Ok(messages)
+        messages.push(AgentMessage::text(Role::User, user));
+        Ok(Context { system, messages })
     }
 }
 
@@ -250,56 +260,59 @@ mod tests {
 
     #[test]
     fn default_system_prompt_is_used_without_override() {
-        let messages = ContextBuilder::new()
+        let context = ContextBuilder::new()
             .with_user_prompt("hello")
             .build()
             .unwrap();
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].role, Role::System);
-        assert_eq!(messages[0].text_content(), DEFAULT_SYSTEM_PROMPT);
-        assert_eq!(messages[1].role, Role::User);
-        assert_eq!(messages[1].text_content(), "hello");
+        // The system message is separate from the history (ADR-0012 D3): a
+        // turn adds only its user message.
+        assert_eq!(context.messages.len(), 1);
+        assert_eq!(context.system.role, Role::System);
+        assert_eq!(context.system.text_content(), DEFAULT_SYSTEM_PROMPT);
+        assert_eq!(context.messages[0].role(), &Role::User);
+        assert_eq!(context.messages[0].text_content(), "hello");
     }
 
     #[test]
     fn with_system_overrides_default() {
-        let messages = ContextBuilder::new()
+        let context = ContextBuilder::new()
             .with_system("be a coder")
             .with_user_prompt("hello")
             .build()
             .unwrap();
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].role, Role::System);
-        assert_eq!(messages[0].text_content(), "be a coder");
-        assert_eq!(messages[1].text_content(), "hello");
+        assert_eq!(context.messages.len(), 1);
+        assert_eq!(context.system.role, Role::System);
+        assert_eq!(context.system.text_content(), "be a coder");
+        assert_eq!(context.messages[0].text_content(), "hello");
     }
 
     #[test]
-    fn empty_history_seeds_system_message() {
-        let messages = ContextBuilder::new()
+    fn empty_history_seeds_only_the_user_message() {
+        let context = ContextBuilder::new()
             .with_system("be a coder")
             .with_user_prompt("hello")
             .build()
             .unwrap();
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].role, Role::System);
-        assert_eq!(messages[0].text_content(), "be a coder");
-        assert_eq!(messages[1].role, Role::User);
-        assert_eq!(messages[1].text_content(), "hello");
+        assert_eq!(context.messages.len(), 1);
+        assert_eq!(context.system.text_content(), "be a coder");
+        assert_eq!(context.messages[0].role(), &Role::User);
+        assert_eq!(context.messages[0].text_content(), "hello");
     }
 
     #[test]
-    fn non_empty_history_not_reseeded() {
-        let history = vec![Message::text(Role::System, "sys")];
-        let messages = ContextBuilder::new()
+    fn non_empty_history_is_kept_and_system_stays_separate() {
+        let history = vec![AgentMessage::text(Role::Assistant, "earlier")];
+        let context = ContextBuilder::new()
+            .with_system("live system")
             .with_history(history)
             .with_user_prompt("again")
             .build()
             .unwrap();
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].role, Role::System);
-        assert_eq!(messages[0].text_content(), "sys");
-        assert_eq!(messages[1].text_content(), "again");
+        assert_eq!(context.system.text_content(), "live system");
+        assert_eq!(context.messages.len(), 2);
+        assert_eq!(context.messages[0].role(), &Role::Assistant);
+        assert_eq!(context.messages[0].text_content(), "earlier");
+        assert_eq!(context.messages[1].text_content(), "again");
     }
 
     #[test]
@@ -308,12 +321,12 @@ mod tests {
             skill("auto", "runs automatically", false),
             skill("manual", "only on demand", true),
         ];
-        let messages = ContextBuilder::new()
+        let context = ContextBuilder::new()
             .with_skills(&skills)
             .with_user_prompt("hello")
             .build()
             .unwrap();
-        let system = messages[0].text_content();
+        let system = context.system.text_content();
         assert!(system.contains("## Skills"), "got: {system}");
         assert!(
             system.contains("- auto: runs automatically [Read from "),
@@ -329,13 +342,12 @@ mod tests {
             skill("auto", "runs automatically", false),
             skill("hist", "history-ish", false),
         ];
-        let messages = ContextBuilder::new()
+        let context = ContextBuilder::new()
             .with_skills(&skills)
             .with_user_prompt("hello")
             .build()
             .unwrap();
-        let system = messages[0].text_content();
-        // The `## Skills` header + one markdown bullet per skill.
+        let system = context.system.text_content();
         assert!(system.contains("## Skills"), "got: {system}");
         assert!(
             system.contains(
@@ -356,8 +368,6 @@ mod tests {
             system.contains("- auto: runs automatically [Read from "),
             "got: {system}"
         );
-        // The base grounding (markdown) is still present before the skills
-        // section.
         assert!(system.contains("You are slimcode"), "got: {system}");
     }
 
@@ -382,11 +392,11 @@ mod tests {
 
     #[test]
     fn no_skills_has_no_skills_section() {
-        let messages = ContextBuilder::new()
+        let context = ContextBuilder::new()
             .with_user_prompt("hello")
             .build()
             .unwrap();
-        let system = messages[0].text_content();
+        let system = context.system.text_content();
         assert!(!system.contains("## Skills"), "got: {system}");
         assert!(system.contains("read"));
     }
@@ -421,12 +431,12 @@ mod tests {
 
         let store = SkillStore::new(&home, &cwd);
         let skills = store.list().unwrap();
-        let messages = ContextBuilder::new()
+        let context = ContextBuilder::new()
             .with_skills(&skills)
             .with_user_prompt("hello")
             .build()
             .unwrap();
-        let system = messages[0].text_content();
+        let system = context.system.text_content();
         assert!(
             system.contains("- tdd: test first [Read from "),
             "got: {system}"
@@ -440,24 +450,24 @@ mod tests {
 
     #[test]
     fn with_user_prompt_sets_user_message() {
-        let messages = ContextBuilder::new()
+        let context = ContextBuilder::new()
             .with_system("sys")
             .with_user_prompt("do the task")
             .build()
             .unwrap();
-        assert_eq!(messages[1].role, Role::User);
-        assert_eq!(messages[1].text_content(), "do the task");
+        assert_eq!(context.messages[0].role(), &Role::User);
+        assert_eq!(context.messages[0].text_content(), "do the task");
     }
 
     #[test]
     fn with_skill_sets_user_message_from_skill() {
         let s = skill("demo", "A demo skill", false);
-        let messages = ContextBuilder::new()
+        let context = ContextBuilder::new()
             .with_system("sys")
             .with_skill(&s, None)
             .build()
             .unwrap();
-        let user = messages[1].text_content();
+        let user = context.messages[0].text_content();
         assert!(user.starts_with("<skill name=\"demo\""), "got: {user}");
         assert!(user.ends_with("</skill>"), "got: {user}");
         assert!(!user.contains("Task:"), "got: {user}");
@@ -474,12 +484,12 @@ mod tests {
             dir: std::path::PathBuf::from("/tmp/skills/demo"),
             file: std::path::PathBuf::from("/tmp/skills/demo/SKILL.md"),
         };
-        let messages = ContextBuilder::new()
+        let context = ContextBuilder::new()
             .with_system("sys")
             .with_skill(&s, None)
             .build()
             .unwrap();
-        let user = messages[1].text_content();
+        let user = context.messages[0].text_content();
         assert!(
             user.contains("References are relative to /tmp/skills/demo."),
             "got: {user}"
@@ -494,12 +504,12 @@ mod tests {
     #[test]
     fn with_skill_embeds_task_argument() {
         let s = skill("demo", "A demo skill", false);
-        let messages = ContextBuilder::new()
+        let context = ContextBuilder::new()
             .with_system("sys")
             .with_skill(&s, Some("run it now"))
             .build()
             .unwrap();
-        let user = messages[1].text_content();
+        let user = context.messages[0].text_content();
         assert!(user.ends_with("</skill>\n\nrun it now"), "got: {user}");
     }
 
@@ -517,14 +527,17 @@ mod tests {
         // The skill was already loaded in an earlier user message: its body is
         // replaced by an already-loaded notice, but the base-dir reference line
         // is kept.
-        let history = vec![Message::text(Role::User, skill_prompt(&s, None, false))];
-        let messages = ContextBuilder::new()
+        let history = vec![AgentMessage::text(
+            Role::User,
+            skill_prompt(&s, None, false),
+        )];
+        let context = ContextBuilder::new()
             .with_system("sys")
             .with_history(history)
             .with_skill(&s, None)
             .build()
             .unwrap();
-        let user = messages[1].text_content();
+        let user = context.messages[1].text_content();
         assert!(
             user.contains("References are relative to /tmp/skills/demo."),
             "got: {user}"
@@ -546,14 +559,17 @@ mod tests {
         };
         // A different skill in history does not trigger dedup.
         let other = skill("other", "Other skill", false);
-        let history = vec![Message::text(Role::User, skill_prompt(&other, None, false))];
-        let messages = ContextBuilder::new()
+        let history = vec![AgentMessage::text(
+            Role::User,
+            skill_prompt(&other, None, false),
+        )];
+        let context = ContextBuilder::new()
             .with_system("sys")
             .with_history(history)
             .with_skill(&s, None)
             .build()
             .unwrap();
-        let user = messages[1].text_content();
+        let user = context.messages[1].text_content();
         assert!(user.contains("Do the demo."), "got: {user}");
         assert!(!user.contains("already loaded"), "got: {user}");
     }
@@ -577,13 +593,13 @@ mod tests {
             scope: ContextScope::Project,
         }];
         let skills = vec![skill("auto", "runs automatically", false)];
-        let messages = ContextBuilder::new()
+        let context = ContextBuilder::new()
             .with_context_files(&files)
             .with_skills(&skills)
             .with_user_prompt("hello")
             .build()
             .unwrap();
-        let system = messages[0].text_content();
+        let system = context.system.text_content();
         let base = system.find("You are slimcode").unwrap();
         let ctx = system.find("## Project context").unwrap();
         let skills_idx = system.find("## Skills").unwrap();
@@ -599,11 +615,11 @@ mod tests {
 
     #[test]
     fn no_context_files_has_no_project_context_section() {
-        let messages = ContextBuilder::new()
+        let context = ContextBuilder::new()
             .with_user_prompt("hello")
             .build()
             .unwrap();
-        let system = messages[0].text_content();
+        let system = context.system.text_content();
         assert!(!system.contains("## Project context"), "got: {system}");
         assert!(!system.contains("AGENTS.md"), "got: {system}");
     }
@@ -620,11 +636,11 @@ mod tests {
 
     #[test]
     fn no_environment_has_no_environment_section() {
-        let messages = ContextBuilder::new()
+        let context = ContextBuilder::new()
             .with_user_prompt("hello")
             .build()
             .unwrap();
-        let system = messages[0].text_content();
+        let system = context.system.text_content();
         assert!(!system.contains("## Environment"), "got: {system}");
         assert!(!system.contains("global home"), "got: {system}");
     }
@@ -639,14 +655,14 @@ mod tests {
             content: "do the thing".to_string(),
             scope: ContextScope::Project,
         }];
-        let messages = ContextBuilder::new()
+        let context = ContextBuilder::new()
             .with_environment(environment())
             .with_context_files(&files)
             .with_skills(&[skill("auto", "runs automatically", false)])
             .with_user_prompt("hello")
             .build()
             .unwrap();
-        let system = messages[0].text_content();
+        let system = context.system.text_content();
         let base = system.find("You are slimcode").unwrap();
         let env = system.find("## Environment").unwrap();
         let ctx = system.find("## Project context").unwrap();
@@ -667,13 +683,13 @@ mod tests {
 
     #[test]
     fn environment_section_precedes_skills_without_context_files() {
-        let messages = ContextBuilder::new()
+        let context = ContextBuilder::new()
             .with_environment(environment())
             .with_skills(&[skill("auto", "runs automatically", false)])
             .with_user_prompt("hello")
             .build()
             .unwrap();
-        let system = messages[0].text_content();
+        let system = context.system.text_content();
         let env = system.find("## Environment").unwrap();
         let skills_idx = system.find("## Skills").unwrap();
         assert!(env < skills_idx, "got: {system}");

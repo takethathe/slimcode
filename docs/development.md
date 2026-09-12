@@ -106,19 +106,22 @@ cargo workspace，六个 crate：
   - **轻量 fuzzy（选项 C）**：exact 优先，找不到时仅做每行 `trim_end` 归一重试（不做 NFKC/智能引号折叠），命中后按行回映射、未触碰行保留原始字节；
   - 成功返回 `{ new_content, replaced_blocks, diff, first_changed_line }`（替换块数、带行号 diff、首个变更行）。
 
-### crates/core 会话模型（`session`）
+### crates/core 会话模型（`session`，ADR-0012）
 
-wire 消息模型（`Message` / `Role` / `Part` / `ToolCall` / `MessageStopReason`）已归 `slimcode-ai`
-（ADR-0011 D1），本模块只保留会话包装并 re-export 消息类型：
+两层消息模型（ADR-0012 D1/D2）：`slimcode-ai` 拥有 wire `Message`（role + parts + tool_calls +
+tool_call_id，已不含日志专用字段），`core` 拥有会话单元 `AgentMessage` 与唯一转换：
 
-- `Message { role, parts: Vec<Part>, tool_calls, tool_call_id, stop_reason, error }`（owner：`ai`），
-  role 序列化小写；`stop_reason`（`stop`/`tool_calls`/`error`/`aborted`）与 `error`
-  是日志专用字段（`skip_serializing_if` 省略、不出现在 LLM wire 上），普通消息的
-  序列化字节与旧 JSON 完全一致；
-- `Part::Text { text }`（parts 抽象，v1 默认/唯一变体），JSON 形状 `{"type":"text","text":"..."}`；
-- `ToolCall { id, name, arguments }`，`arguments` 存模型原始 JSON 串、执行时才 parse；
-- `Session { id, created_at, messages, title }` 包一层元数据（为 `~/.slimcode/sessions/` 准备）；
-- JSON 边界：`tool_calls`/`tool_call_id` 缺省时省略，整图无损 round-trip。
+- `AgentMessage` 是 serde-tagged enum（`{"kind":"llm",…}`，今天只有 LLM 变体；compact 摘要等
+  会话专有种类后续加入同一 enum）；`AgentMessage::to_llm(&self) -> Option<ai::Message>` 是唯一转换，
+  LLM 变体返回其消息，会话专有变体自己决定“转化或丢弃”；
+- `convert(system: &ai::Message, history: &[AgentMessage]) -> Vec<ai::Message>` = system 前缀 +
+  `filter_map(to_llm)`，在**每次** provider 请求前调用（ADR-0012 D2），因此 run 中途的 compact
+  下一轮自然生效；
+- system prompt 每轮现组、不进会话也不进日志（ADR-0012 D3）；`Session::messages: Vec<AgentMessage>`
+  一回合只新增一条 prompt 消息；
+- `MessageStopReason`（`stop`/`tool_calls`/`error`/`aborted`）是日志专用类型，住在记录信封里
+  （ADR-0012 D4），不在消息载荷上；旧日志的 `role:"system"` 记录在 `load` 时跳过（不重写文件、不升版本），
+  旧格式的裸消息载荷（无 `kind` tag、日志字段内联）也仍可加载。
 
 ### crates/core 运行时循环（`core`）
 
@@ -139,6 +142,8 @@ wire 消息模型（`Message` / `Role` / `Part` / `ToolCall` / `MessageStopReaso
   `core::Tool { spec: ToolSpec, run }` 是带执行闭包的包装，`Tool::new(name, description, parameters, run)`
   照旧；loop 在每次 run 开头构建一次 `Vec<ToolSpec>`（非每请求）并交给所有 `chat` 调用；
 - 工具事件（`ToolStart`/`ToolResult`）携带 `tool_call_id`，渲染端据此配对同名工具的多次调用；
+- 历史是 `Vec<AgentMessage>`；每条进历史的都是 LLM 变体（assistant 回复、tool 结果），
+  每次 `chat` 前用 `convert(system, &messages)` 重组 wire 消息列表；
 - 工具报错以 `Error: …` 前缀作 `role: tool` 内容进 history，模型自然恢复；
 - `Provider` trait 归 `slimcode-ai` 拥有（同步、无 async 依赖，真实 provider 内部处理阻塞边界），
   `core` 只 re-export 它的 seam 类型；运行时只依赖 `ai`（ADR-0011 D1/D4）；
@@ -192,8 +197,10 @@ wire 消息模型（`Message` / `Role` / `Part` / `ToolCall` / `MessageStopReaso
   FNV-1a hash 前 12 hex（`project_key()`，无外部依赖、跨版本稳定）；id
   `slimcode-<unix>-<pid>-<n>`、created_at RFC3339 UTC（无 chrono 依赖）、标题取首条
   用户消息截断 48 字符；`append`（首个 assistant 消息时独占建日志：头 + title + 全量
-  backlog，此后每条一行的追加，之前为 no-op）、`append_title`、宽容的 `load`
-  （未知/损坏记录跳过并计数、残缺尾行丢弃并补换行、悬空的工具调用批次在内存补
+  backlog，此后每条一行的追加，之前为 no-op）、`append_closing`（失败/取消回合的收尾 assistant，
+  `stop_reason`/`error` 写在记录信封：`{"type":"message","message":{…},"stop_reason":…,"error":…}`，
+  缺省省略）、`append_title`、宽容的 `load`（未知/损坏记录跳过并计数、旧格式裸消息载荷与
+  `role:"system"` 遗留记录均兼容（后者跳过，ADR-0012 D3）、残缺尾行丢弃并补换行、悬空的工具调用批次在内存补
   `Error: interrupted`，磁盘字节不改写）、`list` 只作用于当前项目子目录；每次追加后
   `evict_over_quota` 以 mtime 最旧优先删到配额一半（`.jsonl` 与遗留 `.json` 一起计数，
   `DEFAULT_MAX_BYTES`，`with_max_bytes` 覆盖，跳过当前 session，删空目录，尽力而为），
@@ -235,11 +242,12 @@ wire 消息模型（`Message` / `Role` / `Part` / `ToolCall` / `MessageStopReaso
   整个章节省略，默认提示词保持逐字节不变）+
   可自动调用 skill 广告（`with_skills`，build 时经 `format_skills_for_prompt` 过滤
   `disable-model-invocation`，产出 `## Skills` markdown 索引）+
-  可选 message history（`with_history`，非空不重复插 system）+ user prompt（
+  可选 message history（`with_history(Vec<AgentMessage>)`，history 不含 system）+ user prompt（
   `with_user_prompt`）或 skill 触发（`with_skill`，build 时扫描 history 中是否已有
   `<skill name="..."` 标记来决定是否去重，再调用 `skill_prompt`）；
-  `build()` 返回可直接交给 `run_agent_from_messages` 的 `Vec<Message>`，缺
-  user 时报错；空 history 前置一条 system 消息；
+  `build()` 返回 `Context { system: ai::Message, messages: Vec<AgentMessage> }`（ADR-0012 D3）：
+  system 由现组状态（基础提示、环境、context files、skills）合成，与 messages 分开返回，
+  缺 user 时报错；一个回合只向 history 新增一条 prompt 消息；
 - `context_files`：`AGENTS.md` 上下文文件的发现与渲染（对齐 pi 的项目上下文加载）：
   先读全局 `<home>/AGENTS.md`（scope `global`）；project 只判定两个位置——cwd 自身
   与 **git 仓库根**（最近的含 `.git` 条目的祖先目录，`.git` 可以是目录或
@@ -263,10 +271,10 @@ wire 消息模型（`Message` / `Role` / `Part` / `ToolCall` / `MessageStopReaso
   与缓存命中百分比）的共享措辞，cli 汇总与 TUI `/usage` 都消费它；
   `Renderer` trait 消费 `DisplayItem`，每个前端只实现自己的渲染器（cli 的文本行、
   tui 的 widget 状态）。
-- `runner`：共享 turn runner `run_turn(provider, tools, messages, &RunConfig,
-  &mut dyn Renderer, &mut dyn FnMut(&Message))
-  -> Result<(Vec<Message>, StopReason), String>`（ADR-0009 D5 加 `on_message` 回调与
-  `StopReason` 返回值）：逐事件流式回调渲染器，每条进历史的消息（assistant 回复、
+- `runner`：共享 turn runner `run_turn(provider, tools, context: Context, &RunConfig,
+  &mut dyn Renderer, &mut dyn FnMut(&AgentMessage))
+  -> Result<(Vec<AgentMessage>, StopReason), String>`（ADR-0012 D3 改为收 `Context`，ADR-0009 D5 加
+  `on_message` 回调与 `StopReason` 返回值）：逐事件流式回调渲染器，每条进历史的消息（assistant 回复、
   每个工具结果）同步回调一次 sink（TUI 借此实时追加日志），返回更新后的消息历史与
   终止原因（`Completed`/`Cancelled`）。cli 与 tui 共用同一 turn 循环，行为不漂移。
 - `setup`：`setup(cwd, config) -> (BailianProvider, Vec<Tool>)` 共享 seam，cli 与
@@ -341,9 +349,11 @@ reducer + draw）、`terminal`（薄壳 + worker-thread runner）。分层：
   transcript 并回到输入框。会话持久化改为**每条消息实时追加**（ADR-0009 D5）：worker 的
   `on_message` sink 把进入历史的每条消息同时推进 session 克隆并 `store.append`（追加失败
   收集为 notice、不打断 turn）；TUI 在 `submit_prompt`/`trigger_skill` 把本轮新消息
-  （首轮 system + user）先进历史并 append（首个 assistant 前是 no-op、不建文件）；失败/
-  取消且本轮已 append 过时，`close_turn` 追加一条带 `stop_reason`（`error`/`aborted`）与
-  短文本的 assistant 消息收尾，保证日志不悬在工具批次上；一轮在首个 assistant 前失败则
+  （只有 user prompt / skill 触发；system 每轮现组、不进会话）先进历史并 append
+  （首个 assistant 前是 no-op、不建文件）；失败/
+  取消且本轮已 append 过时，`close_turn` 用 `append_closing` 追加一条带
+  `stop_reason`（`error`/`aborted`，写在记录信封）与短文本的 assistant 消息收尾，
+  保证日志不悬在工具批次上；一轮在首个 assistant 前失败则
   不产生任何文件。`/save` 已随整文件保存一并移除。TUI 用 `setup_with_cancel`
   （bash 为可取消变体，进程组 SIGKILL、~50ms 轮询）；CLI one-shot 用普通 `setup` +
   从不置位的 token。
@@ -370,8 +380,8 @@ reducer + draw）、`terminal`（薄壳 + worker-thread runner）。分层：
   `app::config::merge_config_toml` 纯函数，写回后（Unix）若含 api_key 则
   chmod 600 并打印文件路径；非 TTY / 多余参数报错；不处理 cache（保持手动编辑）；
 - **one-shot**：`slimcode "<prompt>"`（可 `--cwd <dir>`、`--model <model>`、
-  `--base-url <url>`、`--api-key <key>`）经共享 `ContextBuilder` 组装消息列表（新会话首轮前置系统
-  提示并广告可自动调用 skill；开头的 `/skill:name` 会先被 `normalize_skill_trigger`
+  `--base-url <url>`、`--api-key <key>`）经共享 `ContextBuilder` 组装 `Context`（system 单独
+  返回、每轮现组并广告可自动调用 skill；开头的 `/skill:name` 会先被 `normalize_skill_trigger`
   改写为 `/{name}`，因为 one-shot 没有命令解析器），经共享 `run_turn` 跑一轮七工具循环、流式渲染事件、
   打印 token 用量；**不落盘会话**（ADR-0009 D5：无 `/load`/`/sessions` 工作流，与 TUI
   「首个 assistant 前失败不建文件」规则一致；`main` 里的启动 `cleanup_empty` 仍执行）；

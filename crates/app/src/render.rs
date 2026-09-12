@@ -326,8 +326,8 @@ mod tests {
     fn message_event_is_not_a_display_unit() {
         // The per-message event feeds the session layer's sink, never the
         // transcript: it must not map to a DisplayItem.
-        use slimcode_core::session::{Message as Msg, Role};
-        let e = AgentEvent::Message(Msg::text(Role::Assistant, "hi"));
+        use slimcode_core::session::{AgentMessage, Role};
+        let e = AgentEvent::Message(AgentMessage::text(Role::Assistant, "hi"));
         assert!(map_event(&e).is_none());
     }
 

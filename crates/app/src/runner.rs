@@ -17,15 +17,20 @@
 //! message at the moment it exists.
 
 use slimcode_core::agent::{
-    AgentEvent, CancelToken, Message, Provider, RunConfig, StopReason, Tool,
+    AgentEvent, AgentMessage, CancelToken, Provider, RunConfig, StopReason, Tool,
 };
 
+use crate::context::Context;
 use crate::render::{Renderer, map_event};
 
-/// Drive one agent turn over `messages`, streaming every event to `renderer`
-/// live as the loop runs, forwarding each message that enters history to
-/// `on_message`, and returning the updated message history plus the stop
-/// reason.
+/// Drive one agent turn over a [`Context`] (its system message plus the history
+/// with this turn's prompt), streaming every event to `renderer` live as the
+/// loop runs, forwarding each message that enters history to `on_message`,
+/// and returning the updated message history plus the stop reason.
+///
+/// The context's system message is assembled per request (ADR-0012 D3) and
+/// never enters the history; the runtime prepends it to `filter_map(to_llm)`
+/// before every provider request.
 ///
 /// `cancel` is threaded into the agent loop untouched: while it stays clear
 /// the run behaves exactly as before; the moment it is set the run stops at
@@ -38,15 +43,17 @@ use crate::render::{Renderer, map_event};
 pub fn run_turn<P: Provider>(
     provider: &mut P,
     tools: &[Tool],
-    messages: Vec<Message>,
+    context: Context,
     cfg: &RunConfig,
     cancel: &CancelToken,
     renderer: &mut dyn Renderer,
-    on_message: &mut dyn FnMut(&Message) -> Result<(), String>,
-) -> Result<(Vec<Message>, StopReason), String> {
+    on_message: &mut dyn FnMut(&AgentMessage) -> Result<(), String>,
+) -> Result<(Vec<AgentMessage>, StopReason), String> {
+    let Context { system, messages } = context;
     slimcode_core::agent::run_agent_from_messages_sink(
         provider,
         tools,
+        &system,
         messages,
         cfg,
         cancel,
@@ -70,7 +77,7 @@ mod tests {
     use crate::render::DisplayItem;
     use serde_json::Value;
     use slimcode_core::agent::{Delta, FinishReason, StopReason, ToolSpec};
-    use slimcode_core::session::{Message, Role};
+    use slimcode_core::session::{AgentMessage, Message, Role};
 
     // --- helpers (the agent crate's scripted FakeProvider pattern) ----------
 
@@ -98,6 +105,18 @@ mod tests {
     }
     fn reasoning(t: &str) -> Delta {
         Delta::Reasoning(t.to_string())
+    }
+    fn system() -> Message {
+        Message::text(Role::System, "be helpful")
+    }
+    fn user(text: &str) -> AgentMessage {
+        AgentMessage::text(Role::User, text)
+    }
+    fn context(messages: Vec<AgentMessage>) -> Context {
+        Context {
+            system: system(),
+            messages,
+        }
     }
 
     /// Scripted provider: pops the next delta sequence per call (agent prior
@@ -166,7 +185,7 @@ mod tests {
     }
 
     /// A sink that accepts every message (no persistence in these tests).
-    fn noop_sink() -> impl FnMut(&Message) -> Result<(), String> {
+    fn noop_sink() -> impl FnMut(&AgentMessage) -> Result<(), String> {
         |_| Ok(())
     }
 
@@ -186,15 +205,12 @@ mod tests {
         ];
         let mut provider = FakeProvider::new(script);
         let mut renderer = RecordingRenderer::new();
-        let messages = vec![
-            Message::text(Role::System, "be helpful"),
-            Message::text(Role::User, "weather?"),
-        ];
+        let messages = vec![user("weather?")];
         let cancel = CancelToken::new();
         let (updated, stop) = run_turn(
             &mut provider,
             &[weather_tool()],
-            messages,
+            context(messages),
             &RunConfig::default(),
             &cancel,
             &mut renderer,
@@ -259,10 +275,11 @@ mod tests {
                 .all(|i| !matches!(i, DisplayItem::Usage(_)))
         );
 
-        // Returned history: system + user + assistant(tool_calls) + tool + assistant.
-        assert_eq!(updated.len(), 5);
-        assert!(updated.iter().any(|m| m.role == Role::Tool));
-        assert_eq!(updated.last().unwrap().role, Role::Assistant);
+        // Returned history: user + assistant(tool_calls) + tool + assistant
+        // (the system prompt is not part of it, ADR-0012 D3).
+        assert_eq!(updated.len(), 4);
+        assert!(updated.iter().any(|m| m.role() == &Role::Tool));
+        assert_eq!(updated.last().unwrap().role(), &Role::Assistant);
         assert!(updated.last().unwrap().text_content().contains("25C"));
     }
 
@@ -280,15 +297,12 @@ mod tests {
         ];
         let mut provider = FakeProvider::new(script.clone());
         let mut renderer = RecordingRenderer::new();
-        let messages = vec![
-            Message::text(Role::System, "be helpful"),
-            Message::text(Role::User, "weather?"),
-        ];
+        let messages = vec![user("weather?")];
         let cancel = CancelToken::new();
         let (updated, stop) = run_turn(
             &mut provider,
             &[weather_tool()],
-            messages.clone(),
+            context(messages.clone()),
             &RunConfig::default(),
             &cancel,
             &mut renderer,
@@ -300,6 +314,7 @@ mod tests {
         let result = slimcode_core::agent::run_agent_from_messages(
             &mut provider2,
             &[weather_tool()],
+            &system(),
             messages,
             &RunConfig::default(),
             &CancelToken::new(),
@@ -318,12 +333,12 @@ mod tests {
         ]];
         let mut provider = FakeProvider::new(script);
         let mut renderer = RecordingRenderer::new();
-        let messages = vec![Message::text(Role::User, "go")];
+        let messages = vec![user("go")];
         let cancel = CancelToken::new();
         run_turn(
             &mut provider,
             &[weather_tool()],
-            messages,
+            context(messages),
             &RunConfig::default(),
             &cancel,
             &mut renderer,
@@ -394,13 +409,13 @@ mod tests {
         let (updated, stop) = run_turn(
             &mut provider,
             &[slow, fast],
-            vec![Message::text(Role::User, "go")],
+            context(vec![user("go")]),
             &RunConfig::default(),
             &cancel,
             &mut renderer,
             &mut |m| {
-                if m.role == Role::Tool {
-                    seen.push(m.tool_call_id.clone().unwrap_or_default());
+                if m.role() == &Role::Tool {
+                    seen.push(m.tool_call_id().unwrap_or_default().to_string());
                 }
                 Ok(())
             },
@@ -411,8 +426,8 @@ mod tests {
         assert_eq!(seen, vec!["call_0", "call_1"]);
         let history_ids: Vec<&str> = updated
             .iter()
-            .filter(|m| m.role == Role::Tool)
-            .map(|m| m.tool_call_id.as_deref().expect("tool result id"))
+            .filter(|m| m.role() == &Role::Tool)
+            .map(|m| m.tool_call_id().expect("tool result id"))
             .collect();
         assert_eq!(history_ids, vec!["call_0", "call_1"]);
         // Renderer: completion order — fast_tool (call_1) first.
@@ -446,7 +461,7 @@ mod tests {
         let err = run_turn(
             &mut provider,
             &[],
-            vec![Message::text(Role::User, "hi")],
+            context(vec![user("hi")]),
             &RunConfig::default(),
             &cancel,
             &mut renderer,
@@ -466,7 +481,7 @@ mod tests {
         let err = run_turn(
             &mut provider,
             &[],
-            vec![Message::text(Role::User, "hi")],
+            context(vec![user("hi")]),
             &RunConfig::default(),
             &cancel,
             &mut renderer,
@@ -493,7 +508,7 @@ mod tests {
         let (updated, stop) = run_turn(
             &mut wrapped,
             &[],
-            vec![Message::text(Role::User, "hi")],
+            context(vec![user("hi")]),
             &RunConfig::default(),
             &cancel,
             &mut renderer,
@@ -550,16 +565,13 @@ mod tests {
         ];
         let mut provider = FakeProvider::new(script);
         let mut renderer = RecordingRenderer::new();
-        let messages = vec![
-            Message::text(Role::System, "be helpful"),
-            Message::text(Role::User, "weather?"),
-        ];
+        let messages = vec![user("weather?")];
         let cancel = CancelToken::new();
-        let mut seen: Vec<Message> = Vec::new();
+        let mut seen: Vec<AgentMessage> = Vec::new();
         let (updated, _) = run_turn(
             &mut provider,
             &[weather_tool()],
-            messages,
+            context(messages),
             &RunConfig::default(),
             &cancel,
             &mut renderer,
@@ -572,13 +584,13 @@ mod tests {
         // The sink saw assistant(tool_calls), tool, then the final assistant —
         // exactly the messages that entered history after the turn's input.
         assert_eq!(seen.len(), 3);
-        assert_eq!(seen[0].role, Role::Assistant);
-        assert_eq!(seen[0].tool_calls.len(), 1);
-        assert_eq!(seen[0].tool_calls[0].id, "call_1");
-        assert_eq!(seen[1].role, Role::Tool);
-        assert_eq!(seen[1].tool_call_id.as_deref(), Some("call_1"));
-        assert_eq!(seen[2].role, Role::Assistant);
-        assert_eq!(seen, updated[2..]);
+        assert_eq!(seen[0].role(), &Role::Assistant);
+        assert_eq!(seen[0].tool_calls().len(), 1);
+        assert_eq!(seen[0].tool_calls()[0].id, "call_1");
+        assert_eq!(seen[1].role(), &Role::Tool);
+        assert_eq!(seen[1].tool_call_id(), Some("call_1"));
+        assert_eq!(seen[2].role(), &Role::Assistant);
+        assert_eq!(seen, updated[1..]);
     }
 
     #[test]
@@ -590,7 +602,7 @@ mod tests {
         let err = run_turn(
             &mut provider,
             &[],
-            vec![Message::text(Role::User, "hi")],
+            context(vec![user("hi")]),
             &RunConfig::default(),
             &cancel,
             &mut renderer,
