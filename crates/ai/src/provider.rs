@@ -1,5 +1,5 @@
 //! `BailianProvider` — implements the `slimcode-ai` `Provider` seam against the
-//! Bailian (阿里云百炼) OpenAI-compatible endpoint.
+//! Bailian OpenAI-compatible endpoint.
 //!
 //! Uses `reqwest::blocking` to keep the sync `Provider` trait seam; the async
 //! boundary is entirely inside this crate. Streaming is used with

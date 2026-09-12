@@ -41,6 +41,10 @@ and the rendering is pixel-for-pixel what it is today.
 
 ## Answer
 
+> **修订（ticket 05）**：本票实现的 `Skills(Vec<SkillInfo>)` 变体与 `SkillInfo` / `SkillScope`
+> 在 ticket 05 中删除 —— 补全候选由注入的 `CompletionProvider` 提供、`/skills` 文本由 CLI 以
+> `Notice` 产出，TUI 不再持有 skill 状态。ADR-0014 D1 与 spec 显示链均已加注。
+
 已实现（ADR-0014，ADR-0004 已加修订注记）：
 
 - 新增 `crates/tui/src/render.rs`：`RenderItem`（`Text` / `Reasoning` / `ToolStart` /

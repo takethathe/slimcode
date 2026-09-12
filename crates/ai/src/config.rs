@@ -1,4 +1,4 @@
-//! Provider configuration for the Bailian (阿里云百炼) OpenAI-compatible endpoint.
+//! Provider configuration for the Bailian OpenAI-compatible endpoint.
 //!
 //! `BailianConfig` is pure provider data: api key, base URL and model. The
 //! endpoint defaults (`DEFAULT_BASE_URL` / `DEFAULT_MODEL`) are owned here,

@@ -44,8 +44,9 @@ history**（`session.messages`）是会话中已发生的消息，可被当作 C
 - 去重：若同一 skill 已在更早 message 加载过（扫描 `<skill name="..."` 标记），
   重触发时正文替换为 “already loaded” 提示、保留外壳与 base-dir 行，模型去更早
   的 message 找指令，避免重复加载；扫描无状态，会话 `/load` 恢复后依然有效。
-- 当轮 user 消息必须存在（`with_user_prompt` 或 `with_skill`），否则
-  `build()` 报错，而不是静默产出没有 user 消息的 turn。
+- 当轮 user 消息必须存在（`with_user_prompt`；skill 触发的消息文本由 CLI 用
+  `skills::skill_prompt` 渲染后再传入），否则 `build()` 报错，而不是静默产出没有
+  user 消息的 turn。
 
 ### AGENTS.md 上下文文件注入（pi 对齐）
 

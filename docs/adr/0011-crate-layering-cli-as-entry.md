@@ -1,5 +1,14 @@
 # Crate layering with the CLI as the sole entry point
 
+> **Implementation note (tickets 02/03 + review)**: D1's `AgentRunner` name did not survive as a
+> type. The runtime loop stayed free functions (`run_agent`, `run_agent_from_messages`,
+> `run_agent_from_messages_sink`); the spec's "loop becomes a struct with optional closure hook
+> fields" seam was `seam only, no new semantics` and no ticket in the migration carried it, so it is
+> not built. Everything else D1 lists (`AgentEvent`, `AgentMessage` + `to_llm`/`convert`,
+> `Tool { spec, run }`, `RunConfig`, `StopReason`, `Provider`/`Message`/`ToolSpec`/`CancelToken` in
+> `ai`) is in place. Tracked in `TODO.md`.
+
+
 The workspace is re-cut into six crates with a single direction of dependency and one binary:
 `slimcode-ai` (LLM wire model + provider), `slimcode-core` (agent runtime: events, runner, hooks),
 `slimcode-app` (frontend-agnostic application services + the display contract), `slimcode-commands`

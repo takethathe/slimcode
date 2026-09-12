@@ -121,7 +121,7 @@ slimcode 的用户看不见这个问题，维护它的人躲不开：workspace �
 | crate | 对外界面 | 依赖 |
 | --- | --- | --- |
 | `slimcode-ai` | `Message`(wire) / `Provider` / `ToolSpec` / `Delta` / `FinishReason` / `CancelToken` / `TokenUsage` / wire 模型 | 无 slimcode 依赖 |
-| `slimcode-core` | `AgentEvent` / `AgentRunner`（loop + 可选闭包 hook 字段）/ `AgentMessage`(+`to_llm`) / `convert` / `Tool{spec,run}` / `RunConfig` / `StopReason` | `ai` |
+| `slimcode-core` | `AgentEvent` / loop（`AgentRunner` —— 见下方实施偏差，实为自由函数）/ `AgentMessage`(+`to_llm`) / `convert` / `Tool{spec,run}` / `RunConfig` / `StopReason` | `ai` |
 | `slimcode-app` | `DisplayItem` / `map_event` / `Renderer` / `usage_summary` / `ContextBuilder`→`Context{system,messages}` / 会话与输入历史持久化 / skills / context_files / 七工具 / setup / `run_turn` | `ai`, `core`, `commands` |
 | `slimcode-commands` | `/` 注册表 + fuzzy 预测（纯数据 + 纯函数） | 无 |
 | `slimcode-tui` | `RenderItem` / `Effect` / `App`(new/apply/draw/handle_key) / `run(terminal, app, handler)` / `UiHandler` / 组件 | **无 slimcode 依赖** |
@@ -154,14 +154,19 @@ slimcode 的用户看不见这个问题，维护它的人躲不开：workspace �
   `Vec<ToolSpec>`。
 - `AgentRunner` 从自由函数变为结构体：事件订阅 + 可选闭包字段（如工具调用前后、回合结束/续跑），
   默认全为 `None` 时行为与今天逐字节相同；本 spec 只摆 seam，不实现新语义。
+  **实施偏差（review）**：六张 ticket 没有一张覆盖这条，因此未实现 —— loop 仍是自由函数
+  `run_agent` / `run_agent_from_messages(_sink)`；已记入 `TODO.md`，ADR-0011 附 implementation note。
 - `AgentEvent::Message` 的载荷是 `AgentMessage`；运行时不做磁盘 I/O。
 
 ### 显示链（ADR-0004 保留 + ADR-0014）
 
 - `DisplayItem` / `map_event` / `Renderer` / `usage_summary` / `run_turn` 留在应用层不变。
 - 新增 `tui::RenderItem`，变体：`Text` / `Reasoning` / `ToolStart` / `ToolResult` / `Notice` /
-  `Error` / `UserPrompt` / `Usage(FooterUsage)` / `Skills(Vec<SkillInfo>)` / `Branch(Option<String>)` /
+  `Error` / `UserPrompt` / `Usage(FooterUsage)` / `Branch(Option<String>)` /
   `SessionChanged{id}`。`DisplayItem::Turn` 与 `DisplayItem::Stop` 由适配器丢弃。
+  **实施偏差（ticket 05）**：`Skills(Vec<SkillInfo>)` 变体（与 `SkillInfo` / `SkillScope`）被删除 ——
+  补全候选由注入的 `CompletionProvider` 提供、`/skills` 文本由 CLI 以 `Notice` 产出，TUI 不再持有
+  任何 skill 状态；ADR-0014 D1 已加修订注记。
 - CLI 实现 `TuiAdapter`（`Renderer`），在 worker 线程上把 `DisplayItem` 转成 `RenderItem`；CLI 自有的
   状态（notice/error/session 变更/skills/branch/usage/user prompt）也以 `RenderItem` 发出——TUI 只有
   一条输入通道。
@@ -222,7 +227,7 @@ slimcode 的用户看不见这个问题，维护它的人躲不开：workspace �
 4. **CLI 的 `UiHandler`**：fake handler 录制 `Effect` 与 emitted `RenderItem`，替代今天只能在真终端里
    验证的终端循环集成测试。
 5. **沿用不动的高价值既有 seam**：`TextRenderer` 输出字节（one-shot 与 ADR-0004 的保证）、
-   `AgentRunner`/loop 的脚本化 `FakeProvider`、`run_turn` 的录制型 renderer、`SessionStore` 的
+   loop 的脚本化 `FakeProvider`、`run_turn` 的录制型 renderer、`SessionStore` 的
    round-trip/宽容读/信封/遗留 system 记录跳过、`ContextBuilder` 的组装结果、`skills` 与 `commands` 的
    纯函数测试、`crates/cli/tests/tui_smoke.rs` 的 tmux 端到端（覆盖两腿：文本与 TUI）。
 

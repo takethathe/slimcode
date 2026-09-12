@@ -2,7 +2,7 @@
 //!
 //! Owns the LLM seam (ADR-0011 D1): the wire `Message` model, `Provider`,
 //! `ToolSpec`, `Delta`, `FinishReason` and `CancelToken`, plus the Bailian
-//! (阿里云百炼) OpenAI-compatible provider. This crate depends on no other
+//! OpenAI-compatible provider. This crate depends on no other
 //! slimcode crate, so adding a provider never requires the agent runtime.
 
 pub mod config;

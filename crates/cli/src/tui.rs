@@ -577,6 +577,15 @@ impl TuiSession<'_> {
         let cfg = RunConfig::default();
         let mut appended = 0usize;
         let mut append_errors: Vec<String> = Vec::new();
+        // A turn that dies before producing anything must still close an
+        // existing log on an assistant boundary; a turn with no log yet leaves
+        // none (the closing message would otherwise be the file's first
+        // assistant message and create one — ADR-0009 D5).
+        let log_exists = self
+            .store
+            .session_path(&state.session.id)
+            .map(|path| path.exists())
+            .unwrap_or(false);
         let TurnState {
             provider,
             tools,
@@ -616,16 +625,17 @@ impl TuiSession<'_> {
                 // Esc: the partial turn is adopted; the log is closed on an
                 // assistant boundary so it never ends on a dangling tool batch
                 // (ADR-0009 D3).
-                if appended > 0 {
+                if appended > 0 || log_exists {
                     self.close_turn(state, MessageStopReason::Aborted, None, emit);
                 }
             }
             Err(e) => {
                 // A failed turn still leaves the session persisted, with its
                 // prior messages intact; the failure closes the log on an
-                // assistant boundary (or leaves no file at all if nothing was
-                // appended). The library shows the returned error.
-                if appended > 0 {
+                // assistant boundary (or leaves no file at all if the turn was
+                // the session's first and produced nothing). The library shows
+                // the returned error.
+                if appended > 0 || log_exists {
                     self.close_turn(state, MessageStopReason::Error, Some(e.clone()), emit);
                 }
                 return Err(e);
@@ -748,6 +758,17 @@ mod tests {
                 script,
                 calls: 0,
                 fail_at: None,
+                usage: TokenUsage::default(),
+            }
+        }
+
+        /// A provider whose very first call fails, the way a network error
+        /// does on a session's opening turn.
+        fn failing_at_zero() -> Self {
+            Self {
+                script: Vec::new(),
+                calls: 0,
+                fail_at: Some(0),
                 usage: TokenUsage::default(),
             }
         }
@@ -1198,6 +1219,55 @@ mod tests {
             "{}",
             last.text_content()
         );
+    }
+
+    #[test]
+    fn a_turn_that_dies_on_an_existing_log_still_closes_it() {
+        let fx = Fixture::new("submit-fail-existing");
+        // Turn 1 completes (the log is created); turn 2 dies before producing
+        // anything, so only the gating on an existing log can close it.
+        let provider = FakeProvider {
+            script: vec![vec![
+                Delta::Text("first".to_string()),
+                Delta::Done(FinishReason::Stop),
+            ]],
+            calls: 0,
+            fail_at: Some(1),
+            usage: TokenUsage::default(),
+        };
+        let handler = fx.handler(Box::new(provider), Vec::new());
+        let id = handler.session_id();
+        handler
+            .submit(user_message("one"), &mut |_| {})
+            .expect("first turn succeeds");
+
+        let err = handler
+            .submit(user_message("two"), &mut |_| {})
+            .expect_err("second turn fails");
+        assert_eq!(err, "boom");
+
+        let loaded = fx.store.load(&id).expect("log loads").session;
+        let last = loaded.messages.last().expect("closing message");
+        assert_eq!(last.role(), &Role::Assistant);
+        assert!(
+            last.text_content()
+                .contains("The turn ended with an error: boom"),
+            "{}",
+            last.text_content()
+        );
+    }
+
+    #[test]
+    fn a_first_turn_that_dies_leaves_no_log() {
+        let fx = Fixture::new("submit-fail-first");
+        let handler = fx.handler(Box::new(FakeProvider::failing_at_zero()), Vec::new());
+        let id = handler.session_id();
+        handler
+            .submit(user_message("only"), &mut |_| {})
+            .expect_err("the provider fails");
+        // Nothing worth persisting: the log must not exist (ADR-0009 D5).
+        let path = fx.store.session_path(&id).expect("path");
+        assert!(!path.exists(), "unexpected log at {}", path.display());
     }
 
     #[test]

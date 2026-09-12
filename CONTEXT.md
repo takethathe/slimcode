@@ -208,6 +208,10 @@ _Avoid_: completer, registry, skill store
 A semantic color-token system (accent, border, borderAccent, muted, dim, userMessageBg, toolPendingBg, toolSuccessBg, toolErrorBg, markdown tokens, ...) whose names and hex values mirror pi's `dark.json`; the TUI resolves tokens to terminal colors at render time. Dark only.
 _Avoid_: palette, colors, style sheet
 
+**Entry**:
+One item of the TUI's transcript model: the startup header, a boxed user prompt, an assistant text block, a thinking block, a tool block (paired start/result, with a status colour), a notice, or an error. Consecutive streamed fragments of the same kind merge into the last Entry of that kind.
+_Avoid_: row, line, message (a Message is model-facing; an Entry is rendered)
+
 **Transcript**:
 The scrollable top region of the TUI holding the startup header, user/assistant messages, and tool blocks; it scrolls, the dock below it never does.
 _Avoid_: chat area, message list
