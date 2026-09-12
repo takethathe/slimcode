@@ -1,5 +1,15 @@
 # TUI runtime seam: terminal lifecycle in the library, application lifecycle in the CLI
 
+> **Implementation note (ticket 05)**: two details of the sketched trait changed once it met the
+> borrow checker. `submit` and `cancel` take `&self` (and `UiHandler: Sync`), because a turn runs on
+> the library's worker thread while the frame loop still has to reach `cancel` on Esc — one `&mut`
+> borrow cannot be in both places, so the CLI carries whichever interior mutability that needs (it
+> wraps its turn state in a `Mutex`). And `on_effect` returns this crate's own
+> `ControlFlow { Continue, Submit(Prompt), Quit }` instead of `std::ops::ControlFlow`: the handler
+> often turns a command (`/!!`, a skill trigger) into a turn, and `std::ops::ControlFlow` cannot
+> carry the prompt the library is asked to run.
+
+
 `slimcode-tui` is entered, not run: the CLI owns the process (raw mode, alternate screen, panic
 hook, signals, exit code), builds the terminal, and passes it to `tui::run`. The library owns the
 frame loop and everything that exists only to keep the frame loop responsive; the CLI owns

@@ -17,6 +17,7 @@
 
 mod config_cmd;
 mod render;
+mod tui;
 
 use std::env;
 use std::io::{IsTerminal, Write};
@@ -118,7 +119,7 @@ fn run_tui(
     context_files: &[ContextFile],
     environment: Environment,
 ) -> Result<i32, String> {
-    slimcode_tui::terminal::run(
+    tui::run(
         cwd,
         config,
         store,
@@ -126,9 +127,6 @@ fn run_tui(
         skills,
         context_files,
         environment,
-        // The CLI owns the `DisplayItem → RenderItem` adapter (ADR-0014 D2):
-        // the TUI builds the turn's channel and the adapter sends over it.
-        Box::new(|tx| Box::new(render::TuiAdapter::new(tx)) as Box<dyn Renderer + Send>),
     )
 }
 

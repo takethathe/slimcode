@@ -25,7 +25,7 @@ cargo clippy --all-targets --all-features --message-format=json -- -D warnings
 
 ## 架构
 
-> **实施状态**：ADR-0011–0014（crate 分层与 cli 总入口 / 两层消息模型 / TUI 运行 seam / TUI 零依赖与 cli 侧适配器）已决策、**尚未实施**。迁移分六张 ticket（`.scratch/arch-realignment/issues/01..06`）。下面「目标架构」是设计基准（先读它）；「现状」描述当前代码，ticket 06 完成后删除并按新布局重写各模块段。
+> **实施状态**：ADR-0011–0014（crate 分层与 cli 总入口 / 两层消息模型 / TUI 运行 seam / TUI 零依赖与 cli 侧适配器）已决策；ticket 01–05 已落地，只剩 ticket 06（矩阵测试 + 删除本节与「现状」表）。下面「目标架构」是设计基准；「现状」表与各模块段描述当前代码。
 
 ### 目标架构（ADR-0011–0014）
 
@@ -280,31 +280,57 @@ tool_call_id，已不含日志专用字段），`core` 拥有会话单元 `Agent
 - `setup`：`setup(cwd, config) -> (BailianProvider, Vec<Tool>)` 共享 seam，cli 与
   tui 用同一套 provider + 工具构造，两端不会各自实现而漂移。
 
-### crates/tui 交互式 TUI（`slimcode-tui`）
+### crates/tui 终端库（`slimcode-tui`）
 
-`crates/tui` 提供交互式全屏 TUI（ADR-0003），替代行式 REPL。模块：
+`crates/tui` 是**终端库**（ADR-0003 / ADR-0013）：它被 CLI **进入**，不自己跑起来。
+CLI 拥有进程与应用生命周期；本 crate 拥有纯 `App` 状态机与帧循环，且**不依赖任何
+其他 `slimcode-*` crate**（含 dev-dependency，见 ticket 06 的矩阵测试）。模块：
 `theme`（pi dark.json 词法转的只读 token 表：`Token::color()` 前景 / `BgToken::color()`
 背景）、`text`（折行/截断/宽度，CJK 双宽）、`markdown`（pulldown-cmark → 样式
 span，代码围栏行映射等）、`toolcall`（内置工具紧凑调用标题 composer，pi `format*Call`
 移植：`CallPart` 纯函数 + 逐工具单测）、`footer`（pi `footer.ts` 的 `formatTokens` /
-`formatCwdForFooter` /
-stats 纯函数移植）、`git`（`terminal_title` / `current_branch` 纯包装）、`render`
-（TUI 自己的显示词汇 `RenderItem` / `SkillInfo`，ADR-0014 D1）、`app`（纯
-reducer + draw）、`terminal`（薄壳 + worker-thread runner）。分层：
+`formatCwdForFooter` / stats 纯函数移植）、`git`（`terminal_title` / `current_branch`
+纯包装）、`render`（TUI 自己的显示词汇 `RenderItem`，ADR-0014 D1）、`handler`
+（运行 seam：`UiHandler` / `Prompt` / `TurnReport` / `ControlFlow` /
+`CompletionProvider` / `CompletionItem`，ADR-0013 D1）、`app`（纯 reducer + draw）、
+`run`（帧循环 + worker-thread runner；`lib.rs` 把它导出为 `slimcode_tui::run`）。
+分层：
 
-- **自有显示词汇（ADR-0014 D1/D2）**：TUI 不再消费 `app` 的 `DisplayItem`。
-  `RenderItem` 载 agent 流输出（`Text` / `Reasoning` / `ToolStart` / `ToolResult`）
-  与 CLI 自有的状态（`Notice` / `Error` / `UserPrompt` / `Usage(FooterUsage)` /
-  `Skills(Vec<SkillInfo>)` / `Branch` / `SessionChanged`），不含任何 `ai`/`core`/`app`
-  类型；`App::apply(RenderItem)` 是唯一入口，transcript 合并与工具配对规则仍是私有实现。
-  三套词汇两层转换：`AgentEvent`（core）→ `DisplayItem`（app，共享 `map_event`）→
-  `RenderItem`（tui）；中间的适配器属于 **cli**（`cli/src/render.rs::TuiAdapter`，
-  `Renderer` 实现），在 turn 的 worker 线程上把每条 `DisplayItem` 转换为 `RenderItem`
-  并发进 TUI 通道；`Turn` 与 `Stop` 被丢弃（transcript 无 turn 标记、stop 不渲染）。
-  `FooterUsage` 只保留平凡构造函数，token 用量换算在 CLI 侧完成，故 TUI 源码不出现
-  provider 的用量类型。`app` 的显示契约（`DisplayItem` / `map_event` / `Renderer` /
-  `usage_summary` / 共享 runner）保持原样。
+- **自有显示词汇（ADR-0014 D1/D2）**：TUI 不消费 `app` 的 `DisplayItem`。`RenderItem`
+  载 agent 流输出（`Text` / `Reasoning` / `ToolStart` / `ToolResult`）与 CLI 自有的状态
+  （`Notice` / `Error` / `UserPrompt` / `Usage(FooterUsage)` / `Branch` /
+  `SessionChanged`），不含任何 `ai`/`core`/`app` 类型；`App::apply(RenderItem)` 是唯一
+  入口，transcript 合并与工具配对规则仍是私有实现。三套词汇两层转换：`AgentEvent`
+  （core）→ `DisplayItem`（app，共享 `map_event`）→ `RenderItem`（tui）；中间的适配器
+  属于 **cli**（`cli/src/render.rs::TuiAdapter`，`Renderer` 实现），在 turn 的 worker
+  线程上把每条 `DisplayItem` 转成 `RenderItem` 交给库的 emit 回调；`Turn` 与 `Stop` 被
+  丢弃（transcript 无 turn 标记、stop 不渲染）。`FooterUsage` 只保留平凡构造函数，token
+  用量换算在 CLI 侧完成，故 TUI 源码不出现 provider 的用量类型。`app` 的显示契约
+  （`DisplayItem` / `map_event` / `Renderer` / `usage_summary` / 共享 runner）保持原样。
+- **运行 seam（ADR-0013 D1/D2）**：库入口是 `tui::run(terminal, app, handler)`——
+  terminal 与 app 由 CLI 构造好，`handler` 是 CLI 实现的 `UiHandler`：
 
+  ```rust
+  pub trait UiHandler: Sync {
+      fn on_effect(&mut self, effect: Effect, emit: &mut dyn FnMut(RenderItem)) -> ControlFlow;
+      fn submit(&self, prompt: Prompt, emit: &mut dyn FnMut(RenderItem)) -> Result<TurnReport, String>;
+      fn cancel(&self);
+  }
+  ```
+
+  `on_effect` 在 UI 线程回答 reducer 的每个意图；`ControlFlow` 是 crate 自有的
+  `Continue` / `Submit(Prompt)` / `Quit`（std 的 `ControlFlow` 载不了“请库跑一轮”），
+  `Submit` 让**库**把该 turn 放到 worker 线程上跑 `submit`；`cancel` 由帧循环在 Esc 时
+  调用，所以 `submit`/`cancel` 取 `&self`（`Sync`，turn 期间从 UI 线程与 worker 并发可达；
+  CLI 用互斥量满足它）。库负责通道、`event::poll(80ms)` 帧定时器、排空、`draw`、
+  `app.tick()` 与 scoped worker；raw mode / alternate screen / 终端标题 / panic hook /
+  退出码全在 CLI。
+- **`/` 补全来自注入的 provider（ADR-0014 D3）**：reducer 每次按键刷新弹框，但候选池
+  由 CLI 在 `App::new` 时注入（`CompletionProvider::complete(&self, input) ->
+  Vec<CompletionItem>`，`CompletionItem` 是 TUI 自己的类型）。CLI 的实现由
+  `slimcode-commands` 的命令表 + skills store 拼成，所以 TUI 既无命令注册表也无 skills
+  store；`/help` 文案、未知命令的 did-you-mean 与 skill 名解析都由 CLI 生成并以
+  `RenderItem` 到达。
 - **主题（ADR-0006 D1）**：唯一风格来源是 pi `dark.json` 的逐字十六进制；TUI 渲染只
   引用 token（`Token` 前景 / `BgToken` 背景），不出现裸颜色。现有测试把每个 token
   的 hex 钉死，换肤只需改一处表。
@@ -327,62 +353,53 @@ reducer + draw）、`terminal`（薄壳 + worker-thread runner）。分层：
   `history`（input history 快照）、`recall` 态、`completion`、`scroll` /
   `scrollbar_ticks`（auto 模式滚动条：出现后 ~1s 淡出，与 scroll 位置无关）、
   `status`（`cwd` / `session_id` / `branch` / `usage: FooterUsage` / `running` /
-  `spinner_frame`）、全局 `tool_output_expanded`、`version`。`handle_key` /
-  `handle_key_running` / `tick()`（推进 spinner 帧、递减滚动条淡出计数）是纯
-  reducer；`Effect` 枚举（Submit / ReplayPrompt / ReplayHistory / NewSession /
-  LoadSession / ShowUsage / Quit / QuitAfterTurn / …）由终端循环兑现。`draw` 用
-  ratatui `TestBackend` 做帧缓冲测试（spec：好测试断言**帧缓冲**而非内部状态）。
-  布局是 ADR-0007 D4 四区 dock：`[transcript(Min0) | popup(0|n) | input |
-  footer(2)]`；补全弹框（0 行时收起）位于输入框正上方，开合只吃 transcript、不移动输入框；
-  编辑器为无左右竖线/圆角的上下两条全宽 `─` 横线，边框色蓝色（`border`）闲置 / 青色
-  （`borderAccent`）运行中，右缘滚动条 thumb。命令解析经
-  `slimcode_commands::find` + skill 触发 + 编号重跑（`/!N`）。输入历史 recall：输入框
-  为空时 `↑`/`↓` 进入（最新一条开始），`Enter` 把选中的历史 prompt 作为新一轮重跑
-  （不再写入历史）；每轮提交时追加（不查重，同 `HistoryStore::append`）。
+  `spinner_frame`）、注入的 `completions` provider、全局 `tool_output_expanded`、
+  `version`。`handle_key` / `handle_key_running` / `tick()`（推进 spinner 帧、递减滚动条
+  淡出计数）是纯 reducer；`Effect` 只有五个变体——`SubmitPrompt(Prompt)`（打字的 prompt
+  或 recall 重跑，`Prompt.record` 决定是否写输入历史）、`Command { name, arg }`、`Quit` /
+  `QuitAfterTurn` / `CancelRunning`——**reducer 不解析命令语义**：`/` 开头的输入原样变成
+  `Command`，含义（`/help` / `/new` / `/load` / `/sessions` / `/usage` / `/history` /
+  `/skills` / `/install-skill` / `/exit` / `/!!` / `/!N` / skill 触发 / 未知命令）全由
+  CLI 在 `on_effect` 里决定（ADR-0013 D3）。`draw` 用 ratatui `TestBackend` 做帧缓冲测试
+  （spec：好测试断言**帧缓冲**而非内部状态）。布局是 ADR-0007 D4 四区 dock：
+  `[transcript(Min0) | popup(0|n) | input | footer(2)]`；补全弹框（0 行时收起）位于输入框
+  正上方，开合只吃 transcript、不移动输入框；编辑器为无左右竖线/圆角的上下两条全宽 `─`
+  横线，边框色蓝色（`border`）闲置 / 青色（`borderAccent`）运行中，右缘滚动条 thumb。
+  输入历史 recall：输入框为空时 `↑`/`↓` 进入（最新一条开始），`Enter` 把选中的历史 prompt
+  作为新一轮重跑（不再写入历史）；每轮提交时追加（不查重，同 `HistoryStore::append`）。
 - **Footer / 状态指示器（ADR-0006 D5/D6）**：两行 dim footer 由纯函数拼装——第一行
   `~/cwd (branch) • session`（`footer::format_cwd_for_footer`：只在词法上位于 `$HOME`
   内时缩写为 `~` / `~/rel`），第二行 `stats_line`（`↑in ↓out Rcache WcacheWrite
   CH{pct}%`，零值省略；`format_tokens` 与 pi 同表：<1000 原样、<10k `x.xk`、<1M 取整
-  `xk`、<10M `x.xM`、否则取整 `M`），模型名右对齐，宽度不足时右侧截断。运行中把
-  `⠋ Working...`（braille 帧、80ms 一帧）嵌入输入框上边框左侧，整行用运行色
-  （borderAccent 青）渲染，空闲恢复纯 `─` 上边框（不再占独立状态行）。
-- **worker-thread turn runner（ADR-0006 D6/D6a）**：`terminal::run` 先 `setup_with_cancel`
-  构造 provider + 可取消工具集（再进 raw mode / alternate screen），设终端标题（OSC 0
-  `slimcode - <session> - <cwd 目录名>`，`/new` `/load` 时更新），并尽力
-  `git branch --show-current` 喂 footer。提交后把 `BailianProvider`（`Option`
-  take/restore）+ `Vec<Tool>`（`mem::take`，`Tool::run` 已加宽为 `Box<dyn Fn(...) +
-  Send + Sync>`）移入 worker `thread::spawn` 跑共享 `run_turn`，经 CLI 提供的
-  `TuiAdapter` 把 `RenderItem` 流回 UI（TUI 建通道、把 sender 交给 `AdapterFactory`）；
-  UI 循环 `event::poll(80ms)` 同时当帧定时器，poll 事件 + 排空
-  通道 + `draw` + `app.tick()`，spinner 因此边 HTTP 等待边动画。运行中：裸 `Esc` →
-  `Effect::CancelRunning`（`Tui` 持有每轮 `CancelToken`，`drive_turn` 开头 `reset()`，
-  Esc 时 `cancel()`；worker 在下一 runner 边界 / 下个 socket chunk 中止在途请求，并杀掉
-  bash 子进程组；以 `StopReason::Cancelled` 静默结束、已流式内容保留、不进历史）；
-  Ctrl+C / Ctrl+D → `Effect::QuitAfterTurn`，其它按键忽略。`handle.is_finished()` 门控
-  join，任何路径都先 join 再 restore provider/工具（不变量：provider 总被归还）。turn
-  结束后 worker 返回会话克隆（每轮起点 + 本轮进入历史的消息），TUI 采纳；turn 报错内联进
-  transcript 并回到输入框。会话持久化改为**每条消息实时追加**（ADR-0009 D5）：worker 的
-  `on_message` sink 把进入历史的每条消息同时推进 session 克隆并 `store.append`（追加失败
-  收集为 notice、不打断 turn）；TUI 在 `submit_prompt`/`trigger_skill` 把本轮新消息
-  （只有 user prompt / skill 触发；system 每轮现组、不进会话）先进历史并 append
-  （首个 assistant 前是 no-op、不建文件）；失败/
-  取消且本轮已 append 过时，`close_turn` 用 `append_closing` 追加一条带
-  `stop_reason`（`error`/`aborted`，写在记录信封）与短文本的 assistant 消息收尾，
-  保证日志不悬在工具批次上；一轮在首个 assistant 前失败则
-  不产生任何文件。`/save` 已随整文件保存一并移除。TUI 用 `setup_with_cancel`
-  （bash 为可取消变体，进程组 SIGKILL、~50ms 轮询）；CLI one-shot 用普通 `setup` +
-  从不置位的 token。
+  `xk`、<10M `x.xM`、否则取整 `M`），模型名右对齐，宽度不足时右侧截断。footer 的用量由
+  CLI 每轮以 `RenderItem::Usage` 喂入（换算在 CLI 侧）。运行中把 `⠋ Working...`
+  （braille 帧、80ms 一帧）嵌入输入框上边框左侧，整行用运行色（borderAccent 青）渲染，
+  空闲恢复纯 `─` 上边框（不再占独立状态行）。
+- **worker-thread turn runner（ADR-0006 D6/D6a，ADR-0013 D2）**：`run` 在提交一轮时建
+  `mpsc::channel::<RenderItem>()`，用 `thread::scope` 起 worker 跑
+  `handler.submit(prompt, &mut emit)`（`emit` 就是往通道 send 的闭包）；UI 线程留帧循环
+  `event::poll(80ms)` 当帧定时器，poll 事件 + 排空通道（`app.apply`）+ `draw` +
+  `app.tick()`，spinner 因此边 HTTP 等待边动画。运行中：裸 `Esc` → `handler.cancel()`
+  （CLI 持有每轮 `CancelToken`，`submit` 开头 `reset()`；worker 在下一 runner 边界 /
+  下个 socket chunk 中止在途请求，并杀掉 bash 子进程组；以 `StopReason::Cancelled` 静默
+  结束、已流式内容保留、不进历史）；Ctrl+C / Ctrl+D → `Effect::QuitAfterTurn`，其它按键
+  忽略。`handle.is_finished()` 门控 join，任何路径都先 join 再让 CLI 归还 provider/工具
+  （不变量：provider 总被归还）。turn 的收尾全在 CLI：会话持久化为**每条消息实时追加**
+  （ADR-0009 D5），`on_message` sink 把进入历史的每条消息同时推进 session 并
+  `store.append`（追加失败收集为 notice、不打断 turn）；失败/取消且本轮已产出过消息时
+  用 `append_closing` 追加一条带 `stop_reason`（`error`/`aborted`，写在记录信封）与短文本
+  的 assistant 消息收尾，保证日志不悬在工具批次上；一轮在首个 assistant 前失败则不产生
+  任何文件。`submit` 返回 `Err` 时库把它渲染成一行错误（CLI 已先关好日志）。
 - **测试 seam**：决定逻辑都在 `app` 纯 core 与 `footer`/`git` 纯函数里（帧缓冲测试、
-  纯单测）；`terminal` 只有原始 I/O + 通道搬移。worker 通道有端到端测试（脚本化
-  provider + 通道录制渲染器断言有序 `RenderItem` 流与最终结果）；cli 侧有表驱动的适配器
-  测试覆盖每个 `DisplayItem` 变体（含被丢弃的 `Turn`/`Stop`）；tmux 冒烟在
-  `crates/cli/tests/tui_smoke.rs`（无 tmux 自动跳过）：对本地 mock SSE 服务器起真终端，
-  capture-pane 断言头部/色块 prompt/markdown 思考/工具块/spinner 动画（已嵌入上边框）/footer 两行/补全
-  弹框/滚动/改尺寸 dock 固定/OSC 0 标题/Ctrl+C 退出/Esc 中途取消（spinner 消失、已流式
-  partial 文本保留、无错误文本、下一 prompt 正常运行）。
-- **CLI 并行不变**：one-shot 前端字节不变地复用 `app`（`render::map_event` 共享；
-  TUI 的 `DisplayItem::Usage` 在前端侧消费、绝不出自 `map_event`，/usage 汇总措辞与
-  CLI 共用 `usage_summary`）。
+  纯单测）；`run` 只有原始 I/O + 通道搬移。CLI 侧有 handler 测试（脚本化 provider +
+  记录 emit 的闭包：命令语义、skill 解析、重跑、会话落盘、失败收尾、并发拒绝、cancel
+  重置）与表驱动适配器测试（覆盖每个 `DisplayItem` 变体，含被丢弃的 `Turn`/`Stop`）；
+  tmux 冒烟在 `crates/cli/tests/tui_smoke.rs`（无 tmux 自动跳过）：对本地 mock SSE 服务器
+  起真终端，capture-pane 断言头部/色块 prompt/markdown 思考/工具块/spinner 动画（已嵌入
+  上边框）/footer 两行/补全弹框/滚动/改尺寸 dock 固定/OSC 0 标题/Ctrl+C 退出/Esc 中途取消
+  （spinner 消失、已流式 partial 文本保留、无错误文本、下一 prompt 正常运行）。
+- **one-shot 与 TUI 不漂移**：两端的 `DisplayItem` 映射、`usage_summary` 措辞与
+  `ContextBuilder` 上下文组装仍来自 `app`；one-shot 从一开始就不经 TUI crate。
 
 ### crates/cli 二进制（`slimcode`）
 
@@ -404,17 +421,28 @@ reducer + draw）、`terminal`（薄壳 + worker-thread runner）。分层：
 - **chmod 提示**：`load_app_config` 之后，若 `ApiKeySource::File` 且（Unix）
   `config.toml` 权限 `mode & 0o077 != 0`，stderr 打印 `chmod 600 <path>` 提示（one-shot
   与 TUI 共用此打印点，TUI 进 alternate screen 前已打过）；非 Unix 跳过；
-- **无 prompt + TTY**：交给 `slimcode_tui::terminal::run` 启动全屏 TUI（见上节）；
+- **无 prompt + TTY**：交给 `tui::run`（`cli/src/tui.rs`）启动全屏 TUI（见上节）：
+  构造 provider + 工具、建 `App` 与 `TuiSession` handler、进 raw mode/alternate screen、
+  设标题、跑 `slimcode_tui::run`、退出前恢复终端；
 - **无 prompt + 非 TTY**：在配置解析前就以明确错误退出（非零退出码）。
 
 模块：
 
+- `tui`：TUI 入口与 handler（ADR-0013）。`run` 拥有进程生命周期（raw mode / alternate
+  screen / 终端标题 / panic hook / 退出码）；`TuiSession` 实现 `UiHandler`，拥有 provider
+  与工具（`Mutex` 里，turn 期间 take 出来跑、结束后归还）、session store、input history、
+  skills、context files、environment，并实现**全部命令语义**（`/help` / `/new` / `/load` /
+  `/sessions` / `/usage` / `/history` / `/skills` / `/install-skill` / `/exit` / `/!!` /
+  `/!N` / skill 触发 / 未知命令 + did-you-mean）、每轮的上下文组装与会话落盘、失败/取消
+  收尾。`CliCompletions` 是注入 TUI 的 `/` 候选 provider（命令表 + skills 快照，
+  `/install-skill` 后就地刷新）。
 - `render`：两个 `Renderer` 实现。`TextRenderer` 把共享 `DisplayItem` 流（流式文本 / 流式思考 / 结构行 / 用量汇总）渲染为终端输出，原始 tool_call delta 与
   `Done` 事件被抑制；流式文本与思考（带 `> ` 前缀）按 delta 拼接、不逐 delta 换行，换行只来自内容本身的 `\n`，结构行（工具开始/结果、停止标记、turn 标记）总是另起一行；事件→DisplayItem 的映射是共享的 `app::render::map_event`。
-  `TuiAdapter`（ADR-0014 D2）在 turn 的 worker 线程上把每条 `DisplayItem` 转为
-  `slimcode_tui::render::RenderItem` 并发进 TUI 通道：`Turn`/`Stop` 丢弃，`Usage` 在此
-  完成 `TokenUsage → FooterUsage` 换算；TUI 因此不依赖 `app`、`ai`、`core`。表驱动单测
-  覆盖每个 `DisplayItem` 变体（含被丢弃的两个）。
+  `TuiAdapter`（ADR-0014 D2）持有库给的 emit 回调，在 turn 的 worker 线程上把每条
+  `DisplayItem` 转为 `slimcode_tui::render::RenderItem`；`Turn`/`Stop` 丢弃，`Usage` 经
+  `to_footer_usage` 完成 `TokenUsage → FooterUsage` 换算（表驱动单测覆盖每个变体）。
+  `DisplayItem` / `Renderer` / `map_event` / `usage_summary` / `run_turn` 仍全在 `app`
+  （ADR-0004 未变）。
 - provider + 工具构造经 `app::setup::setup` 与 TUI 共享，两端不会漂移。
 
 交互能力（历史 recall、`/` 命令、skills、`/new`、`/load`、`/exit`）已整体移入

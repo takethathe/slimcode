@@ -98,7 +98,7 @@ enum UserInput {
 /// Has this skill's `<skill name="...">` block already been injected into one
 /// of the history messages? Detected from the XML wrapper the trigger inserts,
 /// so the check is stateless and survives session reloads.
-fn skill_loaded_in(history: &[AgentMessage], skill: &Skill) -> bool {
+pub fn skill_loaded_in(history: &[AgentMessage], skill: &Skill) -> bool {
     let marker = format!("<skill name=\"{}\"", skill.name);
     history.iter().any(|m| m.text_content().contains(&marker))
 }

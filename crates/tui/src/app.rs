@@ -4,14 +4,16 @@
 //!
 //! The app consumes only its own display vocabulary: the CLI converts the
 //! application layer's `DisplayItem`s into [`RenderItem`]s (ADR-0014 D2) and
-//! the app applies them through [`App::apply`]. The merge and tool-pairing
-//! rules that build the transcript stay private here.
+//! the app applies them through [`App::apply`]. It also injects the `/`
+//! completion pool ([`CompletionProvider`], ADR-0014 D3), so this crate needs
+//! no command registry and no skills store. The merge and tool-pairing rules
+//! that build the transcript stay private here.
 //!
 //! Nothing in this module touches a real terminal. Rendering goes through a
 //! [`Frame`] supplied by the caller, so tests can drive it with ratatui's
 //! `TestBackend` and assert on the frame buffer. Side effects (running a turn,
-//! saving a session, ...) are surfaced as [`Effect`]s for the terminal loop to
-//! fulfill.
+//! loading a session, installing a skill, ...) are surfaced as [`Effect`]s for
+//! the library to hand to the CLI.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -19,14 +21,13 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use slimcode_app::skills::{CompletionItem, SkillView, combined_suggestions, complete, find_skill};
-use slimcode_commands::{COMMANDS, find};
 use tui_textarea::{CursorMove, TextArea};
 use unicode_width::UnicodeWidthChar;
 
 use crate::footer::FooterUsage;
+use crate::handler::{CompletionItem, CompletionProvider, Prompt};
 use crate::markdown::render_markdown;
-use crate::render::{RenderItem, SkillInfo, SkillScope};
+use crate::render::RenderItem;
 use crate::text::{display_width, wrap_to_width};
 use crate::theme::{BgToken, Token, bg, fg};
 use crate::toolcall::{CallPart, tool_call_title};
@@ -134,9 +135,21 @@ pub enum Entry {
 }
 
 /// A side effect the terminal loop fulfills after the app processed a key.
+///
+/// These are user *intents*, not semantics (ADR-0013 D3): `Effect::Command`
+/// says the user typed a slash command, not what it means, and the CLI answers
+/// it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
-    /// Quit the TUI (Ctrl+C / Ctrl+D / `/exit`).
+    /// Submit one turn's prompt to the CLI: typed text (recorded) or a
+    /// recalled prompt being replayed (not recorded).
+    SubmitPrompt(Prompt),
+    /// The user typed a `/`-prefixed command, with its optional argument.
+    /// Every semantic (`/help`, `/new`, `/load`, `/sessions`, `/usage`,
+    /// `/history`, `/skills`, `/install-skill`, `/exit`, `/!!`, `/!N`, a skill
+    /// name, or an unknown command) belongs to the CLI.
+    Command { name: String, arg: Option<String> },
+    /// Quit the TUI (Ctrl+C / Ctrl+D while idle).
     Quit,
     /// Quit after the currently running turn finishes (Ctrl+C / Ctrl+D while
     /// a turn runs; the worker keeps streaming, keys are otherwise ignored
@@ -146,27 +159,6 @@ pub enum Effect {
     /// runs): the worker aborts its in-flight request / tool and returns to
     /// idle with whatever already streamed/applied kept.
     CancelRunning,
-    /// Submit the given prompt to the model.
-    SubmitPrompt(String),
-    /// Trigger a skill turn with an optional argument.
-    TriggerSkill { name: String, arg: Option<String> },
-    /// Replay the last N prompts from history.
-    ReplayHistory(usize),
-    /// Re-run a prompt recalled from history as a fresh turn, without
-    /// recording it again in input history.
-    ReplayPrompt(String),
-    /// Start a new session (clears the transcript).
-    NewSession,
-    /// Load the session with the given id (clears the transcript).
-    LoadSession(String),
-    /// List persisted sessions.
-    ListSessions,
-    /// Show the usage for the last turn.
-    ShowUsage,
-    /// List recent prompts from history.
-    ListHistory,
-    /// Install a skill from the given reference.
-    InstallSkill(String),
 }
 
 /// Active ↑/↓ history-recall state: the index into [`App::history`] whose
@@ -224,9 +216,9 @@ pub struct App {
     pub input: TextArea<'static>,
     /// Status-line state.
     pub status: StatusLine,
-    /// Snapshot of installed skills used for `/skill` dispatch and suggestions;
-    /// refreshed by [`RenderItem::Skills`] after a runtime `/install-skill`.
-    pub skills: Vec<SkillInfo>,
+    /// The `/`-candidate pool, injected by the CLI (ADR-0014 D3). The TUI
+    /// keeps no command registry and no skills store of its own.
+    completions: Box<dyn CompletionProvider>,
     /// Recent prompts for ↑/↓ recall, in `HistoryStore` order (oldest first,
     /// newest last — recall starts at the newest entry, matching `/!1`). The
     /// terminal loop seeds this from `HistoryStore` at startup; fresh prompts
@@ -258,13 +250,14 @@ pub struct App {
 
 impl App {
     /// Create a fresh app in "ready" state. `version` feeds the startup
-    /// header block.
+    /// header block; `completions` is the CLI's `/`-candidate provider
+    /// (ADR-0014 D3).
     pub fn new(
         cwd: impl Into<String>,
         session_id: impl Into<String>,
         model: impl Into<String>,
         version: impl Into<String>,
-        skills: Vec<SkillInfo>,
+        completions: Box<dyn CompletionProvider>,
     ) -> Self {
         let mut app = App {
             transcript: Vec::new(),
@@ -277,7 +270,7 @@ impl App {
                 branch: None,
                 usage: FooterUsage::default(),
             },
-            skills,
+            completions,
             history: Vec::new(),
             recall: None,
             completion: None,
@@ -330,18 +323,6 @@ impl App {
             return Some(Effect::CancelRunning);
         }
         None
-    }
-
-    /// Append frontend-owned output to the transcript (dim notice).
-    fn push_notice(&mut self, text: impl Into<String>) {
-        self.transcript.push(Entry::Notice(text.into()));
-        self.reset_view();
-    }
-
-    /// Append an inline error entry to the transcript (red).
-    fn push_error(&mut self, text: impl Into<String>) {
-        self.transcript.push(Entry::Error(text.into()));
-        self.reset_view();
     }
 
     /// Append a boxed user prompt block (typed, recalled, or `/!!`-replayed
@@ -466,7 +447,7 @@ impl App {
             self.completion = None;
             return;
         }
-        let items = complete(&self.input_text(), &self.skills);
+        let items = self.completions.complete(&self.input_text());
         if items.is_empty() {
             self.completion = None;
             return;
@@ -574,7 +555,10 @@ impl App {
             let text = self.history.get(recall.index).cloned()?;
             self.clear_input();
             self.push_user_prompt(text.clone());
-            return Some(Effect::ReplayPrompt(text));
+            return Some(Effect::SubmitPrompt(Prompt {
+                text,
+                record: false,
+            }));
         }
         if key.modifiers.contains(KeyModifiers::SHIFT) {
             self.input.insert_newline();
@@ -883,7 +867,6 @@ impl App {
             RenderItem::Error(text) => self.transcript.push(Entry::Error(text)),
             RenderItem::UserPrompt(text) => self.transcript.push(Entry::UserPrompt { text }),
             RenderItem::Usage(usage) => self.status.usage = usage,
-            RenderItem::Skills(skills) => self.skills = skills,
             RenderItem::Branch(branch) => self.status.branch = branch,
             // A new or loaded session drops the old transcript; the CLI emits
             // the accompanying notice as its own item.
@@ -1023,7 +1006,11 @@ impl App {
     }
 
     /// Take the current input as a prompt: echo it, clear the box, and resolve
-    /// it (either a normal prompt or a `/command`). Returns the effect to run.
+    /// it into an intent. Returns the effect to run.
+    ///
+    /// Slash input becomes an opaque [`Effect::Command`] — the reducer never
+    /// decides what a command means, only that the user typed one (ADR-0013
+    /// D3).
     fn submit_current_input(&mut self) -> Option<Effect> {
         let text = self.input_text();
         let trimmed = text.trim();
@@ -1032,169 +1019,23 @@ impl App {
         }
         self.clear_input();
         if trimmed.starts_with('/') {
-            self.handle_command(trimmed)
-        } else {
-            self.push_user_prompt(trimmed.to_string());
-            self.record_prompt(trimmed.to_string());
-            Some(Effect::SubmitPrompt(trimmed.to_string()))
+            let (name, arg) = split_name_arg(trimmed);
+            return Some(Effect::Command {
+                name: name.to_string(),
+                arg: arg.map(str::to_string),
+            });
         }
+        self.push_user_prompt(trimmed.to_string());
+        self.record_prompt(trimmed.to_string());
+        Some(Effect::SubmitPrompt(Prompt {
+            text: trimmed.to_string(),
+            record: true,
+        }))
     }
 
     /// Reset the input box to a fresh empty multi-line box.
     fn clear_input(&mut self) {
         self.input = fresh_input();
-    }
-
-    /// Resolve a `/command` line (leading slash kept in `name`).
-    fn handle_command(&mut self, line: &str) -> Option<Effect> {
-        let (name, arg) = split_name_arg(line);
-        if let Some(command) = find(name) {
-            return match command.name {
-                "/help" => {
-                    self.show_help();
-                    None
-                }
-                "/new" => Some(Effect::NewSession),
-                "/load" => match arg {
-                    Some(id) if !id.is_empty() => Some(Effect::LoadSession(id.to_string())),
-                    _ => {
-                        self.push_error("/load needs a session id — /sessions lists them");
-                        None
-                    }
-                },
-                "/sessions" => Some(Effect::ListSessions),
-                "/usage" => Some(Effect::ShowUsage),
-                "/history" => Some(Effect::ListHistory),
-                "/skills" => {
-                    self.show_skills();
-                    None
-                }
-                "/install-skill" => match arg {
-                    Some(reference) if !reference.is_empty() => {
-                        Some(Effect::InstallSkill(reference.to_string()))
-                    }
-                    _ => {
-                        self.push_error("/install-skill needs a skill reference");
-                        None
-                    }
-                },
-                "/exit" => Some(Effect::Quit),
-                "/!!" => Some(Effect::ReplayHistory(1)),
-                "/!" => match arg {
-                    Some(digits) => match digits.parse::<usize>() {
-                        Ok(n) if n >= 1 => Some(Effect::ReplayHistory(n)),
-                        _ => {
-                            self.push_error(format!("bad replay index: /!{digits}"));
-                            None
-                        }
-                    },
-                    None => {
-                        self.push_error("/!N needs a number (1 = newest)");
-                        None
-                    }
-                },
-                // Every other registered command falls through to generic
-                // handling: skill dispatch and predictive suggestions.
-                _ => self.handle_unresolved_command(name, arg),
-            };
-        }
-        self.handle_unresolved_command(name, arg)
-    }
-
-    /// Resolve a command name that did not match a registered command exactly:
-    /// numbered replay (`/!N`), skill triggers, or an unknown-command notice.
-    fn handle_unresolved_command(&mut self, name: &str, arg: Option<&str>) -> Option<Effect> {
-        // Numbered replay: `/!N` (N digits) is not an exact spelling, so a
-        // numbered command never matches `find` and lands here.
-        if let Some(spec) = name.strip_prefix("/!")
-            && !spec.is_empty()
-            && spec.chars().all(|c| c.is_ascii_digit())
-        {
-            let n = spec.parse::<usize>().unwrap_or(1);
-            return Some(Effect::ReplayHistory(n));
-        }
-        // Skill trigger: `/skill-name` or the canonical `/skill:name`.
-        if let Some(skill) = find_skill(&self.skills, name) {
-            return Some(Effect::TriggerSkill {
-                name: skill.name.clone(),
-                arg: arg.map(str::to_string),
-            });
-        }
-        // Unknown command: predictive notice with suggestions.
-        let suggestions = combined_suggestions(&self.skills, name);
-        self.push_error(format!("unknown command: {name}"));
-        if suggestions.is_empty() {
-            self.push_notice("  run /help to list commands");
-        } else {
-            self.push_notice(format!("  did you mean: {}", suggestions.join(", ")));
-        }
-        None
-    }
-
-    /// Render the built-in command list.
-    fn show_help(&mut self) {
-        self.push_notice("commands:");
-        let width = COMMANDS
-            .iter()
-            .map(|c| c.usage.chars().count())
-            .max()
-            .unwrap_or(0);
-        for command in COMMANDS {
-            let mut line = format!("  {:<width$}  {}", command.usage, command.description);
-            if !command.aliases.is_empty() {
-                line.push_str(&format!("  (alias: {})", command.aliases.join(", ")));
-            }
-            self.push_notice(line);
-        }
-        self.push_notice("multi-line: Shift+Enter inserts a newline; Enter submits");
-        self.push_notice("skills: /skills lists installed skills; /skill:<name> runs one");
-    }
-
-    /// Render the installed skills list.
-    fn show_skills(&mut self) {
-        if self.skills.is_empty() {
-            self.push_notice("no skills installed");
-            return;
-        }
-        self.push_notice("skills:");
-        let width = self
-            .skills
-            .iter()
-            .map(|s| s.name.chars().count())
-            .max()
-            .unwrap_or(0);
-        let lines: Vec<String> = self
-            .skills
-            .iter()
-            .map(|skill| {
-                let scope = match skill.scope {
-                    SkillScope::User => "user",
-                    SkillScope::Project => "project",
-                };
-                let manual = if skill.disable_model_invocation {
-                    " (manual only)"
-                } else {
-                    ""
-                };
-                format!(
-                    "  /skill:{:<width$}  {}{}  [{}]",
-                    skill.name, skill.description, manual, scope
-                )
-            })
-            .collect();
-        for line in lines {
-            self.push_notice(line);
-        }
-    }
-}
-
-impl SkillView for SkillInfo {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn description(&self) -> &str {
-        &self.description
     }
 }
 
@@ -1662,17 +1503,77 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
-    use slimcode_app::history::{HISTORY_DISPLAY, render_history};
 
     // --- helpers -----------------------------------------------------------
 
-    /// A minimal installed skill for trigger tests.
-    fn skill(name: &str, description: &str) -> SkillInfo {
-        SkillInfo {
-            name: name.to_string(),
-            description: description.to_string(),
-            disable_model_invocation: false,
-            scope: SkillScope::User,
+    /// The CLI's `/`-candidate provider, faked for these tests (ADR-0014 D3):
+    /// the real one lives in the CLI, so the popup tests only need a stable
+    /// pool whose ranking they control.
+    struct FakeCompletions {
+        pool: Vec<CompletionItem>,
+    }
+
+    impl FakeCompletions {
+        fn new() -> Self {
+            Self {
+                // Every spelling the real registry advertises (with its
+                // description), so the popup mechanics are exercised against a
+                // realistic pool.
+                pool: [
+                    ("/help", "list commands"),
+                    ("/new", "start a new session"),
+                    ("/load", "load a saved session"),
+                    ("/resume", "load a saved session"),
+                    ("/sessions", "list saved sessions"),
+                    ("/usage", "show token usage"),
+                    ("/history", "list input history"),
+                    ("/skills", "list installed skills"),
+                    ("/install-skill", "install a skill (user or project scope)"),
+                    ("/!!", "rerun the most recent prompt"),
+                    ("/!", "rerun history entry N (1 = newest)"),
+                    ("/exit", "quit the TUI"),
+                    ("/quit", "quit the TUI"),
+                ]
+                .iter()
+                .map(|(value, description)| CompletionItem {
+                    value: value.to_string(),
+                    description: description.to_string(),
+                })
+                .collect(),
+            }
+        }
+    }
+
+    impl CompletionProvider for FakeCompletions {
+        /// Prefix matches in pool order, then any remaining match — enough to
+        /// exercise selection, paging and stickiness deterministically.
+        fn complete(&self, input: &str) -> Vec<CompletionItem> {
+            let trimmed = input.trim();
+            let Some(query) = trimmed.strip_prefix('/') else {
+                return Vec::new();
+            };
+            if query.contains(char::is_whitespace) {
+                return Vec::new();
+            }
+            if query.is_empty() {
+                return self.pool.clone();
+            }
+            let bare = query.strip_prefix("skill:").unwrap_or(query);
+            let (prefix, rest): (Vec<_>, Vec<_>) = self
+                .pool
+                .iter()
+                .filter_map(|item| {
+                    let name = item.value.trim_start_matches('/');
+                    let name = name.strip_prefix("skill:").unwrap_or(name);
+                    name.contains(bare)
+                        .then(|| (item.clone(), name.starts_with(bare)))
+                })
+                .partition(|(_, is_prefix)| *is_prefix);
+            prefix
+                .into_iter()
+                .chain(rest)
+                .map(|(item, _)| item)
+                .collect()
         }
     }
 
@@ -1749,9 +1650,40 @@ mod tests {
         }
     }
 
-    /// A test app with a couple of entries already in the transcript.
+    /// A test app with the fake `/` pool injected and the header entry drawn.
     fn seeded_app() -> App {
-        App::new("~/proj", "sess-1", "model-x", "9.9.9", vec![])
+        App::new(
+            "~/proj",
+            "sess-1",
+            "model-x",
+            "9.9.9",
+            Box::new(FakeCompletions::new()),
+        )
+    }
+
+    /// The `Effect::Command` a slash line reduces to.
+    fn command(name: &str, arg: Option<&str>) -> Effect {
+        Effect::Command {
+            name: name.to_string(),
+            arg: arg.map(str::to_string),
+        }
+    }
+
+    /// The `Effect::SubmitPrompt` a recalled prompt replays with (never
+    /// recorded again in input history).
+    fn replay(text: &str) -> Effect {
+        Effect::SubmitPrompt(Prompt {
+            text: text.to_string(),
+            record: false,
+        })
+    }
+
+    /// The `Effect::SubmitPrompt` a typed prompt reduces to.
+    fn prompt(text: &str) -> Effect {
+        Effect::SubmitPrompt(Prompt {
+            text: text.to_string(),
+            record: true,
+        })
     }
 
     /// Render the transcript pane rows (content only, border excluded) of a
@@ -1936,10 +1868,7 @@ mod tests {
         let mut app = seeded_app();
         type_text(&mut app, "explain tests");
         let effect = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(
-            effect,
-            Some(Effect::SubmitPrompt("explain tests".to_string()))
-        );
+        assert_eq!(effect, Some(prompt("explain tests")));
         assert!(app.input_text().is_empty());
         // The prompt is echoed into the transcript as a boxed user block
         // (no `> ` notice line).
@@ -1958,10 +1887,7 @@ mod tests {
 
         // Enter now submits the whole multi-line buffer as a single prompt.
         let effect = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(
-            effect,
-            Some(Effect::SubmitPrompt("first\nsecond".to_string()))
-        );
+        assert_eq!(effect, Some(prompt("first\nsecond")));
         assert!(app.input_text().is_empty());
     }
 
@@ -2036,7 +1962,7 @@ mod tests {
 
         type_text(&mut app, "/new");
         let effect = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(effect, Some(Effect::NewSession));
+        assert_eq!(effect, Some(command("/new", None)));
 
         // The loop fulfils the effect by clearing the transcript.
         app.apply(RenderItem::SessionChanged {
@@ -2056,7 +1982,7 @@ mod tests {
 
         type_text(&mut app, "/load sess-9");
         let effect = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(effect, Some(Effect::LoadSession("sess-9".to_string())));
+        assert_eq!(effect, Some(command("/load", Some("sess-9"))));
 
         app.apply(RenderItem::SessionChanged {
             id: "sess-9".into(),
@@ -2069,25 +1995,12 @@ mod tests {
     }
 
     #[test]
-    fn slash_load_without_id_is_an_error() {
-        let mut app = seeded_app();
-        type_text(&mut app, "/load");
-        let effect = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(effect, None);
-        let buffer = render_buffer(&mut app, 80, 12);
-        assert!(buffer_contains(&buffer, "/load needs a session id"));
-    }
-
-    #[test]
     fn failed_turn_appends_error_and_returns_to_input() {
         let mut app = seeded_app();
         // The user submits a prompt; the loop starts the turn and it fails.
         type_text(&mut app, "do the thing");
         let effect = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(
-            effect,
-            Some(Effect::SubmitPrompt("do the thing".to_string()))
-        );
+        assert_eq!(effect, Some(prompt("do the thing")));
 
         app.set_running(true);
         app.apply(RenderItem::Error(
@@ -2106,47 +2019,13 @@ mod tests {
     }
 
     #[test]
-    fn slash_help_and_slash_skills_render_lists() {
-        let mut app = seeded_app();
-        type_text(&mut app, "/help");
-        assert_eq!(app.handle_key(key(KeyCode::Enter)), None);
-        let buffer = render_buffer(&mut app, 100, 30);
-        // The help list is long, so assert on content anchored near the end of
-        // the list (the header may have scrolled off the pane).
-        assert!(buffer_contains(&buffer, "/!!"));
-        assert!(buffer_contains(&buffer, "Shift+Enter"));
-        assert!(buffer_contains(&buffer, "/skill:<name> runs one"));
-
-        let mut app = App::new(
-            "~/proj",
-            "sess-1",
-            "model-x",
-            "9.9.9",
-            vec![skill("grill", "stress-test a plan")],
-        );
-        type_text(&mut app, "/skills");
-        assert_eq!(app.handle_key(key(KeyCode::Enter)), None);
-        let buffer = render_buffer(&mut app, 100, 20);
-        assert!(buffer_contains(&buffer, "skills:"));
-        assert!(buffer_contains(&buffer, "/skill:grill"));
-    }
-
-    #[test]
-    fn unknown_command_suggests_and_error_renders() {
-        let mut app = seeded_app();
-        type_text(&mut app, "/nop");
-        let effect = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(effect, None);
-        let buffer = render_buffer(&mut app, 100, 12);
-        assert!(buffer_contains(&buffer, "unknown command: /nop"));
-        assert!(buffer_contains(&buffer, "/help"));
-    }
-
-    #[test]
     fn slash_exit_quits() {
         let mut app = seeded_app();
         type_text(&mut app, "/exit");
-        assert_eq!(app.handle_key(key(KeyCode::Enter)), Some(Effect::Quit));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Some(command("/exit", None))
+        );
     }
 
     #[test]
@@ -2155,39 +2034,22 @@ mod tests {
         type_text(&mut app, "/sessions");
         assert_eq!(
             app.handle_key(key(KeyCode::Enter)),
-            Some(Effect::ListSessions)
+            Some(command("/sessions", None))
         );
         type_text(&mut app, "/usage");
-        assert_eq!(app.handle_key(key(KeyCode::Enter)), Some(Effect::ShowUsage));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Some(command("/usage", None))
+        );
         type_text(&mut app, "/history");
         assert_eq!(
             app.handle_key(key(KeyCode::Enter)),
-            Some(Effect::ListHistory)
+            Some(command("/history", None))
         );
         type_text(&mut app, "/install-skill github:org/repo");
         assert_eq!(
             app.handle_key(key(KeyCode::Enter)),
-            Some(Effect::InstallSkill("github:org/repo".to_string()))
-        );
-    }
-
-    #[test]
-    fn skill_trigger_returns_effect() {
-        let mut app = App::new(
-            "~/proj",
-            "sess-1",
-            "model-x",
-            "9.9.9",
-            vec![skill("grill", "stress-test a plan")],
-        );
-        type_text(&mut app, "/grill my plan");
-        let effect = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(
-            effect,
-            Some(Effect::TriggerSkill {
-                name: "grill".to_string(),
-                arg: Some("my plan".to_string()),
-            })
+            Some(command("/install-skill", Some("github:org/repo")))
         );
     }
 
@@ -2197,18 +2059,19 @@ mod tests {
         type_text(&mut app, "/!!");
         assert_eq!(
             app.handle_key(key(KeyCode::Enter)),
-            Some(Effect::ReplayHistory(1))
+            Some(command("/!!", None))
         );
         type_text(&mut app, "/!3");
         assert_eq!(
             app.handle_key(key(KeyCode::Enter)),
-            Some(Effect::ReplayHistory(3))
+            Some(command("/!3", None))
         );
+        // A malformed index is still just a command: the CLI reports it.
         type_text(&mut app, "/!x");
-        let effect = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(effect, None);
-        let buffer = render_buffer(&mut app, 80, 12);
-        assert!(buffer_contains(&buffer, "unknown command: /!x"));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Some(command("/!x", None))
+        );
     }
 
     #[test]
@@ -2309,7 +2172,7 @@ mod tests {
         type_text(&mut app, "brand new");
         assert_eq!(
             app.handle_key(key(KeyCode::Enter)),
-            Some(Effect::SubmitPrompt("brand new".to_string()))
+            Some(prompt("brand new"))
         );
         assert_eq!(app.history, vec!["older", "recent", "brand new"]);
         // Recall the newest prompt and press Enter: it re-runs as a fresh
@@ -2318,7 +2181,7 @@ mod tests {
         assert_eq!(app.input_text(), "brand new");
         assert_eq!(
             app.handle_key(key(KeyCode::Enter)),
-            Some(Effect::ReplayPrompt("brand new".to_string()))
+            Some(replay("brand new"))
         );
         assert_eq!(app.history, vec!["older", "recent", "brand new"]);
     }
@@ -2330,34 +2193,15 @@ mod tests {
         type_text(&mut app, "/!!");
         assert_eq!(
             app.handle_key(key(KeyCode::Enter)),
-            Some(Effect::ReplayHistory(1))
+            Some(command("/!!", None))
         );
         type_text(&mut app, "/!2");
         assert_eq!(
             app.handle_key(key(KeyCode::Enter)),
-            Some(Effect::ReplayHistory(2))
+            Some(command("/!2", None))
         );
         // The `/!!` / `/!N` replay path never records into the snapshot.
         assert_eq!(app.history, vec!["older", "recent"]);
-    }
-
-    #[test]
-    fn slash_history_lists_prompts_as_transcript_entries() {
-        let mut app = seeded_app();
-        type_text(&mut app, "/history");
-        assert_eq!(
-            app.handle_key(key(KeyCode::Enter)),
-            Some(Effect::ListHistory)
-        );
-        // The loop fulfils the effect through the shared renderer.
-        let entries = vec!["one".to_string(), "two".to_string()];
-        let lines = render_history(&entries, HISTORY_DISPLAY);
-        for line in lines {
-            app.apply(RenderItem::Notice(line));
-        }
-        let buffer = render_buffer(&mut app, 60, 12);
-        assert!(buffer_contains(&buffer, "2: one"));
-        assert!(buffer_contains(&buffer, "1: two"));
     }
 
     #[test]
@@ -2376,7 +2220,7 @@ mod tests {
         let mut app = seeded_app();
         type_text(&mut app, "/");
         let comp = app.completion.as_ref().expect("popup should open on /");
-        assert!(comp.items.len() >= COMMANDS.len());
+        assert_eq!(comp.items.len(), 13);
         assert_eq!(comp.selected, 0);
         assert!(comp.items.iter().any(|i| i.value == "/help"));
     }
@@ -2437,7 +2281,7 @@ mod tests {
         // The popup's best match for `/us` is `/usage`; Enter expands and runs
         // it (Q4: execute the selection, not the literal partial text).
         let effect = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(effect, Some(Effect::ShowUsage));
+        assert_eq!(effect, Some(command("/usage", None)));
         assert!(app.completion.is_none());
         assert!(app.input_text().is_empty());
     }
@@ -2451,7 +2295,7 @@ mod tests {
         let comp = app.completion.as_ref().unwrap();
         assert_eq!(comp.items[0].value, "/sessions");
         let effect = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(effect, Some(Effect::ListSessions));
+        assert_eq!(effect, Some(command("/sessions", None)));
     }
 
     #[test]
@@ -2460,7 +2304,7 @@ mod tests {
         type_text(&mut app, "plain prompt");
         assert_eq!(
             app.handle_key(key(KeyCode::Enter)),
-            Some(Effect::SubmitPrompt("plain prompt".to_string()))
+            Some(prompt("plain prompt"))
         );
     }
 
@@ -2514,39 +2358,6 @@ mod tests {
         type_text(&mut app, "k");
         let comp = app.completion.as_ref().unwrap();
         assert_eq!(comp.items[comp.selected].value, "/skills");
-    }
-
-    #[test]
-    fn auto_selection_follows_reranked_best_match_while_typing() {
-        // Two skills share the `to-` prefix, so until the letters diverge the
-        // top pick is simply the pool-order first. Once `/to-s` ranks
-        // /skill:to-spec strictly above /skill:to-questionnaire (which is
-        // still a candidate), the untouched highlight must follow the new
-        // best match instead of sticking to the earlier pick.
-        let mut app = App::new(
-            "~/proj",
-            "sess-1",
-            "model-x",
-            "9.9.9",
-            vec![
-                skill("to-questionnaire", "questionnaire for someone else"),
-                skill("to-spec", "collapse an idea into a spec"),
-            ],
-        );
-        type_text(&mut app, "/t");
-        let comp = app.completion.as_ref().unwrap();
-        assert_eq!(comp.items[comp.selected].value, "/skill:to-questionnaire");
-        type_text(&mut app, "o-");
-        let comp = app.completion.as_ref().unwrap();
-        assert_eq!(comp.items[comp.selected].value, "/skill:to-questionnaire");
-        type_text(&mut app, "s");
-        let comp = app.completion.as_ref().unwrap();
-        let values: Vec<&str> = comp.items.iter().map(|i| i.value.as_str()).collect();
-        assert!(
-            values.contains(&"/skill:to-questionnaire"),
-            "old pick still a candidate: {values:?}"
-        );
-        assert_eq!(comp.items[comp.selected].value, "/skill:to-spec");
     }
 
     #[test]
@@ -2644,54 +2455,6 @@ mod tests {
         assert_eq!(
             cell_style(&buffer, 0, sep_y).fg,
             Some(Token::Border.color())
-        );
-    }
-
-    #[test]
-    fn completion_includes_installed_skills() {
-        let mut app = App::new(
-            "~/proj",
-            "sess-1",
-            "model-x",
-            "9.9.9",
-            vec![skill("grill", "stress-test a plan")],
-        );
-        type_text(&mut app, "/gr");
-        let comp = app.completion.as_ref().expect("popup open");
-        let values: Vec<&str> = comp.items.iter().map(|i| i.value.as_str()).collect();
-        assert!(values.contains(&"/skill:grill"), "{values:?}");
-    }
-
-    #[test]
-    fn runtime_skill_install_refreshes_completion_and_dispatch() {
-        let mut app = seeded_app();
-        // No skills installed yet: `/gr` matches no command and no skill.
-        type_text(&mut app, "/gr");
-        assert!(app.completion.is_none());
-
-        // A runtime `/install-skill` re-reads the store and pushes the fresh
-        // snapshot into the app (the terminal loop wires this up).
-        app.apply(RenderItem::Skills(vec![skill(
-            "grill",
-            "stress-test a plan",
-        )]));
-
-        // The next keystroke recomputes the popup: the new skill is
-        // predictable without a restart.
-        type_text(&mut app, "i");
-        let comp = app.completion.as_ref().expect("popup open");
-        let values: Vec<&str> = comp.items.iter().map(|i| i.value.as_str()).collect();
-        assert!(values.contains(&"/skill:grill"), "{values:?}");
-
-        // And the freshly installed skill dispatches as a skill trigger.
-        type_text(&mut app, "ll");
-        let effect = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(
-            effect,
-            Some(Effect::TriggerSkill {
-                name: "grill".to_string(),
-                arg: None
-            })
         );
     }
 

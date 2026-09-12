@@ -161,7 +161,7 @@ A Prompt entered across multiple lines in the TUI input box (Shift+Enter or Ctrl
 _Avoid_: block, paste
 
 **Completion popup**:
-The fuzzy candidate list shown above the TUI input box while a partial `/` command is typed (commands + installed skills, ranked best-first); it renders as bare SelectList rows (no box) directly above the input so the input box stays put when it opens/closes. `↑`/`↓` move the selection, `Tab` commits it to the buffer, `Enter` executes it, `Esc` cancels. Distinct from the post-submit "did you mean" notice.
+The fuzzy candidate list shown above the TUI input box while a partial `/` command is typed (whatever the CLI's injected CompletionProvider offers: commands + installed skills, ranked best-first); it renders as bare SelectList rows (no box) directly above the input so the input box stays put when it opens/closes. `↑`/`↓` move the selection, `Tab` commits it to the buffer, `Enter` executes it, `Esc` cancels. Distinct from the post-submit "did you mean" notice.
 _Avoid_: autocomplete box, suggestion popup, picker
 
 **Commit to buffer**:
@@ -189,8 +189,20 @@ The frontend-agnostic unit a Renderer consumes (turn marker, streamed text fragm
 _Avoid_: RenderText, view model
 
 **RenderItem**:
-The TUI's own display vocabulary: what the CLI's TUI adapter produces from a DisplayItem, and from CLI-owned state that is not an agent event (notices, skills, branch, session change, token usage), before the TUI applies it to its transcript. Distinct from DisplayItem (frontend-agnostic) and from Entry (the TUI's transcript model).
+The TUI's own display vocabulary: what the CLI's TUI adapter produces from a DisplayItem, and from CLI-owned state that is not an agent event (notices, errors, prompts, branch, session change, token usage), before the TUI applies it (`App::apply`) to its transcript. Distinct from DisplayItem (frontend-agnostic) and from Entry (the TUI's transcript model).
 _Avoid_: view model, ui event, display item
+
+**Effect**:
+The reducer's intent vocabulary: the only thing `App::handle_key` produces (submit this prompt, the user typed this `/` command, quit, cancel). It carries no semantics — `Command { name, arg }` means "the user asked for this command", not what it does; the CLI's UiHandler answers it (ADR-0013 D3).
+_Avoid_: action, command, event
+
+**UiHandler**:
+The runtime seam the CLI implements and the TUI library drives: answers Effects on the UI thread (`on_effect`), runs one turn on the library's worker thread (`submit`), and cancels a running turn (`cancel`). The library owns the frame loop, the render-item channel and the worker thread; the handler owns everything that decides what should happen.
+_Avoid_: controller, application, backend
+
+**CompletionProvider**:
+The `/`-candidate source injected into `App::new`: the reducer asks it for ranked `CompletionItem`s on every keystroke. The CLI builds it from the command registry and the skills store, so the TUI imports neither.
+_Avoid_: completer, registry, skill store
 
 **Theme**:
 A semantic color-token system (accent, border, borderAccent, muted, dim, userMessageBg, toolPendingBg, toolSuccessBg, toolErrorBg, markdown tokens, ...) whose names and hex values mirror pi's `dark.json`; the TUI resolves tokens to terminal colors at render time. Dark only.

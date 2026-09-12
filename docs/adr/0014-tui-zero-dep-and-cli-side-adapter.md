@@ -15,8 +15,12 @@ Two frontends, three vocabularies: `AgentEvent` (core) → `DisplayItem` (app, s
 ### D1 — `RenderItem` is the TUI's display vocabulary
 
 `RenderItem` carries only what the TUI renders: `Text`, `Reasoning`, `ToolStart`, `ToolResult`,
-`Notice`, `Error`, `UserPrompt`, `Usage(FooterUsage)`, `Skills(Vec<SkillInfo>)`,
-`Branch(Option<String>)`, `SessionChanged { id }`. CLI-owned state that is not derived from an
+`Notice`, `Error`, `UserPrompt`, `Usage(FooterUsage)`, `Branch(Option<String>)`,
+`SessionChanged { id }`.
+> **Amended by ticket 05**: the `Skills(Vec<SkillInfo>)` variant (and `SkillInfo` /
+> `SkillScope`) was dropped. With the completion pool injected at construction (D3) and `/skills`
+> text produced by the CLI as `Notice`s, the TUI holds no skill state at all, so a variant nothing
+> would produce or consume had no reason to exist. CLI-owned state that is not derived from an
 `AgentEvent` (notices, an installed-skills refresh, a branch change, a loaded session, token usage)
 is emitted as `RenderItem`s too, so there is exactly one channel the TUI applies.
 `DisplayItem::Turn` and `DisplayItem::Stop` are dropped by the adapter — the TUI already ignores

@@ -615,3 +615,69 @@ fn tmux_escape_cancels_a_running_turn() {
         redact(&ui.capture())
     );
 }
+
+/// Launch the same binary in one-shot mode (a prompt argument), so the pane
+/// captures what a piped invocation prints (ADR-0003's text mode).
+fn launch_one_shot(mock: &MockServer, ui: &Tmux, cwd: &Path, home: &Path, prompt: &str) {
+    let bin = env!("CARGO_BIN_EXE_slimcode");
+    let cmd = format!(
+        "cd {} && SLIMCODE_HOME={} SLIMCODE_AI_MODEL=mock-model DASHSCOPE_API_KEY=test-key SLIMCODE_AI_BASE_URL={} {} \"{}\"",
+        cwd.display(),
+        home.display(),
+        mock.base_url(),
+        bin,
+        prompt,
+    );
+    ui.send_literal(&cmd);
+    ui.send_keys("Enter");
+}
+
+/// The one-shot mode smoke: `slimcode "<prompt>"` against the same mock, with
+/// the real binary and the text renderer (no alternate screen). It shares the
+/// turn runner and the display mapping with the TUI, so this is the "both
+/// modes" half of the CLI's end-to-end coverage.
+#[test]
+fn tmux_smoke_one_shot_prints_a_run() {
+    if Command::new("tmux").arg("-V").output().is_err() {
+        eprintln!("skipping: tmux not available");
+        return;
+    }
+
+    let dir = std::env::temp_dir().join(format!("slimcode-oneshot-{}", std::process::id()));
+    let home = std::env::temp_dir().join(format!("slimcode-oneshot-home-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(dir.join("marker.txt"), "marker").unwrap();
+
+    let mock = MockServer::start(vec![sse(true), sse(false)]);
+    let ui = Tmux::new();
+    launch_one_shot(&mock, &ui, &dir, &home, "list the directory");
+
+    // The streamed reasoning line, the tool line with the real `ls` output,
+    // the follow-up answer, and the token-usage summary.
+    assert!(
+        ui.wait_for("> Thinking about the directory", Duration::from_secs(20)),
+        "reasoning not shown: {}",
+        redact(&ui.capture())
+    );
+    assert!(
+        ui.wait_for("✔ ls: marker.txt", Duration::from_secs(20)),
+        "tool result not shown: {}",
+        redact(&ui.capture())
+    );
+    assert!(
+        ui.wait_for("Second answer.", Duration::from_secs(20)),
+        "answer not shown: {}",
+        redact(&ui.capture())
+    );
+    assert!(
+        ui.wait_for(
+            "tokens: 1234 prompt (100 cached, 8.1%) + 56 completion = 1290 total",
+            Duration::from_secs(20)
+        ),
+        "usage summary not shown: {}",
+        redact(&ui.capture())
+    );
+}

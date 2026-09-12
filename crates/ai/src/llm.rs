@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde_json::Value;
 
 use crate::message::Message;
+use crate::wire::TokenUsage;
 
 /// A shared cancellation handle threaded through a run: one `Arc<AtomicBool>`
 /// observed by the runner boundaries, the provider's interruptible body read,
@@ -109,4 +110,31 @@ pub trait Provider {
         tools: &[ToolSpec],
         cancel: &CancelToken,
     ) -> Result<Vec<Delta>, String>;
+
+    /// Cumulative usage across every request this provider has run.
+    ///
+    /// Frontends read it after a turn for their token-usage display (ADR-0004);
+    /// it is part of the trait so a frontend can hold a boxed provider without
+    /// naming the concrete one (ADR-0013). Providers that do not track usage
+    /// keep the zero default.
+    fn total_usage(&self) -> TokenUsage {
+        TokenUsage::default()
+    }
+}
+
+/// Let a boxed provider stand in for a provider, so callers can keep the type
+/// erased (the CLI) or swap in a scripted one (tests).
+impl<T: Provider + ?Sized> Provider for Box<T> {
+    fn chat(
+        &mut self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        cancel: &CancelToken,
+    ) -> Result<Vec<Delta>, String> {
+        (**self).chat(messages, tools, cancel)
+    }
+
+    fn total_usage(&self) -> TokenUsage {
+        (**self).total_usage()
+    }
 }

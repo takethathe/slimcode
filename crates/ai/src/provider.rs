@@ -115,6 +115,12 @@ impl BailianProvider {
 }
 
 impl Provider for BailianProvider {
+    /// The provider's running totals: the CLI reads them for the footer stats
+    /// line and the `/usage` notice (ADR-0004, ADR-0013).
+    fn total_usage(&self) -> TokenUsage {
+        self.total_usage
+    }
+
     fn chat(
         &mut self,
         messages: &[Message],

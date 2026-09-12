@@ -1358,6 +1358,9 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 name = "slimcode"
 version = "0.1.0"
 dependencies = [
+ "crossterm",
+ "ratatui",
+ "serde_json",
  "slimcode-ai",
  "slimcode-app",
  "slimcode-commands",
@@ -1407,10 +1410,6 @@ dependencies = [
  "pulldown-cmark",
  "ratatui",
  "serde_json",
- "slimcode-ai",
- "slimcode-app",
- "slimcode-commands",
- "slimcode-core",
  "tui-textarea",
  "unicode-width 0.2.0",
 ]

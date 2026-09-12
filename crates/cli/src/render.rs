@@ -18,8 +18,8 @@
 //! dependency of its own.
 
 use std::io::Write;
-use std::sync::mpsc;
 
+use slimcode_ai::TokenUsage;
 use slimcode_app::render::{DisplayItem, Renderer, usage_summary};
 use slimcode_core::agent::StopReason;
 use slimcode_tui::footer::FooterUsage;
@@ -55,35 +55,42 @@ pub fn to_render_item(item: &DisplayItem) -> Option<RenderItem> {
             ok: *ok,
             result: result.clone(),
         },
-        DisplayItem::Usage(u) => RenderItem::Usage(FooterUsage::new(
-            u.prompt_tokens,
-            u.completion_tokens,
-            u.cached_tokens(),
-            u.cache_creation_tokens(),
-        )),
+        DisplayItem::Usage(u) => RenderItem::Usage(to_footer_usage(u)),
         DisplayItem::Turn { .. } | DisplayItem::Stop(_) => return None,
     })
 }
 
-/// The CLI's TUI adapter (ADR-0014 D2): a [`Renderer`] that runs on the turn's
-/// worker thread and sends [`RenderItem`]s over the TUI's channel. The TUI
-/// creates the channel and hands the sender to [`TuiAdapter::new`].
-pub struct TuiAdapter {
-    tx: mpsc::Sender<RenderItem>,
+/// The TUI's view of a provider's cumulative usage (ADR-0014 D1): the CLI does
+/// the conversion, so `slimcode-tui` never names the AI type.
+pub fn to_footer_usage(usage: &TokenUsage) -> FooterUsage {
+    FooterUsage::new(
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        usage.cached_tokens(),
+        usage.cache_creation_tokens(),
+    )
 }
 
-impl TuiAdapter {
-    pub fn new(tx: mpsc::Sender<RenderItem>) -> Self {
-        Self { tx }
+/// The CLI's TUI adapter (ADR-0014 D2): a [`Renderer`] that runs on the turn's
+/// worker thread and feeds each item into the library's emit callback. The
+/// library owns the channel and the frame loop; the CLI only decides how a
+/// `DisplayItem` looks in the TUI.
+pub struct TuiAdapter<'a> {
+    emit: &'a mut dyn FnMut(RenderItem),
+}
+
+impl<'a> TuiAdapter<'a> {
+    pub fn new(emit: &'a mut dyn FnMut(RenderItem)) -> Self {
+        Self { emit }
     }
 }
 
-impl Renderer for TuiAdapter {
+impl Renderer for TuiAdapter<'_> {
     fn render(&mut self, item: &DisplayItem) -> Result<(), String> {
-        match to_render_item(item) {
-            Some(render_item) => self.tx.send(render_item).map_err(|e| e.to_string()),
-            None => Ok(()),
+        if let Some(render_item) = to_render_item(item) {
+            (self.emit)(render_item);
         }
+        Ok(())
     }
 }
 
@@ -500,29 +507,19 @@ mod tests {
     }
 
     #[test]
-    fn tui_adapter_sends_mapped_items_and_skips_dropped_ones() {
-        let (tx, rx) = mpsc::channel::<RenderItem>();
-        let mut adapter = TuiAdapter::new(tx);
-        adapter
-            .render(&DisplayItem::Text("answer".to_string()))
-            .unwrap();
-        adapter.render(&DisplayItem::Turn { turn: 1 }).unwrap();
-        adapter
-            .render(&DisplayItem::Stop(StopReason::Completed))
-            .unwrap();
-        drop(adapter);
-
-        let items: Vec<RenderItem> = rx.iter().collect();
-        assert_eq!(items, vec![RenderItem::Text("answer".to_string())]);
-    }
-
-    #[test]
-    fn tui_adapter_reports_a_closed_channel() {
-        let (tx, rx) = mpsc::channel::<RenderItem>();
-        drop(rx);
-        let mut adapter = TuiAdapter::new(tx);
-        assert!(adapter.render(&DisplayItem::Text("x".to_string())).is_err());
-        // A dropped item never touches the channel, so it still succeeds.
-        assert!(adapter.render(&DisplayItem::Turn { turn: 1 }).is_ok());
+    fn tui_adapter_emits_mapped_items_and_skips_dropped_ones() {
+        let mut emitted: Vec<RenderItem> = Vec::new();
+        {
+            let mut record = |item: RenderItem| emitted.push(item);
+            let mut adapter = TuiAdapter::new(&mut record);
+            adapter
+                .render(&DisplayItem::Text("answer".to_string()))
+                .unwrap();
+            adapter.render(&DisplayItem::Turn { turn: 1 }).unwrap();
+            adapter
+                .render(&DisplayItem::Stop(StopReason::Completed))
+                .unwrap();
+        }
+        assert_eq!(emitted, vec![RenderItem::Text("answer".to_string())]);
     }
 }
