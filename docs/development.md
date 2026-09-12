@@ -25,13 +25,11 @@ cargo clippy --all-targets --all-features --message-format=json -- -D warnings
 
 ## 架构
 
-> **实施状态**：ADR-0011–0014（crate 分层与 cli 总入口 / 两层消息模型 / TUI 运行 seam / TUI 零依赖与 cli 侧适配器）已决策；ticket 01–05 已落地，只剩 ticket 06（矩阵测试 + 删除本节与「现状」表）。下面「目标架构」是设计基准；「现状」表与各模块段描述当前代码。
-
-### 目标架构（ADR-0011–0014）
+### crate 分层（ADR-0011–0014）
 
 cargo workspace，六个 crate，唯一二进制 `slimcode`：
 
-| crate | 包名 | 目标职责（对外界面） | 依赖 |
+| crate | 包名 | 职责（对外界面） | 依赖 |
 | --- | --- | --- | --- |
 | `crates/ai` | `slimcode-ai` | LLM 层：`Message`（wire 消息）/ `Provider` / `ToolSpec` / `Delta` / `FinishReason` / `CancelToken` / `TokenUsage` / wire 模型 | 无 slimcode 依赖 |
 | `crates/core` | `slimcode-core` | agent 运行时：`AgentEvent` / `AgentRunner`（loop + 可选闭包 hook 字段）/ `AgentMessage`(+`to_llm`) / `convert` / `Tool{spec,run}` / `RunConfig` / `StopReason` | → ai |
@@ -40,22 +38,9 @@ cargo workspace，六个 crate，唯一二进制 `slimcode`：
 | `crates/tui` | `slimcode-tui` | 终端图形库：`RenderItem` / `Effect` / `App`(new/apply/draw/handle_key) / `run(terminal, app, handler)` / `UiHandler` / 组件（theme/markdown/toolcall/footer/text/git） | **无 slimcode 依赖** |
 | `crates/cli` | `slimcode` | 唯一二进制 = 总入口：argv / 模式选择（one-shot 文本 vs 交互 TUI）/ 配置解析 / 服务构建 / 命令语义 / 会话落盘 / `TextRenderer` / `TuiAdapter` / 补全与文案 | → 全部 |
 
-重命名：`crates/core` → `crates/core`、`crates/app` → `crates/app`。关键依赖反转：`Provider` trait 与 LLM `Message` 由 `ai` 拥有（现状是 `ai` 反向依赖 `core`）。
+重命名（ticket 01）：`crates/agent` → `crates/core`、`crates/common` → `crates/app`。关键依赖反转（ticket 02）：`Provider` trait 与 LLM `Message` 由 `ai` 拥有，`ai` 不再反向依赖运行时。
 
 依赖方向由测试断言（ticket 06，`crates/cli/tests/architecture.rs`）：`ai` 无 slimcode 依赖；`core` → 仅 `ai`；`app` → `ai`/`core`/`commands`；`tui` 无 slimcode 依赖；`cli` → 全部；`tui` 源码不得出现 `SessionStore`/`SkillStore`/`Config`。
-
-**现状（迁移前，ticket 06 后删除）**：
-
-cargo workspace，六个 crate：
-
-| crate | 包名 | 职责 | 状态 |
-| --- | --- | --- | --- |
-| `crates/ai` | `slimcode-ai` | 统一 LLM provider 层（Provider trait + OpenAI-compatible/Bailian） | 起步（Bailian provider + wire 模型） |
-| `crates/core` | `slimcode-core` | agent 运行时、工具、会话状态 | 起步（edit 引擎 + 运行时循环 + 消息模型） |
-| `crates/commands` | `slimcode-commands` | 前端无关的 `/` 命令注册表与预测提示 | v1 新增（registry + suggest/find） |
-| `crates/app` | `slimcode-app` | 前端无关的应用模块（配置解析 / 会话与输入历史持久化 / skills 发现与安装 / 上下文组装 / 七工具绑定 / 共享渲染模型与 turn runner / setup seam） | v1 新增（自 cli 抽出 + TUI 共享 seam） |
-| `crates/tui` | `slimcode-tui` | 交互式全屏 TUI（纯 App core + crossterm/ratatui 终端循环；theme/markdown/toolcall/footer/git 纯函数模块） | v1 完成（pi 对齐：header/blocks/layout/footer/status） |
-| `crates/cli` | `slimcode` | 二进制入口 + 非交互 one-shot 前端（共享 runner + TextRenderer） | v1 完成（render/main） |
 
 ### crates/ai Bailian provider 与 LLM seam
 
@@ -166,8 +151,10 @@ tool_call_id，已不含日志专用字段），`core` 拥有会话单元 `Agent
   纯函数、无依赖、可独立单测，供 `/` 补全弹框的候选排序使用。
 
 这里只登记**内置**命令；安装的 **skill** 是另一组动态 `/` 触发
-（`slimcode-app::skills`），前端在预测部分 `/` 输入时把两者合并
-（`combined_suggestions`，同样在 `slimcode-app::skills`）。
+（`slimcode-app::skills`），同样是前端无关的纯函数：CLI 在启动时把命令表与 skills 快照
+合成注入 TUI 的 `/` 候选池（`app::skills::complete`，泛型自 `SkillView`：name/description
+只读视图，`Skill` 与任何前端快照各实现一次），did-you-mean 文案走
+`combined_suggestions`（同模块）；TUI 自己既不读注册表也不读 skills store（ADR-0014 D3）。
 
 ### crates/app 前端无关应用模块（`slimcode-app`）
 
@@ -242,9 +229,11 @@ tool_call_id，已不含日志专用字段），`core` 拥有会话单元 `Agent
   整个章节省略，默认提示词保持逐字节不变）+
   可自动调用 skill 广告（`with_skills`，build 时经 `format_skills_for_prompt` 过滤
   `disable-model-invocation`，产出 `## Skills` markdown 索引）+
-  可选 message history（`with_history(Vec<AgentMessage>)`，history 不含 system）+ user prompt（
-  `with_user_prompt`）或 skill 触发（`with_skill`，build 时扫描 history 中是否已有
-  `<skill name="..."` 标记来决定是否去重，再调用 `skill_prompt`）；
+  可选 message history（`with_history(Vec<AgentMessage>)`，history 不含 system）+ user prompt
+  （`with_user_prompt`）。skill 触发的消息文本由 CLI 渲染（`skills::skill_prompt`，先用
+  `context::skill_loaded_in` 对照 history 判断该 skill 是否已注入过，决定重复 body 还是
+  “already loaded” 提示），再作为普通 user message 传入 —— 命令与 skill 语义都在 CLI
+  （ADR-0013 D3）；
   `build()` 返回 `Context { system: ai::Message, messages: Vec<AgentMessage> }`（ADR-0012 D3）：
   system 由现组状态（基础提示、环境、context files、skills）合成，与 messages 分开返回，
   缺 user 时报错；一个回合只向 history 新增一条 prompt 消息；
@@ -401,10 +390,12 @@ span，代码围栏行映射等）、`toolcall`（内置工具紧凑调用标题
 - **one-shot 与 TUI 不漂移**：两端的 `DisplayItem` 映射、`usage_summary` 措辞与
   `ContextBuilder` 上下文组装仍来自 `app`；one-shot 从一开始就不经 TUI crate。
 
-### crates/cli 二进制（`slimcode`）
+### crates/cli 唯一二进制 = 总入口（`slimcode`）
 
-二进制入口 + 非交互 one-shot 前端，I/O 与逻辑分离（`run(args, out, tty)` 便于测试），
-按启动规则分派（`std::io::IsTerminal` 判定 stdout 是否 TTY）：
+唯一的二进制入口（ADR-0011 D3）：argv / 模式选择 / 配置解析 / 服务构建 / 命令语义 /
+会话落盘 / 两个显示适配器（one-shot 文本与 TUI）全在这里；TUI 只是它进入的一个库。I/O 与
+逻辑分离（`run(args, out, tty)` 便于测试），按启动规则分派（`std::io::IsTerminal` 判定
+stdout 是否 TTY）：
 
 - `--help` / `-h`：打印用法后退出；
 - `slimcode config`：第一个参数为 `config` 时特判为子命令（先于 prompt 解析）→

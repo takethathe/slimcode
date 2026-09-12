@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use slimcode_core::session::{AgentMessage, Message, Role};
 
 use crate::context_files::{ContextFile, format_context_files};
-use crate::skills::{Skill, format_skills_for_prompt, skill_prompt};
+use crate::skills::{Skill, format_skills_for_prompt};
 
 /// Default base system prompt grounding the agent in its tools and working
 /// directory. Skill descriptions are appended on top by the builder's `build()`.
@@ -85,16 +85,6 @@ fn build_system_prompt(
     prompt
 }
 
-/// One turn's user message: either a plain prompt or a skill trigger. The
-/// skill body is rendered at `build()` time so a skill already loaded in an
-/// earlier message of the history can be replaced by an already-loaded notice
-/// instead of being repeated.
-#[derive(Debug)]
-enum UserInput {
-    Prompt(String),
-    Skill { skill: Skill, arg: Option<String> },
-}
-
 /// Has this skill's `<skill name="...">` block already been injected into one
 /// of the history messages? Detected from the XML wrapper the trigger inserts,
 /// so the check is stateless and survives session reloads.
@@ -110,7 +100,7 @@ pub fn skill_loaded_in(history: &[AgentMessage], skill: &Skill) -> bool {
 pub struct Context {
     /// The system message for this turn — never stored in a Session.
     pub system: Message,
-    /// The history plus this turn's user message (prompt or skill trigger).
+    /// The history plus this turn's user message.
     pub messages: Vec<AgentMessage>,
 }
 
@@ -129,7 +119,7 @@ pub struct ContextBuilder {
     skills: Vec<Skill>,
     context_files: Vec<ContextFile>,
     history: Vec<AgentMessage>,
-    user: Option<UserInput>,
+    user: Option<String>,
 }
 
 impl ContextBuilder {
@@ -180,21 +170,12 @@ impl ContextBuilder {
         self
     }
 
-    /// Set this turn's user message from a plain prompt.
+    /// Set this turn's user message. A skill trigger is a user message too:
+    /// the CLI renders it with [`crate::skills::skill_prompt`] (deduped against
+    /// the history via [`skill_loaded_in`]) and passes the text here, so
+    /// command and skill semantics stay on the CLI side (ADR-0013 D3).
     pub fn with_user_prompt(mut self, prompt: impl Into<String>) -> Self {
-        self.user = Some(UserInput::Prompt(prompt.into()));
-        self
-    }
-
-    /// Set this turn's user message from a skill trigger. The skill body is
-    /// rendered at `build()` time via [`crate::skills::skill_prompt`], so a
-    /// skill already loaded in the supplied history is replaced by an
-    /// already-loaded notice instead of being repeated.
-    pub fn with_skill(mut self, skill: &Skill, arg: Option<&str>) -> Self {
-        self.user = Some(UserInput::Skill {
-            skill: skill.clone(),
-            arg: arg.map(str::to_string),
-        });
+        self.user = Some(prompt.into());
         self
     }
 
@@ -206,20 +187,12 @@ impl ContextBuilder {
     ///   for whatever was supplied. It is returned separately and never enters
     ///   the message list (ADR-0012 D3).
     /// - The message list is the supplied history followed by exactly one
-    ///   `Role::User` message (prompt or skill trigger); a skill trigger whose
-    ///   `<skill name="...">` block already appears in the history is
-    ///   deduplicated (body replaced, base-dir reference kept).
+    ///   `Role::User` message: the caller's prompt text, or a skill trigger it
+    ///   rendered itself.
     pub fn build(self) -> Result<Context, String> {
-        let user = match self.user {
-            Some(UserInput::Prompt(prompt)) => prompt,
-            Some(UserInput::Skill { skill, arg }) => {
-                let already_loaded = skill_loaded_in(&self.history, &skill);
-                skill_prompt(&skill, arg.as_deref(), already_loaded)
-            }
-            None => {
-                return Err("no user message set: call with_user_prompt or with_skill".to_string());
-            }
-        };
+        let user = self
+            .user
+            .ok_or_else(|| "no user message set: call with_user_prompt".to_string())?;
         let system = Message::text(
             Role::System,
             build_system_prompt(
@@ -460,118 +433,16 @@ mod tests {
     }
 
     #[test]
-    fn with_skill_sets_user_message_from_skill() {
+    fn skill_loaded_in_detects_the_xml_marker() {
         let s = skill("demo", "A demo skill", false);
-        let context = ContextBuilder::new()
-            .with_system("sys")
-            .with_skill(&s, None)
-            .build()
-            .unwrap();
-        let user = context.messages[0].text_content();
-        assert!(user.starts_with("<skill name=\"demo\""), "got: {user}");
-        assert!(user.ends_with("</skill>"), "got: {user}");
-        assert!(!user.contains("Task:"), "got: {user}");
-    }
-
-    #[test]
-    fn with_skill_embeds_skill_directory_and_file() {
-        let s = Skill {
-            name: "demo".to_string(),
-            description: "A demo skill".to_string(),
-            disable_model_invocation: false,
-            body: "Do the demo.".to_string(),
-            scope: SkillScope::User,
-            dir: std::path::PathBuf::from("/tmp/skills/demo"),
-            file: std::path::PathBuf::from("/tmp/skills/demo/SKILL.md"),
-        };
-        let context = ContextBuilder::new()
-            .with_system("sys")
-            .with_skill(&s, None)
-            .build()
-            .unwrap();
-        let user = context.messages[0].text_content();
-        assert!(
-            user.contains("References are relative to /tmp/skills/demo."),
-            "got: {user}"
-        );
-        assert!(
-            user.contains("location=\"/tmp/skills/demo/SKILL.md\""),
-            "got: {user}"
-        );
-        assert!(user.contains("Do the demo."));
-    }
-
-    #[test]
-    fn with_skill_embeds_task_argument() {
-        let s = skill("demo", "A demo skill", false);
-        let context = ContextBuilder::new()
-            .with_system("sys")
-            .with_skill(&s, Some("run it now"))
-            .build()
-            .unwrap();
-        let user = context.messages[0].text_content();
-        assert!(user.ends_with("</skill>\n\nrun it now"), "got: {user}");
-    }
-
-    #[test]
-    fn with_skill_dedupes_when_already_loaded_in_history() {
-        let s = Skill {
-            name: "demo".to_string(),
-            description: "A demo skill".to_string(),
-            disable_model_invocation: false,
-            body: "Do the demo.".to_string(),
-            scope: SkillScope::User,
-            dir: std::path::PathBuf::from("/tmp/skills/demo"),
-            file: std::path::PathBuf::from("/tmp/skills/demo/SKILL.md"),
-        };
-        // The skill was already loaded in an earlier user message: its body is
-        // replaced by an already-loaded notice, but the base-dir reference line
-        // is kept.
+        assert!(!skill_loaded_in(&[], &s));
         let history = vec![AgentMessage::text(
             Role::User,
-            skill_prompt(&s, None, false),
+            "please run <skill name=\"demo\"> the demo",
         )];
-        let context = ContextBuilder::new()
-            .with_system("sys")
-            .with_history(history)
-            .with_skill(&s, None)
-            .build()
-            .unwrap();
-        let user = context.messages[1].text_content();
-        assert!(
-            user.contains("References are relative to /tmp/skills/demo."),
-            "got: {user}"
-        );
-        assert!(user.contains("already loaded"), "got: {user}");
-        assert!(!user.contains("Do the demo."), "got: {user}");
-    }
-
-    #[test]
-    fn with_skill_not_deduped_when_absent_from_history() {
-        let s = Skill {
-            name: "demo".to_string(),
-            description: "A demo skill".to_string(),
-            disable_model_invocation: false,
-            body: "Do the demo.".to_string(),
-            scope: SkillScope::User,
-            dir: std::path::PathBuf::from("/tmp/skills/demo"),
-            file: std::path::PathBuf::from("/tmp/skills/demo/SKILL.md"),
-        };
-        // A different skill in history does not trigger dedup.
-        let other = skill("other", "Other skill", false);
-        let history = vec![AgentMessage::text(
-            Role::User,
-            skill_prompt(&other, None, false),
-        )];
-        let context = ContextBuilder::new()
-            .with_system("sys")
-            .with_history(history)
-            .with_skill(&s, None)
-            .build()
-            .unwrap();
-        let user = context.messages[1].text_content();
-        assert!(user.contains("Do the demo."), "got: {user}");
-        assert!(!user.contains("already loaded"), "got: {user}");
+        assert!(skill_loaded_in(&history, &s));
+        // A different skill's marker does not count.
+        assert!(!skill_loaded_in(&history, &skill("other", "x", false)));
     }
 
     #[test]

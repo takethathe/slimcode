@@ -7,24 +7,26 @@
 ## 特性
 
 - 单次非交互模式：`slimcode "为 README 补一段简介"`
-- 交互式 REPL：`/help`、`/new`、`/load`、`/usage`、`/history` 等命令，
+- 交互式全屏 TUI：`/help`、`/new`、`/load`、`/usage`、`/history` 等命令，
   未知 `/` 命令给出预测提示（前缀匹配建议）
 - 流式渲染 agent 输出，会话按消息逐条追加保存
 - 基于 DashScope（百炼）OpenAI 兼容接口，默认使用 `qwen-plus` 模型
-- 多行 prompt（以 `\` 结尾续行）与跨运行输入历史
+- 多行 prompt（TUI 内 `Shift+Enter` 换行）与跨运行输入历史
 - 前端无关的命令注册表与预测逻辑（`slimcode-commands`）与公共应用模块（`slimcode-app`），可供其它前端复用
 
 ## 架构
 
-cargo workspace，五个 crate：
+cargo workspace，六个 crate，唯一二进制 `slimcode`；依赖单向、由测试断言
+（`crates/cli/tests/architecture.rs`，见 ADR-0011）：
 
 | crate | 包名 | 职责 |
 | --- | --- | --- |
-| `crates/ai` | `slimcode-ai` | 统一 LLM provider 层（Provider trait + OpenAI-compatible/Bailian） |
-| `crates/core` | `slimcode-core` | agent 运行时、七工具引擎、会话消息模型 |
-| `crates/commands` | `slimcode-commands` | 前端无关的 `/` 命令注册表与预测提示（suggest/find） |
-| `crates/app` | `slimcode-app` | 前端无关的应用模块：配置解析 / 会话与输入历史持久化 / 七工具绑定 |
-| `crates/cli` | `slimcode` | 二进制入口 + 终端前端（非交互模式 + REPL） |
+| `crates/ai` | `slimcode-ai` | LLM 层：wire `Message` / `Provider` / `ToolSpec` / `Delta` / `TokenUsage`（无 slimcode 依赖） |
+| `crates/core` | `slimcode-core` | agent 运行时：`AgentEvent` / runner 循环 / `AgentMessage` / `Tool{spec,run}`（→ ai） |
+| `crates/commands` | `slimcode-commands` | 纯命令注册表 + 模糊预测（无依赖） |
+| `crates/app` | `slimcode-app` | 前端无关应用层：`DisplayItem`/`map_event`/`Renderer`/`run_turn`、上下文组装、会话与输入历史持久化、skills、七工具（→ ai, core, commands） |
+| `crates/tui` | `slimcode-tui` | 终端图形库：`App` reducer + 帧循环 + `RenderItem`/`UiHandler` seam（无 slimcode 依赖） |
+| `crates/cli` | `slimcode` | 唯一二进制 = 总入口：argv / 模式选择（one-shot 文本 vs 交互 TUI）/ 配置 / 服务构建 / 命令语义 / 会话落盘 / 两个显示适配器 |
 
 ## 安装
 
@@ -90,9 +92,9 @@ slimcode --model qwen-max "为 README 补一段简介"
 
 运行结束后打印 token 用量（一次性 CLI 不落盘会话）。
 
-### 交互式 REPL
+### 交互式 TUI
 
-不带参数启动即进入 REPL，会话以追加式 JSONL 日志逐条写入
+不带参数启动即进入全屏 TUI，会话以追加式 JSONL 日志逐条写入
 `~/.slimcode/sessions/<project-key>/<id>.jsonl`（首个 assistant 消息出现时才
 创建文件，之后每条进入历史的消息各占一行）：
 
@@ -102,7 +104,7 @@ slimcode
 
 | 命令 | 作用 |
 | --- | --- |
-| `<prompt>` | 作为用户消息运行一轮 agent 循环；以 `\` 结尾的行续行 |
+| `<prompt>` | 作为用户消息运行一轮 agent 循环（`Shift+Enter` 换行） |
 | `/help` | 列出命令 |
 | `/new` | 新建会话 |
 | `/load <id>` | 从磁盘恢复一个已保存会话（`/resume` 同义） |
@@ -116,7 +118,7 @@ slimcode
 输入未知的 `/` 命令时会给出**预测提示**：按已输入前缀匹配命令名或其别名
 （如 `/his` → `did you mean: /history`），前缀为 `/` 时列出全部命令，完全无法
 匹配时提示运行 `/help`。该提示来自前端无关的 `slimcode-commands` 注册表，
-任何前端（当前 REPL、未来 TUI/Web）都能复用同一套命令定义与补全逻辑。
+任何前端（当前 TUI、未来 Web）都能复用同一套命令定义与补全逻辑。
 
 ## 文档
 

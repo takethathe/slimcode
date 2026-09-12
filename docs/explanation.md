@@ -116,10 +116,10 @@ notice 行（措辞与 CLI 共用 `usage_summary`，含同样式汇总）。`{pc
 
 ## 设计动机
 
-上下文组装曾散落在 CLI 两个入口（非交互 `run_once` 与交互前端的 `submit_prompt`）
+上下文组装曾散落在 CLI 的两个前端（非交互 `run_once` 与交互 TUI 的 `submit_prompt`）
 各自实现一遍「system / message history / user」规则，skill 触发再绕一层，规则
 重复、容易漂移。把组装收敛为 `slimcode-app::context` 的单一 `ContextBuilder`
-后，one-shot 入口与 TUI 消费同一套规则，未来 Web 前端也可直接复用。
+后，one-shot 前端与 TUI（在 CLI 里）消费同一套规则，未来 Web 前端也可直接复用。
 
 同样地，渲染与 turn 执行曾由 CLI 独占：事件→输出的映射和 turn 循环只在
 `crates/cli` 里，TUI 若另写一套必然漂移。把 `map_event` / `DisplayItem` /
