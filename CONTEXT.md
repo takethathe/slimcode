@@ -46,10 +46,29 @@ _Avoid_: history (bare — collides with message history), shell history
 **Context**:
 The assembled list of Messages for one turn, produced by `ContextBuilder::build()`
 and handed straight to the agent runtime. Built from a base system prompt (default or
-overridden), an advertised skills list, an optional message history, and a user prompt
-or skill trigger. Distinct from message history (`session.messages`, which may be the
-`with_history` input) and from input history.
+overridden), injected context files (global + project `AGENTS.md`), an advertised
+skills list, an optional message history, and a user prompt or skill trigger. Distinct
+from message history (`session.messages`, which may be the `with_history` input) and
+from input history.
 _Avoid_: context window (collides with the LLM notion), assembled messages
+
+**Context file**:
+A discovered `AGENTS.md` injected into the system message's `## Project context`
+markdown section (pi-style, but with a markdown header instead of a
+`<project_context>` XML wrapper). Two scopes: **global** (`<home>/AGENTS.md`, i.e.
+`$SLIMCODE_HOME` or `~/.slimcode`, applies to every project) and **project**
+(`AGENTS.md` in the working directory itself and in the git repository root —
+the nearest ancestor holding a `.git` entry, whether a directory or a
+`gitdir:` file marker; ordered root-first so cwd lands last). Each injected
+file's content is wrapped in a `<project_instructions path scope>` XML block
+(its `scope="global|project"` attribute labels the intent), and the section
+declares that project requirements override global ones when they conflict.
+When no `AGENTS.md` can be injected the whole section is omitted, so the system
+message is byte-identical to a run without this feature. Discovery is
+infallible (missing files yield none) and deduplicated by path in favour of the
+global scope. Distinct from a Skill (instructions on demand via
+`/skill:name`) — a context file is always loaded into the system message.
+_Avoid_: project instructions file (ambiguity with scope), rules file
 
 **Multi-line prompt**:
 A Prompt entered across multiple lines in the TUI input box (Shift+Enter or Ctrl+J inserts a newline; Enter submits). Stored and submitted as a single Prompt.

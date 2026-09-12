@@ -11,7 +11,10 @@
 //! - [`skills`]: `Skill` model + `SkillStore` for user/project-scoped skill
 //!   discovery, installation, and `/`-trigger prediction.
 //! - [`context`]: `ContextBuilder` assembling one turn's message list from a
-//!   system prompt, skills, history, and a user prompt / skill trigger.
+//!   system prompt, context files, skills, history, and a user prompt / skill
+//!   trigger.
+//! - [`context_files`]: `AGENTS.md` discovery (global home file + project
+//!   cwd/git-root files) and its `## Project context` system-prompt rendering.
 //! - [`tools`]: the seven-tool set bound to a working directory.
 //! - [`render`]: the frontend-agnostic renderer seam — `DisplayItem`,
 //!   `map_event`, and the `Renderer` trait (ADR-0004).
@@ -21,6 +24,7 @@
 
 pub mod config;
 pub mod context;
+pub mod context_files;
 pub mod history;
 pub mod render;
 pub mod runner;

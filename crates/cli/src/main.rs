@@ -25,6 +25,7 @@ use slimcode_agent::agent::Message;
 use slimcode_ai::BailianConfig;
 use slimcode_common::config::{self, Overrides};
 use slimcode_common::context::ContextBuilder;
+use slimcode_common::context_files::{ContextFile, load_context_files};
 use slimcode_common::history::HistoryStore;
 use slimcode_common::render::{DisplayItem, Renderer};
 use slimcode_common::session::{SessionStore, infer_title};
@@ -64,6 +65,7 @@ fn run_once(
     config: BailianConfig,
     store: &SessionStore,
     skills: &[Skill],
+    context_files: &[ContextFile],
     out: &mut dyn Write,
 ) -> Result<i32, String> {
     let (mut provider, tools) = slimcode_common::setup::setup(cwd, config)?;
@@ -77,6 +79,7 @@ fn run_once(
         prompt.as_str(),
     )]);
     let messages = ContextBuilder::new()
+        .with_context_files(context_files)
         .with_skills(skills)
         .with_user_prompt(prompt)
         .build()?;
@@ -108,8 +111,9 @@ fn run_tui(
     store: &SessionStore,
     history: &HistoryStore,
     skills: &SkillStore,
+    context_files: &[ContextFile],
 ) -> Result<i32, String> {
-    slimcode_tui::terminal::run(cwd, config, store, history, skills)
+    slimcode_tui::terminal::run(cwd, config, store, history, skills, context_files)
 }
 
 fn main() {
@@ -209,10 +213,19 @@ fn run(args: &[String], out: &mut dyn Write, tty: bool) -> Result<i32, String> {
     let skills_store = SkillStore::new(&home, &cwd);
     // Skill discovery failures must not block a run; `/skills` surfaces them.
     let skills = skills_store.list().unwrap_or_default();
+    // AGENTS.md discovery is infallible: missing files simply yield none.
+    let context_files = load_context_files(&home, &cwd);
 
     match parsed.prompt {
-        Some(p) => run_once(&p, &cwd, app_config, &store, &skills, out),
-        None => run_tui(&cwd, app_config, &store, &history, &skills_store),
+        Some(p) => run_once(&p, &cwd, app_config, &store, &skills, &context_files, out),
+        None => run_tui(
+            &cwd,
+            app_config,
+            &store,
+            &history,
+            &skills_store,
+            &context_files,
+        ),
     }
 }
 

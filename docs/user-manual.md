@@ -282,6 +282,29 @@ frontmatter 的 `name`，与所在深度无关。同一 scope 内同名冲突时
   `did you mean: /skill:tdd`）；裸 `/` 列出全部。
 
 
+### AGENTS.md 上下文文件（始终注入的指令）
+
+除了按需触发的 Skill，slimcode 还会把 `AGENTS.md` 上下文文件**自动注入系统提示词**
+（对齐 pi 的 project context 加载）。每轮新会话首轮 system 消息里都会包含这些文件，
+作为 agent 的常驻指令。发现规则：
+
+- **全局**：`~/.slimcode/AGENTS.md`（可用 `SLIMCODE_HOME` 覆盖目录），对所有项目生效；
+- **项目**：只判定两个位置——当前工作目录自身，以及 **git 仓库根**（最近的含
+  `.git` 条目的祖先目录；`.git` 可以是目录，也可以是 `gitdir:` 文件标记，兼容
+  worktree/submodule）；git 根在前、cwd 在后的顺序注入；同一路径只注入一次
+  （在 `~` 下运行时全局文件不会重复出现）。
+
+注入内容以 `## Project context` markdown 章节出现在 system 消息里，每个文件的内容
+被一个 `<project_instructions path scope>` XML 块包裹并标注其作用域
+（`scope="global"` 或 `scope="project"`），段首声明**项目要求可覆盖全局要求**
+（当两者冲突时以项目为准）。用 XML 块包裹内容，文件内部的标题/列表不会与外层
+markdown 结构冲突。与 Skill 的区别：Skill 按需触发（`/skill:name`），上下文文件则
+始终加载、无需触发。
+
+写法示例——全局 `~/.slimcode/AGENTS.md` 放跨项目习惯（如“所有代码注释只用英文”），
+项目根 `AGENTS.md` 放本仓库约定（如“提交前先跑 `cargo fmt`”）与工程纪律；项目
+要求声明在全局之上。
+
 ### 输入历史与多行 prompt
 
 输入历史（`input history`，区别于会话的消息历史 `message history`）记录你提交过的

@@ -8,6 +8,7 @@
 
 use slimcode_agent::session::{Message, Role};
 
+use crate::context_files::{ContextFile, format_context_files};
 use crate::skills::{Skill, format_skills_for_prompt, skill_prompt};
 
 /// Default base system prompt grounding the agent in its tools and working
@@ -23,14 +24,18 @@ pub const DEFAULT_SYSTEM_PROMPT: &str = concat!(
     "- When a tool fails, read the error and retry with a corrected approach."
 );
 
-/// Assemble the full system prompt: the base grounding plus a `## Skills`
-/// markdown index of auto-invokable skills (those without
-/// `disable-model-invocation: true`), each bullet carrying its name,
-/// description, and the `SKILL.md` file the model can `read`. Skills marked
+/// Assemble the full system prompt: the base grounding plus a
+/// `## Project context` markdown section of context files (global + project
+/// `AGENTS.md`, pi-style, with scope-labelled XML blocks and a
+/// project-overrides-global note), plus a `## Skills` markdown index of
+/// auto-invokable skills (those without `disable-model-invocation: true`),
+/// each bullet carrying its name, description, and the `SKILL.md` file the
+/// model can `read`. Skills marked
 /// `disable-model-invocation` stay out of the system prompt and are only
 /// reachable through an explicit `/skill:name` trigger.
-fn build_system_prompt(base: &str, skills: &[Skill]) -> String {
+fn build_system_prompt(base: &str, skills: &[Skill], context_files: &[ContextFile]) -> String {
     let mut prompt = base.to_string();
+    prompt.push_str(&format_context_files(context_files));
     prompt.push_str(&format_skills_for_prompt(skills));
     prompt
 }
@@ -57,13 +62,14 @@ fn skill_loaded_in(history: &[Message], skill: &Skill) -> bool {
 ///
 /// Components are optional and added as needed: the system prompt defaults to
 /// [`DEFAULT_SYSTEM_PROMPT`] (overridable via [`ContextBuilder::with_system`]),
-/// skills are advertised only when a fresh system message is seeded, and a
-/// non-empty history is never re-seeded. `build()` returns the assembled
+/// context files and skills are injected only when supplied, and a non-empty
+/// history is never re-seeded. `build()` returns the assembled
 /// `Vec<Message>`, ready for `run_agent_from_messages`.
 #[derive(Debug)]
 pub struct ContextBuilder {
     system: String,
     skills: Vec<Skill>,
+    context_files: Vec<ContextFile>,
     history: Vec<Message>,
     user: Option<UserInput>,
 }
@@ -74,6 +80,7 @@ impl ContextBuilder {
         Self {
             system: DEFAULT_SYSTEM_PROMPT.to_string(),
             skills: Vec::new(),
+            context_files: Vec::new(),
             history: Vec::new(),
             user: None,
         }
@@ -88,6 +95,13 @@ impl ContextBuilder {
     /// Advertise a skills list (auto-invokable skills only, filtered at build).
     pub fn with_skills(mut self, skills: &[Skill]) -> Self {
         self.skills = skills.to_vec();
+        self
+    }
+
+    /// Inject context files (`AGENTS.md`, global + project, pi-style) into
+    /// the system prompt between the base and the skills index.
+    pub fn with_context_files(mut self, files: &[ContextFile]) -> Self {
+        self.context_files = files.to_vec();
         self
     }
 
@@ -142,7 +156,7 @@ impl ContextBuilder {
         if messages.is_empty() {
             messages.push(Message::text(
                 Role::System,
-                build_system_prompt(&base, &self.skills),
+                build_system_prompt(&base, &self.skills, &self.context_files),
             ));
         }
         messages.push(Message::text(Role::User, user));
@@ -487,5 +501,49 @@ mod tests {
     fn build_errors_without_user_message() {
         let err = ContextBuilder::new().build().unwrap_err();
         assert!(err.contains("user message"), "err: {err}");
+    }
+
+    // --- context files (AGENTS.md) injection ------------------------------
+
+    #[test]
+    fn context_files_inject_between_base_and_skills() {
+        use crate::context_files::ContextScope;
+        use std::path::PathBuf;
+
+        let files = vec![ContextFile {
+            path: PathBuf::from("/tmp/AGENTS.md"),
+            content: "do the thing".to_string(),
+            scope: ContextScope::Project,
+        }];
+        let skills = vec![skill("auto", "runs automatically", false)];
+        let messages = ContextBuilder::new()
+            .with_context_files(&files)
+            .with_skills(&skills)
+            .with_user_prompt("hello")
+            .build()
+            .unwrap();
+        let system = messages[0].text_content();
+        let base = system.find("You are slimcode").unwrap();
+        let ctx = system.find("## Project context").unwrap();
+        let skills_idx = system.find("## Skills").unwrap();
+        assert!(base < ctx, "context files must follow the base prompt");
+        assert!(ctx < skills_idx, "skills index must follow context files");
+        assert!(system.contains("scope=\"project\""), "got: {system}");
+        assert!(system.contains("do the thing"), "got: {system}");
+        assert!(
+            system.contains("project requirements override global requirements"),
+            "got: {system}"
+        );
+    }
+
+    #[test]
+    fn no_context_files_has_no_project_context_section() {
+        let messages = ContextBuilder::new()
+            .with_user_prompt("hello")
+            .build()
+            .unwrap();
+        let system = messages[0].text_content();
+        assert!(!system.contains("## Project context"), "got: {system}");
+        assert!(!system.contains("AGENTS.md"), "got: {system}");
     }
 }

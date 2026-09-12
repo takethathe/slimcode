@@ -189,6 +189,18 @@ cargo workspace，六个 crate：
   `<skill name="..."` 标记来决定是否去重，再调用 `skill_prompt`）；
   `build()` 返回可直接交给 `run_agent_from_messages` 的 `Vec<Message>`，缺
   user 时报错；空 history 前置一条 system 消息；
+- `context_files`：`AGENTS.md` 上下文文件的发现与渲染（对齐 pi 的项目上下文加载）：
+  先读全局 `<home>/AGENTS.md`（scope `global`）；project 只判定两个位置——cwd 自身
+  与 **git 仓库根**（最近的含 `.git` 条目的祖先目录，`.git` 可以是目录或
+  `gitdir:` 文件标记，兼容 worktree/submodule），按 git 根在前、cwd 在后的顺序
+  （scope `project`），按规范化路径去重（cwd 嵌套在 home 下时全局文件不再重复
+  作为 project）。`format_context_files` 把它们渲染成 `## Project context` markdown
+  章节（对齐 `## Skills` / `## Tools` 的标题层级），每个文件一个
+  `<project_instructions path scope>` XML 块包裹内容（`scope="global|project"`
+  标注意图，XML 块隔离内容，防止 AGENTS.md 内部的 `#` 标题/列表与外层 markdown
+  冲突），段首声明项目要求可覆盖全局要求；没有可注入的 AGENTS.md 时整个章节
+  省略，system 与未启用该功能时逐字节一致；注入位置在基础 system 之后、
+  `## Skills` 索引之前；发现逻辑无失败路径（文件缺失即返回空列表）。
 - `tools`：把七工具 factory 绑定到启动 `cwd`。
 - `render`（ADR-0004）：前端无关的显示模型。`DisplayItem` 是渲染单元（turn 标记 /
   流式文本片段 / 思考行 / 工具开始与结果 / 停止标记 / token 用量）；

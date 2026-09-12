@@ -44,6 +44,26 @@ history**（`session.messages`）是会话中已发生的消息，可被当作 C
 - 当轮 user 消息必须存在（`with_user_prompt` 或 `with_skill`），否则
   `build()` 报错，而不是静默产出没有 user 消息的 turn。
 
+### AGENTS.md 上下文文件注入（pi 对齐）
+
+slimcode 会把 `AGENTS.md` 上下文文件注入到 system 消息里（对齐 pi 的 project
+context 加载，见 `slimcode-common::context_files`）。发现规则：
+
+- **全局**：`<home>/AGENTS.md`（`$SLIMCODE_HOME` 或 `~/.slimcode`，跨项目生效），
+  scope 标为 `global`。
+- **项目**：只判定两个位置——cwd 自身，以及 **git 仓库根**（最近的含 `.git` 条目
+  的祖先目录；`.git` 可以是目录，也可以是 `gitdir:` 文件标记，兼容
+  worktree/submodule），scope 标为 `project`；git 根在前、cwd 在后的顺序注入；
+  同一路径只注入一次（cwd 嵌套在 home 下时，全局文件不会被重复当作项目文件）。
+
+渲染时整个章节用 markdown 标题 `## Project context`（与 `## Skills` / `## Tools`
+同层），每个文件的内容被一个 `<project_instructions path="…" scope="…">` XML 块
+包裹（`scope="global|project"` 标注意图；XML 块把文件内容隔离成原子单元，
+防止 AGENTS.md 内部的 `#` 标题/列表与外层 markdown 结构互相干扰），段首声明
+**项目要求可覆盖全局要求**（仅声明，不做程序级合并；两个文件都是自由文本）。
+上下文文件章节位于基础 system 之后、`## Skills` 索引之前；没有任何可注入的
+`AGENTS.md` 时整个章节省略，system 与现状完全一致。
+
 ### DisplayItem / Renderer / run_turn（前端无关的渲染与运行 seam）
 
 渲染与 turn 执行收敛为 `slimcode-common` 的前端无关 seam（ADR-0004）：

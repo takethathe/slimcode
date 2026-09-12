@@ -31,6 +31,7 @@ use slimcode_agent::agent::{CancelToken, RunConfig, Tool};
 use slimcode_agent::session::{Message, Session};
 use slimcode_ai::{BailianConfig, BailianProvider};
 use slimcode_common::context::ContextBuilder;
+use slimcode_common::context_files::ContextFile;
 use slimcode_common::history::{
     HISTORY_DISPLAY, HistoryStore, render_history, resolve_replay_index,
 };
@@ -59,6 +60,7 @@ pub fn run(
     store: &SessionStore,
     history: &HistoryStore,
     skills: &SkillStore,
+    context_files: &[ContextFile],
 ) -> Result<i32, String> {
     let model = config.model.clone();
     // One token shared by the cancellable tool set and every turn's worker:
@@ -67,7 +69,16 @@ pub fn run(
     let (provider, tools) = slimcode_common::setup::setup_with_cancel(cwd, config, &cancel)?;
     let session = store.new_session();
     let mut ui = match Tui::new(
-        provider, tools, store, history, skills, session, cwd, model, cancel,
+        provider,
+        tools,
+        store,
+        history,
+        skills,
+        session,
+        cwd,
+        model,
+        cancel,
+        context_files,
     ) {
         Ok(ui) => ui,
         Err(e) => {
@@ -101,6 +112,9 @@ struct Tui<'a> {
     store: &'a SessionStore,
     history: &'a HistoryStore,
     skills: &'a SkillStore,
+    /// Discovered `AGENTS.md` files (global + project), injected into every
+    /// fresh system message via `ContextBuilder::with_context_files`.
+    context_files: Vec<ContextFile>,
     session: Session,
     cwd: PathBuf,
     /// Set while a turn runs when the user presses Ctrl+C/Ctrl+D: the current
@@ -128,6 +142,7 @@ impl<'a> Tui<'a> {
         cwd: &Path,
         model: String,
         cancel: CancelToken,
+        context_files: &[ContextFile],
     ) -> Result<Self, String> {
         enable_raw_mode().map_err(|e| format!("raw mode: {e}"))?;
         execute!(stdout(), EnterAlternateScreen).map_err(|e| format!("alternate screen: {e}"))?;
@@ -153,6 +168,7 @@ impl<'a> Tui<'a> {
             store,
             history,
             skills,
+            context_files: context_files.to_vec(),
             session,
             cwd: cwd.to_path_buf(),
             quit_after_turn: false,
@@ -297,6 +313,7 @@ impl<'a> Tui<'a> {
     fn submit_prompt(&mut self, prompt: String, record: bool) -> Result<(), String> {
         let skills = self.skills.list().unwrap_or_default();
         let context = ContextBuilder::new()
+            .with_context_files(&self.context_files)
             .with_skills(&skills)
             .with_history(self.session.messages.clone())
             .with_user_prompt(&prompt)
@@ -326,6 +343,7 @@ impl<'a> Tui<'a> {
             return Ok(());
         };
         let context = ContextBuilder::new()
+            .with_context_files(&self.context_files)
             .with_skills(&skills)
             .with_history(self.session.messages.clone())
             .with_skill(skill, arg)
