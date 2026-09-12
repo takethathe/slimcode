@@ -946,16 +946,20 @@ impl App {
     }
 
     /// Build every transcript row once (used by both the window and the
-    /// scrollbar thumb math), including the leading spacer row before user
-    /// and tool blocks.
+    /// scrollbar thumb math). Exactly one plain blank row separates each entry
+    /// from the one above it; the header is first and gets none, and nothing is
+    /// appended after the last block, so the transcript never carries dead
+    /// space above the dock. The spacer is a bare [`Line::default`] — the
+    /// box-style blocks (user prompt, tool) keep their own padding row *plus*
+    /// this true blank row.
     fn all_rows(&self, width: usize) -> Vec<Line<'static>> {
         let mut rows: Vec<Line<'static>> = Vec::new();
         for entry in &self.transcript {
             let block = entry_rows(entry, width, self.tool_output_expanded, &self.version);
-            if !block.is_empty()
-                && !rows.is_empty()
-                && matches!(entry, Entry::UserPrompt { .. } | Entry::Tool { .. })
-            {
+            if block.is_empty() {
+                continue;
+            }
+            if !rows.is_empty() {
                 rows.push(Line::default());
             }
             rows.extend(block);
@@ -1699,6 +1703,74 @@ mod tests {
     }
 
     // --- tests -------------------------------------------------------------
+
+    #[test]
+    fn transcript_separates_every_block_with_one_blank_row() {
+        let mut app = seeded_app();
+        app.apply(RenderItem::UserPrompt("prompt".to_string()));
+        app.apply(RenderItem::Text("answer\n".to_string()));
+        app.apply(RenderItem::Reasoning("think\n".to_string()));
+        app.apply(RenderItem::ToolStart {
+            tool_call_id: "call_read".to_string(),
+            name: "read".to_string(),
+            arguments: r#"{"path":"a.txt"}"#.to_string(),
+        });
+        app.apply(RenderItem::ToolResult {
+            tool_call_id: "call_read".to_string(),
+            name: "read".to_string(),
+            ok: true,
+            result: "ok".to_string(),
+        });
+        app.apply(RenderItem::Notice("notice".to_string()));
+        app.apply(RenderItem::Error("error".to_string()));
+
+        let width = 60;
+        let rows = app.all_rows(width);
+        // Header flush at the top, then exactly one plain blank row before
+        // every block after it. Rebuilding the expected rows entry by entry
+        // pins the rule: a spacer before a user prompt or a tool block alone
+        // (the old condition) no longer matches.
+        let mut expected = entry_rows(&Entry::Header, width, false, "9.9.9");
+        for entry in &app.transcript[1..] {
+            expected.push(Line::default());
+            expected.extend(entry_rows(entry, width, false, "9.9.9"));
+        }
+        assert_eq!(rows, expected);
+        // Nothing precedes the header and no blank row trails the last block.
+        assert!(!rows[0].spans.is_empty());
+        assert!(!rows.last().unwrap().spans.is_empty());
+    }
+
+    #[test]
+    fn single_entry_transcript_has_no_separator_rows() {
+        let app = seeded_app();
+        let width = 60;
+        assert_eq!(
+            app.all_rows(width),
+            entry_rows(&Entry::Header, width, false, "9.9.9")
+        );
+        assert!(!app.all_rows(width).iter().any(|r| r.spans.is_empty()));
+    }
+
+    #[test]
+    fn boxed_block_keeps_its_padding_row_plus_the_blank_row_above() {
+        let mut app = seeded_app();
+        app.apply(RenderItem::UserPrompt("prompt".to_string()));
+        app.apply(RenderItem::Text("answer\n".to_string()));
+
+        let buffer = render_buffer(&mut app, 60, 16);
+        let y = row_containing(&buffer, "answer").unwrap() as usize;
+        // Directly above the answer: a plain spacer row with no block bg.
+        assert_ne!(
+            cell_bg_at(&buffer, 0, (y - 1) as u16),
+            Some(BgToken::UserMessageBg.color())
+        );
+        // Above the spacer: the user box's own padding row (userMessageBg).
+        assert_eq!(
+            cell_bg_at(&buffer, 0, (y - 2) as u16),
+            Some(BgToken::UserMessageBg.color())
+        );
+    }
 
     #[test]
     fn transcript_accumulates_streamed_text() {

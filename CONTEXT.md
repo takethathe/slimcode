@@ -229,7 +229,7 @@ A semantic color-token system (accent, border, borderAccent, muted, dim, userMes
 _Avoid_: palette, colors, style sheet
 
 **Entry**:
-One item of the TUI's transcript model: the startup header, a boxed user prompt, an assistant text block, a thinking block, a tool block (paired start/result, with a status colour), a notice, or an error. Consecutive streamed fragments of the same kind merge into the last Entry of that kind.
+One item of the TUI's transcript model: the startup header, a boxed user prompt, an assistant text block, a thinking block, a tool block (paired start/result, with a status colour), a notice, or an error. Consecutive streamed fragments of the same kind merge into the last Entry of that kind. An Entry is not a markdown block: one Entry may render as several markdown blocks, and the transcript separates Entries while the markdown renderer separates the blocks inside one.
 _Avoid_: row, line, message (a Message is model-facing; an Entry is rendered)
 
 **Transcript**:

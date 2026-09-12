@@ -288,8 +288,7 @@ provider config seam 见 ADR-0016，hook seam 见 ADR-0015）。折入自 ticket
 CLI 拥有进程与应用生命周期；本 crate 拥有纯 `App` 状态机与帧循环，且**不依赖任何
 其他 `slimcode-*` crate**（含 dev-dependency，见 ticket 06 的矩阵测试）。模块：
 `theme`（pi dark.json 词法转的只读 token 表：`Token::color()` 前景 / `BgToken::color()`
-背景）、`text`（折行/截断/宽度，CJK 双宽）、`markdown`（pulldown-cmark → 样式
-span，代码围栏行映射等）、`toolcall`（内置工具紧凑调用标题 composer，pi `format*Call`
+背景）、`text`（折行/截断/宽度，CJK 双宽）、`markdown`（pulldown-cmark → 样式 span，代码围栏行映射等）、`toolcall`（内置工具紧凑调用标题 composer，pi `format*Call`
 移植：`CallPart` 纯函数 + 逐工具单测）、`footer`（pi `footer.ts` 的 `formatTokens` /
 `formatCwdForFooter` / stats 纯函数移植）、`git`（`terminal_title` / `current_branch`
 纯包装）、`render`（TUI 自己的显示词汇 `RenderItem`，ADR-0014 D1）、`handler`
@@ -336,6 +335,23 @@ span，代码围栏行映射等）、`toolcall`（内置工具紧凑调用标题
 - **主题（ADR-0006 D1）**：唯一风格来源是 pi `dark.json` 的逐字十六进制；TUI 渲染只
   引用 token（`Token` 前景 / `BgToken` 背景），不出现裸颜色。现有测试把每个 token
   的 hex 钉死，换肤只需改一处表。
+- **两级空格（markdown 渲染器 + transcript 行构造器）**：TUI 的呼吸感分两级。
+  **markdown 文档内部**（`markdown` 渲染器）：相邻 block（heading / paragraph /
+  code / blockquote / list / hrule）之间恰好一行空行，heading 因此总在其正文前得到
+  空行；源码里连续空行塌陷为这一行（`pulldown-cmark` 对空行不发事件，渲染器只在
+  block 前补一次空行，且该空行幂等：结尾已是空行就不再补）；blockquote 内的空行
+  渲染为 `│ ` 行；文档结尾不输出尾随空行；list item **内部**相邻 block 不插空行
+  （loose list 的项间空行是唯一例外，由列表几何单独负责）。**transcript 各 Entry 之间**（`app::all_rows`）：
+  每个 Entry 上方恰好一行无样式空行（pi 的 `Spacer(1)`），启动头部在首位所以上方无空行，
+  最后一个 Entry 之后不补空行；boxed 块（user prompt / tool）自己的内边距行与这行真空行
+  同时保留。
+- **列表几何（markdown 渲染器）**：无序项用 `- ` 前缀（`*` / `+` 归一到 `- `），有序项
+  按列表起始号重编号（`N. `，尊重显式起始值）；checkbox（`[x]` / `[ ]` / `[X]`）按
+  原样保留并沿用正文色（task-list 选项关闭，不合成不重染）；嵌套每层缩进四空格；首行
+  前缀为 `缩进 + marker`，后续行（折行文本、第二段、嵌套列表、项内代码块）以前缀等宽的
+  空格对齐到项文本下；项内段落各自成行；loose list（项间有空行）只在项之间插一行空行，
+  最后一项之后不插（复用同一幂等 gap 助手，故不会与下一 block 的 gap 叠加）；折行宽度
+  扣除 quote 前缀、缩进与 marker 宽度，所有行不超出 pane。
 - **块感知 transcript（ADR-0006 D2）**：App 持有 `Vec<Entry>`（`Header` /
   `UserPrompt` / `Assistant` / `Thinking` / `Tool` / `Notice` / `Error`），不再是
   扁平的逐 kind 行；流式文本/思考相邻片段仍按“同 kind 合并”规则拼进同一条目。
