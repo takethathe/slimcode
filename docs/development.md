@@ -151,7 +151,7 @@ provider config seam 见 ADR-0016，hook seam 见 ADR-0015）。折入自 ticket
 前端无关的 `/` 命令定义与预测逻辑（纯数据 + 纯函数，无 I/O、无依赖）：
 
 - `Command`：规范名 `name`、别名 `aliases`、用法串 `usage`（含参数占位，如
-  `/load <id>`）、描述 `description`、匹配种类 `kind`；
+  `/!N`）、描述 `description`、匹配种类 `kind`；
 - `CommandKind::Exact`（按规范名/别名精确或前缀匹配）与
   `CommandKind::Numbered`（如 `/!N`：`name` 后跟数字序列，匹配 `/!3`）；
 - `COMMANDS`：命令注册表的单一事实来源（`/help`、启动 banner、未知命令提示均由此生成）；
@@ -200,7 +200,12 @@ provider config seam 见 ADR-0016，hook seam 见 ADR-0015）。折入自 ticket
   `stop_reason`/`error` 写在记录信封：`{"type":"message","message":{…},"stop_reason":…,"error":…}`，
   缺省省略）、`append_title`、宽容的 `load`（未知/损坏记录跳过并计数、旧格式裸消息载荷与
   `role:"system"` 遗留记录均兼容（后者跳过，ADR-0012 D3）、残缺尾行丢弃并补换行、悬空的工具调用批次在内存补
-  `Error: interrupted`，磁盘字节不改写）、`list` 只作用于当前项目子目录；每次追加后
+  `Error: interrupted`，磁盘字节不改写）、`entries`：对当前项目子目录每个 `.jsonl` 做一次
+  流式扫描，产出 `SessionSummary { id, title, modified, messages }`（日志头必须解析，否则整个
+  文件跳过；按 record `type` 的前缀识别计数 `message`、取首个 `title`，不整份 JSON 解析；
+  按文件 mtime 降序、同 mtime 按 id 降序），配 `unix_secs(SystemTime) -> i64` 与
+  `format_minute(secs) -> "YYYY-MM-DD HH:MM"`（UTC 时钟、无时区换算、无 chrono 依赖）；
+  每次追加后
   `evict_over_quota` 以 mtime 最旧优先删到配额一半（`.jsonl` 与遗留 `.json` 一起计数，
   `DEFAULT_MAX_BYTES`，`with_max_bytes` 覆盖，跳过当前 session，删空目录，尽力而为），
   `cleanup_empty` 在启动时静默清理当前项目内重放不到任何 assistant 消息的 `.jsonl`；
@@ -227,7 +232,7 @@ provider config seam 见 ADR-0016，hook seam 见 ADR-0015）。折入自 ticket
 - `/` 补全（ADR-0005）：`CompletionItem { value, description }` + `complete(input,
   skills) -> Vec<CompletionItem>`——把 `slimcode-commands` 的每个命令拼写（规范名 + 别名）
   与每个已安装 skill 合成候选池，用 `fuzzy::fuzzy_match` 模糊排序（裸 `/` 按注册表顺序列全部，
-  命令在前、skill 在后；非 `/` 输入返回空）；候选 `value` 是命令的裸拼写（`/usage`、`/resume`）
+  命令在前、skill 在后；非 `/` 输入返回空）；候选 `value` 是命令的裸拼写（`/usage`、`/session`）
   与 skill 的规范触发 `/skill:name`，**不含** `usage` 的参数占位符，提交时经
   `find`/`find_skill` 可解析；skill 只按**裸名字**参与模糊打分（`/skill:` 前缀是纯拼写，
   若一起打分会让 `s`/`k`/`i`/`l` 等前缀字母命中所有 skill、并淹没名字自身的边界奖励），
@@ -364,21 +369,35 @@ CLI 拥有进程与应用生命周期；本 crate 拥有纯 `App` 状态机与�
   `… (N more lines, Ctrl+O to expand)`，`Ctrl+O` 全局展开）；启动头部是 transcript 顶部的
   `Header` 条目（bold accent `slimcode` + dim ` v<version>` + 一行 dim 快捷键提示）；
   错误红字、notice dim；**不**渲染 turn 标记 / `done` 行 / 每轮用量行。`/new`、
-  `/load` 清空后重建会话视图。`/` 补全弹框是 SelectList 裸行样式（无边框、无标题，顶部一条
+  picker 载入会话会清空后重建会话视图（transcript 重插启动 Header、footer 用量归零、
+  session id 更新、picker 关闭）。`/` 补全弹框是 SelectList 裸行样式（无边框、无标题，顶部一条
   全宽 `─` 分隔线（border 色）把弹框与上方 transcript 隔开；选中行
   `→` + accent、无反色，描述 muted，滚动标记 `(i/n)` muted），显示在输入框正上方。
+- **Session picker 视图（ADR-0018 D2）**：`slimcode-tui` 的第一个（也是唯一的）非聊天视图，
+  `App.picker` 非空时整帧只画 picker：`[1 行 header][Min(0) 列表][2 行 footer]`。
+  header 左侧 `Sessions (this project)`、右侧 `N saved`；行 = `光标列(2) + 当前标记列(2) +
+  标题 + 空隙 + meta`（`›`/`*` 标记、标题 `…` 截断、meta 右对齐、宽度不足时先丢 meta），
+  选中行整行 `selectedBg` + 加粗，当前会话标题 accent；列表溢出时最后一行作 `(i/n)`
+  指示（可见行数随减一），窗口 `offset` 保证选中行可见；空态显示
+  `no saved sessions in this project`、提示行变 `Esc close`。picker 打开时
+  `handle_key` 把按键全部交给 `handle_picker_key`（`↑`/`↓` 一行、`PgUp`/`PgDn`
+  `PAGE_LINES` 行、两端 clamp；`Enter` 产 `Effect::LoadSession { id }` 并关闭；`Esc`
+  关闭且无 Effect；Ctrl+C/Ctrl+D 仍退出；其余忽略），滚轮改移选中行（`WHEEL_LINES`）且
+  不动 transcript 的 `scroll`/`follow`/滚动条淡出计数。
 - **纯 App core（`app`）**：前端无关、无 I/O 的 reducer。持有 transcript、输入框、
-  `history`（input history 快照）、`recall` 态、`completion`、`scroll` /
+  `history`（input history 快照）、`recall` 态、`completion`、`picker`（`Picker { rows,
+  selected, offset }`）、`scroll` /
   `scrollbar_ticks`（auto 模式滚动条：出现后 ~1s 淡出，与 scroll 位置无关）、
   `content_width` / `view_height`（最近一次 draw 的 transcript 面板宽度/高度，
   行宽折行与滚轮溢出判定都依据它）、
   `status`（`cwd` / `session_id` / `branch` / `usage: FooterUsage` / `running` /
   `spinner_frame`）、注入的 `completions` provider、全局 `tool_output_expanded`、
   `version`。`handle_key` / `handle_key_running` / `handle_mouse` / `tick()`（推进 spinner 帧、递减滚动条
-  淡出计数）是纯 reducer；`Effect` 只有五个变体——`SubmitPrompt(Prompt)`（打字的 prompt
-  或 recall 重跑，`Prompt.record` 决定是否写输入历史）、`Command { name, arg }`、`Quit` /
+  淡出计数）是纯 reducer；`Effect` 只有六个变体——`SubmitPrompt(Prompt)`（打字的 prompt
+  或 recall 重跑，`Prompt.record` 决定是否写输入历史）、`Command { name, arg }`、
+  `LoadSession { id }`（picker 回车选中行）、`Quit` /
   `QuitAfterTurn` / `CancelRunning`——**reducer 不解析命令语义**：`/` 开头的输入原样变成
-  `Command`，含义（`/help` / `/new` / `/load` / `/sessions` / `/usage` / `/history` /
+  `Command`，含义（`/help` / `/new` / `/session` / `/usage` / `/history` /
   `/skills` / `/install-skill` / `/exit` / `/!!` / `/!N` / skill 触发 / 未知命令）全由
   CLI 在 `on_effect` 里决定（ADR-0013 D3）。`draw` 用 ratatui `TestBackend` 做帧缓冲测试
   （spec：好测试断言**帧缓冲**而非内部状态）。布局是 ADR-0007 D4 四区 dock：
@@ -392,7 +411,7 @@ CLI 拥有进程与应用生命周期；本 crate 拥有纯 `App` 状态机与�
   一行内容、其余是空白），内容不足一屏时两者都停在原处（ADR-0017 D5）。
   视口靠内容锚泊：`apply` 只在 `follow` 时重新锚到底部，否则把本次追加的行数加到
   `scroll` 上，所以上滚后（`follow == false`，滚轮或 `PgUp` 都一样）流式新内容**不会**把
-  视口拽回底部，窗口停在原内容上（ADR-0017 D6）；`/new`/`/load` 换 transcript 仍整体
+  视口拽回底部，窗口停在原内容上（ADR-0017 D6）；`/new` 与 picker 载入换 transcript 仍整体
   `reset_view`。
   `handle_mouse`（ADR-0017）是与键盘 reducer 并列的鼠标入口，**无返回值**（滚轮不产生
   `Effect`）：只认 `ScrollUp`/`ScrollDown`，每格调用既有 `scroll_up`/`scroll_down` 3 行
@@ -457,7 +476,7 @@ stdout 是否 TTY）：
   `--base-url <url>`、`--api-key <key>`）经共享 `ContextBuilder` 组装 `Context`（system 单独
   返回、每轮现组并广告可自动调用 skill；开头的 `/skill:name` 会先被 `normalize_skill_trigger`
   改写为 `/{name}`，因为 one-shot 没有命令解析器），经共享 `run_turn` 跑一轮七工具循环、流式渲染事件、
-  打印 token 用量；**不落盘会话**（ADR-0009 D5：无 `/load`/`/sessions` 工作流，与 TUI
+  打印 token 用量；**不落盘会话**（ADR-0009 D5：无交互式会话工作流（picker），与 TUI
   「首个 assistant 前失败不建文件」规则一致；`main` 里的启动 `cleanup_empty` 仍执行）；
 - **chmod 提示**：`load_app_config` 之后，若 `ApiKeySource::File` 且（Unix）
   `config.toml` 权限 `mode & 0o077 != 0`，stderr 打印 `chmod 600 <path>` 提示（one-shot
@@ -475,10 +494,14 @@ stdout 是否 TTY）：
   `XTSHIFTESCAPE`），`restore_terminal()` 发其逆向 `?1006l`+`?1000l`，panic hook 复用
   同一恢复函数，所以异常退出也不会把鼠标留在 app 手里（ADR-0017 D2/D8）；`TuiSession` 实现 `UiHandler`，拥有 provider
   与工具（`Mutex` 里，turn 期间 take 出来跑、结束后归还）、session store、input history、
-  skills、context files、environment，并实现**全部命令语义**（`/help` / `/new` / `/load` /
-  `/sessions` / `/usage` / `/history` / `/skills` / `/install-skill` / `/exit` / `/!!` /
+  skills、context files、environment，并实现**全部命令语义**（`/help` / `/new` / `/session` /
+  `/usage` / `/history` / `/skills` / `/install-skill` / `/exit` / `/!!` /
   `/!N` / skill 触发 / 未知命令 + did-you-mean）、每轮的上下文组装与会话落盘、失败/取消
-  收尾。`CliCompletions` 是注入 TUI 的 `/` 候选 provider（命令表 + skills 快照，
+  收尾。`/session` 在 UI 线程同步扫 `store.entries()`，把每个摘要拼成
+  `SessionRow { id, title: title ?? id, meta: "N msgs  YYYY-MM-DD HH:MM" }` 后发
+  `RenderItem::SessionPicker { rows }`；`Effect::LoadSession { id }` 走与旧 `/load` 同一路径，
+  但先发 `SessionChanged` 再发 title/skipped/repaired/`loaded session` notice（否则清屏会
+  吃掉提示），且选中当前 session 时直接 no-op（ADR-0018 D3）。`CliCompletions` 是注入 TUI 的 `/` 候选 provider（命令表 + skills 快照，
   `/install-skill` 后就地刷新）。
 - `render`：两个 `Renderer` 实现。`TextRenderer` 把共享 `DisplayItem` 流（流式文本 / 流式思考 / 结构行 / 用量汇总）渲染为终端输出，原始 tool_call delta 与
   `Done` 事件被抑制；流式文本与思考（带 `> ` 前缀）按 delta 拼接、不逐 delta 换行，换行只来自内容本身的 `\n`，结构行（工具开始/结果、停止标记、turn 标记）总是另起一行；事件→DisplayItem 的映射是共享的 `app::render::map_event`。
@@ -489,7 +512,7 @@ stdout 是否 TTY）：
   （ADR-0004 未变）。
 - provider + 工具构造经 `app::setup::setup` 与 TUI 共享，两端不会漂移。
 
-交互能力（历史 recall、`/` 命令、skills、`/new`、`/load`、`/exit`）已整体移入
+交互能力（历史 recall、`/` 命令、skills、`/new`、`/session`、`/exit`）已整体移入
 TUI（`slimcode-tui`，见上节），行式 REPL 已移除（见 ADR-0003）。
 
 core crate 的 `core` 模块 `pub use session::{Message, Role, ToolCall}`，CLI 统一从

@@ -3,7 +3,7 @@
 //! Two modes (ADR-0003):
 //! - `slimcode "<prompt>"` — non-interactive: run one prompt to completion in
 //!   the current directory (or `--cwd`), stream events, print token usage. No
-//!   session is persisted (the one-shot has no `/load`/`/sessions` workflow),
+//!   session is persisted (the one-shot has no interactive session workflow),
 //!   per ADR-0009 D5.
 //! - `slimcode` on a terminal — the full-screen TUI: a scrollable transcript,
 //!   a multi-line input box, live streamed output, `/` commands and skills,
@@ -60,7 +60,7 @@ fn usage() -> String {
 }
 
 /// Non-interactive one-shot: run one prompt, print usage. Sessions are never
-/// persisted here (ADR-0009 D5): the one-shot has no `/load`/`/sessions`
+/// persisted here (ADR-0009 D5): the one-shot has no interactive session
 /// workflow, so it leaves no session files behind — matching the TUI's rule
 /// that a turn with no assistant message leaves no log.
 //
@@ -231,8 +231,8 @@ fn run(args: &[String], out: &mut dyn Write, tty: bool) -> Result<i32, String> {
     let user_home = std::env::var_os("HOME").map(PathBuf::from);
     let project_home = resolve_project_home(&cwd, user_home.as_deref());
     // The session store is scoped to the current project: sessions persist
-    // under `<home>/sessions/<project-key>/`, so `/load` and `/sessions` only
-    // ever see this project's sessions.
+    // under `<home>/sessions/<project-key>/`, so the session picker only
+    // ever sees this project's sessions.
     let store = SessionStore::new(
         home.join("sessions"),
         project_key(&project_home),

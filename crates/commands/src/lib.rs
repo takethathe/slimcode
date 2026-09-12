@@ -28,7 +28,7 @@ pub enum CommandKind {
 pub struct Command {
     pub name: &'static str,
     pub aliases: &'static [&'static str],
-    /// Display form, argument placeholder included (e.g. `/load <id>`).
+    /// Display form, argument placeholder included (e.g. `/!N`).
     pub usage: &'static str,
     pub description: &'static str,
     pub kind: CommandKind,
@@ -88,8 +88,7 @@ impl Command {
 pub const COMMANDS: &[Command] = &[
     Command::new("/help", "/help", "list commands"),
     Command::new("/new", "/new", "start a new session"),
-    Command::aliased("/load", &["/resume"], "/load <id>", "load a saved session"),
-    Command::new("/sessions", "/sessions", "list saved sessions"),
+    Command::new("/session", "/session", "browse this project's sessions"),
     Command::new("/usage", "/usage", "show token usage"),
     Command::new("/history", "/history", "list input history"),
     Command::new("/skills", "/skills", "list installed skills"),
@@ -158,9 +157,9 @@ mod tests {
 
     #[test]
     fn suggest_prefix_matches_alias() {
-        let got = suggest("/res");
+        let got = suggest("/qu");
         let names: Vec<_> = got.iter().map(|c| c.name).collect();
-        assert_eq!(names, vec!["/load"]);
+        assert_eq!(names, vec!["/exit"]);
     }
 
     #[test]
@@ -220,10 +219,11 @@ mod tests {
 
     #[test]
     fn find_resolves_name_and_alias() {
-        assert_eq!(find("/load").map(|c| c.name), Some("/load"));
-        assert_eq!(find("/resume").map(|c| c.name), Some("/load"));
+        assert_eq!(find("/session").map(|c| c.name), Some("/session"));
         assert_eq!(find("/quit").map(|c| c.name), Some("/exit"));
         assert!(find("/nope").is_none());
+        assert!(find("/load").is_none());
+        assert!(find("/sessions").is_none());
     }
 
     #[test]

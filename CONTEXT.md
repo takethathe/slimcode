@@ -9,7 +9,7 @@ A single user input submitted to the agent for one turn. A prompt may span multi
 _Avoid_: input, question
 
 **Command**:
-A `/xxx` control instruction in an interactive frontend (currently the TUI), e.g. `/load`, `/sessions`; distinct from a Prompt.
+A `/xxx` control instruction in an interactive frontend (currently the TUI), e.g. `/session`; distinct from a Prompt.
 _Avoid_: slash-command
 
 **Skill**:
@@ -32,8 +32,9 @@ finds the instructions in the earlier message instead of reloading.
 _Avoid_: plugin, extension
 
 **Session**:
-A conversation with a stable id, timestamp, message history, and optional title; persisted as an
-append-only session log and restorable via `/load`.
+A conversation with a stable id, timestamp, message history, optional title, and its own in-memory
+token usage; persisted as an append-only session log and restorable through the Session picker
+(`/session`).
 _Avoid_: conversation (used interchangeably)
 
 **Session log**:
@@ -97,10 +98,28 @@ _Avoid_: verdict, action, permission
 
 **Session store**:
 The project-scoped place sessions are persisted: one directory per project
-(`<home>/sessions/<project-key>/`) holding one session log per Session; `/load` and `/sessions` see
+(`<home>/sessions/<project-key>/`) holding one session log per Session; the Session picker sees
 only the current project's directory, and legacy `<id>.json` files in it are neither listed nor
 loaded (they still count toward the storage quota).
 _Avoid_: sessions dir, archive
+
+**Current session**:
+The Session the frontend holds in memory right now (`session_id` on the status line): the one
+`/new` created or the one the picker last loaded. It may have no log file yet — a fresh session's
+log is created with its first assistant message, and a logless session is therefore absent from
+the picker's list rather than listed as a synthetic row (ADR-0018 D3). Selecting the current
+session's row is a no-op, so the in-memory history that is ahead of the log cannot be dropped.
+_Avoid_: active session, open session
+
+**Session picker**:
+The full-screen view `/session` opens: the current project's saved sessions, newest first, one row
+each — the title (or the id when the log has no title record), the message-record count and the
+log file's mtime — with `*` marking the Current session, `›` marking the cursor row, an `(i/n)`
+indicator when the list overflows, and `Esc`/`↑`/`↓`/`PgUp`/`PgDn`/`Enter` as its whole keymap. It
+is a TUI view fed by CLI-owned rows (`SessionRow { id, title, meta }`); picking a row emits
+`Effect::LoadSession { id }`, and closing the view is not a command, so `Esc` produces no effect
+(ADR-0018 D2).
+_Avoid_: session selector, resume screen, session list
 
 **Project key**:
 The deterministic name of a project's directory inside the session store: the project
@@ -115,7 +134,7 @@ _Avoid_: size limit, cache
 
 **Eviction**:
 Removing session logs once the session store exceeds the storage quota: oldest-first by mtime, down
-to half the quota, never the active session; legacy `<id>.json` files are invisible to `/load` but
+to half the quota, never the active session; legacy `<id>.json` files are invisible to the picker but
 still counted, so they disappear through eviction rather than migration. An **empty session log**
 (zero-byte, or replaying to no assistant record — residue of a crash during log creation) is
 removed by a separate startup sweep that touches only the current project.
@@ -130,7 +149,7 @@ A message in a Session's message history, owned by `slimcode-core`: the user/ass
 _Avoid_: session message (ambiguous with a session-log record), stored message
 
 **Message history**:
-The conversation messages of a Session (`session.messages`), restorable via `/load`. The system prompt is not part of it: it is assembled per request and never stored.
+The conversation messages of a Session (`session.messages`), restorable through the Session picker. The system prompt is not part of it: it is assembled per request and never stored.
 _Avoid_: history (bare — collides with input history)
 
 **Input history**:

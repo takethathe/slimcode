@@ -25,7 +25,7 @@ use slimcode_app::context::{ContextBuilder, Environment, skill_loaded_in};
 use slimcode_app::context_files::ContextFile;
 use slimcode_app::history::{HISTORY_DISPLAY, HistoryStore, render_history, resolve_replay_index};
 use slimcode_app::render::usage_summary;
-use slimcode_app::session::{SessionStore, infer_title};
+use slimcode_app::session::{SessionStore, format_minute, infer_title, unix_secs};
 use slimcode_app::skills::{
     Skill, SkillScope, SkillStore, find_skill, is_builtin_command, parse_install_args, skill_prompt,
 };
@@ -36,7 +36,7 @@ use slimcode_tui::git::{current_branch, terminal_title};
 use slimcode_tui::handler::{
     CompletionItem, CompletionProvider, ControlFlow, Prompt, TurnReport, UiHandler,
 };
-use slimcode_tui::render::RenderItem;
+use slimcode_tui::render::{RenderItem, SessionRow};
 
 use crate::render::TuiAdapter;
 
@@ -254,18 +254,7 @@ impl TuiSession<'_> {
             match command.name {
                 "/help" => return self.help(emit),
                 "/new" => return self.new_session(emit),
-                "/load" => {
-                    return match arg.filter(|id| !id.is_empty()) {
-                        Some(id) => self.load_session(id, emit),
-                        None => {
-                            emit(RenderItem::Error(
-                                "/load needs a session id — /sessions lists them".to_string(),
-                            ));
-                            ControlFlow::Continue
-                        }
-                    };
-                }
-                "/sessions" => return self.list_sessions(emit),
+                "/session" => return self.open_session_picker(emit),
                 "/usage" => return self.show_usage(emit),
                 "/history" => return self.list_history(emit),
                 "/skills" => return self.list_skills(emit),
@@ -361,7 +350,18 @@ impl TuiSession<'_> {
     }
 
     /// Load a saved session, reporting the lenient-replay repair counters.
+    ///
+    /// Picking the session that is already current is a no-op (ADR-0018 D3):
+    /// reloading would re-read the log, drop the in-memory history that is
+    /// ahead of it, clear the screen and reset usage, none of which a row the
+    /// cursor often starts on should do.
+    ///
+    /// `SessionChanged` is emitted *before* the load notices: it clears the
+    /// transcript, so notices emitted first would be wiped (ADR-0018 D2).
     fn load_session(&self, id: &str, emit: &mut dyn FnMut(RenderItem)) -> ControlFlow {
+        if id == self.session_id() {
+            return ControlFlow::Continue;
+        }
         let outcome = match self.store.load(id) {
             Ok(outcome) => outcome,
             Err(e) => {
@@ -369,54 +369,63 @@ impl TuiSession<'_> {
                 return ControlFlow::Continue;
             }
         };
-        if let Some(title) = &outcome.session.title {
-            emit(RenderItem::Notice(format!("  title: {title}")));
-        }
-        if outcome.skipped_records > 0 {
-            emit(RenderItem::Notice(format!(
-                "  skipped {} unreadable record(s)",
-                outcome.skipped_records
-            )));
-        }
-        if outcome.repaired_tool_calls > 0 {
-            emit(RenderItem::Notice(format!(
-                "  repaired {} interrupted tool call(s)",
-                outcome.repaired_tool_calls
-            )));
-        }
+        let title = outcome.session.title.clone();
+        let skipped_records = outcome.skipped_records;
+        let repaired_tool_calls = outcome.repaired_tool_calls;
         let session = outcome.session;
         let id = session.id.clone();
         self.inner.lock().expect("session lock").session = session;
         emit(RenderItem::SessionChanged { id: id.clone() });
+        if let Some(title) = &title {
+            emit(RenderItem::Notice(format!("  title: {title}")));
+        }
+        if skipped_records > 0 {
+            emit(RenderItem::Notice(format!(
+                "  skipped {skipped_records} unreadable record(s)"
+            )));
+        }
+        if repaired_tool_calls > 0 {
+            emit(RenderItem::Notice(format!(
+                "  repaired {repaired_tool_calls} interrupted tool call(s)"
+            )));
+        }
         emit(RenderItem::Notice(format!("loaded session: {id}")));
         emit(RenderItem::Branch(current_branch(&self.cwd)));
         set_title(&id, &self.cwd);
         ControlFlow::Continue
     }
 
-    fn list_sessions(&self, emit: &mut dyn FnMut(RenderItem)) -> ControlFlow {
-        match self.store.list() {
-            Ok(ids) => {
-                for id in ids {
-                    emit(RenderItem::Notice(format!("  {id}")));
-                }
+    /// Open the session picker (ADR-0018 D2/D5): this project's saved
+    /// sessions, scanned and built into rows the library renders and selects.
+    /// The scan happens here, synchronously, so the library owns no filesystem
+    /// knowledge; a scan failure is an error line and no picker.
+    fn open_session_picker(&self, emit: &mut dyn FnMut(RenderItem)) -> ControlFlow {
+        match self.store.entries() {
+            Ok(entries) => {
+                let rows = entries
+                    .into_iter()
+                    .map(|entry| SessionRow {
+                        title: entry.title.clone().unwrap_or_else(|| entry.id.clone()),
+                        id: entry.id,
+                        meta: format!(
+                            "{}  {}",
+                            message_count(entry.messages),
+                            format_minute(unix_secs(entry.modified))
+                        ),
+                    })
+                    .collect();
+                emit(RenderItem::SessionPicker { rows });
             }
             Err(e) => emit(RenderItem::Error(e)),
         }
         ControlFlow::Continue
     }
 
-    /// The session's cumulative token usage, worded by the app layer
-    /// (`usage_summary`, ADR-0014 D4).
+    /// The live session's own cumulative token usage, worded by the app layer
+    /// (`usage_summary`, ADR-0014 D4). The provider's running total is the
+    /// runtime's counter, not the display's source (ADR-0018 D4).
     fn show_usage(&self, emit: &mut dyn FnMut(RenderItem)) -> ControlFlow {
-        let usage = {
-            let inner = self.inner.lock().expect("session lock");
-            inner
-                .provider
-                .as_ref()
-                .map(|p| p.total_usage())
-                .unwrap_or_default()
-        };
+        let usage = self.inner.lock().expect("session lock").session.usage;
         emit(RenderItem::Notice(usage_summary(&usage)));
         ControlFlow::Continue
     }
@@ -619,6 +628,12 @@ impl TuiSession<'_> {
             .session_path(&state.session.id)
             .map(|path| path.exists())
             .unwrap_or(false);
+        // Usage belongs to the live session (ADR-0018 D4): snapshot the
+        // provider's running total before the turn, then add the diff after
+        // it. A turn can issue several requests (the tool loop), so the diff
+        // — not one request's numbers — is what the session earned, and the
+        // snapshot keeps earlier turns (and earlier sessions) out of it.
+        let usage_before = state.provider.total_usage();
         let TurnState {
             provider,
             tools,
@@ -648,10 +663,13 @@ impl TuiSession<'_> {
         for e in &append_errors {
             emit(RenderItem::Notice(format!("session log: {e}")));
         }
-        // Footer totals: read after the turn, while the provider is still
-        // here, and converted by the CLI (ADR-0014 D1).
+        // Footer totals: the session's own accumulated usage, converted by the
+        // CLI (ADR-0014 D1).
+        session.usage = session
+            .usage
+            .saturating_add(&provider.total_usage().saturating_sub(&usage_before));
         emit(RenderItem::Usage(crate::render::to_footer_usage(
-            &provider.total_usage(),
+            &session.usage,
         )));
         match result {
             Ok((_, StopReason::Completed)) => {}
@@ -685,6 +703,8 @@ impl UiHandler for TuiSession<'_> {
             // The library runs a turn on its worker thread.
             Effect::SubmitPrompt(prompt) => ControlFlow::Submit(prompt),
             Effect::Command { name, arg } => self.command(&name, arg.as_deref(), emit),
+            // The library's picker picked a row; the CLI loads it.
+            Effect::LoadSession { id } => self.load_session(&id, emit),
             Effect::Quit => ControlFlow::Quit,
             // Both are handled inside the running loop and never reach here;
             // the arms keep the match exhaustive.
@@ -706,6 +726,15 @@ impl UiHandler for TuiSession<'_> {
 
     fn cancel(&self) {
         self.inner.lock().expect("session lock").cancel.cancel();
+    }
+}
+
+/// The picker's message-count column: `1 msg` (singular) or `N msgs`.
+fn message_count(n: usize) -> String {
+    if n == 1 {
+        "1 msg".to_string()
+    } else {
+        format!("{n} msgs")
     }
 }
 
@@ -743,6 +772,7 @@ fn parse_replay_index(text: &str) -> Option<usize> {
 mod tests {
     use super::*;
 
+    use slimcode_tui::footer::FooterUsage;
     use std::fs;
 
     use slimcode_ai::wire::TokenUsage;
@@ -784,6 +814,9 @@ mod tests {
         calls: usize,
         fail_at: Option<usize>,
         usage: TokenUsage,
+        /// Added to `usage` on every successful `chat`, the way the real
+        /// provider's running total grows with each request of a turn.
+        per_call: TokenUsage,
     }
 
     impl FakeProvider {
@@ -793,6 +826,7 @@ mod tests {
                 calls: 0,
                 fail_at: None,
                 usage: TokenUsage::default(),
+                per_call: TokenUsage::default(),
             }
         }
 
@@ -804,6 +838,7 @@ mod tests {
                 calls: 0,
                 fail_at: Some(0),
                 usage: TokenUsage::default(),
+                per_call: TokenUsage::default(),
             }
         }
 
@@ -813,7 +848,14 @@ mod tests {
                 calls: 0,
                 fail_at: None,
                 usage,
+                per_call: TokenUsage::default(),
             }
+        }
+
+        /// Accumulate `usage` on every successful call.
+        fn with_per_call(mut self, usage: TokenUsage) -> Self {
+            self.per_call = usage;
+            self
         }
     }
 
@@ -830,6 +872,7 @@ mod tests {
             }
             let batch = self.script.get(self.calls).cloned().unwrap_or_default();
             self.calls += 1;
+            self.usage = self.usage.saturating_add(&self.per_call);
             Ok(batch)
         }
 
@@ -933,6 +976,33 @@ mod tests {
             .collect()
     }
 
+    /// Whether `s` has the picker's minute timestamp shape, `YYYY-MM-DD HH:MM`.
+    fn looks_like_minute(s: &str) -> bool {
+        let b = s.as_bytes();
+        b.len() == 16
+            && b[4] == b'-'
+            && b[7] == b'-'
+            && b[10] == b' '
+            && b[13] == b':'
+            && s.bytes()
+                .enumerate()
+                .all(|(i, c)| matches!(i, 4 | 7 | 10 | 13) || c.is_ascii_digit())
+    }
+
+    /// Write a session log with a title and one user/assistant pair, as the
+    /// first assistant message does at runtime, and return its id.
+    fn saved_session(store: &SessionStore, prompt: &str, reply: &str) -> String {
+        let mut session = store.new_session();
+        session.title = Some(prompt.to_string());
+        session
+            .messages
+            .push(AgentMessage::text(Role::User, prompt));
+        let assistant = AgentMessage::text(Role::Assistant, reply);
+        session.messages.push(assistant.clone());
+        store.append(&session, &assistant).expect("log created");
+        session.id
+    }
+
     fn user_message(text: &str) -> Prompt {
         Prompt {
             text: text.to_string(),
@@ -947,11 +1017,9 @@ mod tests {
         let items = command(&mut handler, "/help");
         let lines = lines(&items);
         assert_eq!(lines[0], "commands:");
-        assert!(lines.iter().any(|l| l.contains("/load <id>")), "{lines:?}");
-        assert!(
-            lines.iter().any(|l| l.contains("(alias: /resume)")),
-            "{lines:?}"
-        );
+        assert!(lines.iter().any(|l| l.contains("/session")), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("/load")), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("/sessions")), "{lines:?}");
         assert!(lines.iter().any(|l| l.contains("Shift+Enter")), "{lines:?}");
     }
 
@@ -1096,22 +1164,129 @@ mod tests {
     }
 
     #[test]
-    fn load_without_an_id_is_an_error() {
-        let fx = Fixture::new("load-bad");
+    fn session_opens_a_picker_with_title_count_and_time_rows() {
+        let fx = Fixture::new("picker");
+        let a = saved_session(&fx.store, "first prompt", "first reply");
+        let b = saved_session(&fx.store, "second prompt", "second reply");
         let mut handler = fx.handler(Box::new(FakeProvider::new(Vec::new())), Vec::new());
-        assert_eq!(
-            lines(&command(&mut handler, "/load")),
-            ["/load needs a session id — /sessions lists them"]
+
+        let items = command(&mut handler, "/session");
+        let [RenderItem::SessionPicker { rows }] = &items[..] else {
+            panic!("expected one picker item: {items:?}");
+        };
+        // Newest first, with the title, the record count and the mtime.
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, b);
+        assert_eq!(rows[0].title, "second prompt");
+        let (count, time) = rows[0].meta.split_once("  ").expect("count + time");
+        assert_eq!(count, "2 msgs");
+        assert!(looks_like_minute(time), "{}", rows[0].meta);
+        assert_eq!(rows[1].id, a);
+        assert_eq!(rows[1].title, "first prompt");
+    }
+
+    #[test]
+    fn picker_rows_fall_back_to_the_id_and_the_singular_count() {
+        let fx = Fixture::new("picker-fallback");
+        // No title record, and a single message record.
+        let mut one = fx.store.new_session();
+        let msg = AgentMessage::text(Role::Assistant, "only");
+        one.messages.push(msg.clone());
+        fx.store.append(&one, &msg).unwrap();
+        let mut handler = fx.handler(Box::new(FakeProvider::new(Vec::new())), Vec::new());
+
+        let items = command(&mut handler, "/session");
+        let [RenderItem::SessionPicker { rows }] = &items[..] else {
+            panic!("expected one picker item: {items:?}");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, one.id);
+        assert_eq!(rows[0].title, one.id, "no title record -> the id");
+        assert!(rows[0].meta.starts_with("1 msg  "), "{}", rows[0].meta);
+    }
+
+    #[test]
+    fn session_reports_a_scan_failure_without_opening_the_picker() {
+        let fx = Fixture::new("picker-error");
+        // A file where the project directory should be makes the scan fail.
+        fs::create_dir_all(fx.scratch.path("sessions")).expect("sessions dir");
+        fs::write(fx.scratch.path("sessions/proj"), b"not a directory").expect("blocking file");
+        let mut handler = fx.handler(Box::new(FakeProvider::new(Vec::new())), Vec::new());
+        let items = command(&mut handler, "/session");
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0], RenderItem::Error(_)), "{items:?}");
+    }
+
+    #[test]
+    fn load_session_emits_the_change_before_the_notices() {
+        let fx = Fixture::new("load-effect");
+        let id = saved_session(&fx.store, "the prompt", "the reply");
+        let mut handler = fx.handler(Box::new(FakeProvider::new(Vec::new())), Vec::new());
+
+        let (flow, items) = drive(&mut handler, Effect::LoadSession { id: id.clone() });
+        assert_eq!(flow, ControlFlow::Continue);
+        // The change clears the transcript, so it has to come first or the
+        // notices would be wiped.
+        assert_eq!(items[0], RenderItem::SessionChanged { id: id.clone() });
+        assert!(
+            items
+                .iter()
+                .any(|i| matches!(i, RenderItem::Notice(t) if t.starts_with("loaded session:"))),
+            "{items:?}"
         );
-        assert_eq!(
-            lines(&command(&mut handler, "/sessions")),
-            Vec::<&str>::new(),
-            "no saved sessions in a fresh store"
+        assert!(items.iter().any(|i| matches!(i, RenderItem::Branch(_))));
+        assert_eq!(handler.session_id(), id);
+        assert_eq!(handler.inner.lock().unwrap().session.messages.len(), 2);
+    }
+
+    #[test]
+    fn load_session_keeps_the_repair_notices_after_the_change() {
+        let fx = Fixture::new("load-repair");
+        let id = saved_session(&fx.store, "the prompt", "the reply");
+        // Append an unreadable record line by hand, so the load skips one.
+        let path = fx.store.session_path(&id).expect("path");
+        let mut log = fs::read_to_string(&path).expect("log");
+        log.push_str("not json\n");
+        fs::write(&path, log).expect("corrupt log");
+        let mut handler = fx.handler(Box::new(FakeProvider::new(Vec::new())), Vec::new());
+
+        let (_, items) = drive(&mut handler, Effect::LoadSession { id });
+        let changed = items
+            .iter()
+            .position(|i| matches!(i, RenderItem::SessionChanged { .. }))
+            .expect("session change");
+        let skipped = items
+            .iter()
+            .position(|i| matches!(i, RenderItem::Notice(t) if t.contains("skipped 1")))
+            .expect("skip notice");
+        assert!(
+            changed < skipped,
+            "notice must survive the clear: {items:?}"
         );
     }
 
     #[test]
-    fn usage_reports_the_providers_totals() {
+    fn loading_the_current_session_is_a_no_op() {
+        let fx = Fixture::new("load-current");
+        let mut handler = fx.handler(Box::new(FakeProvider::new(Vec::new())), Vec::new());
+        let id = handler.session_id();
+        // Memory is ahead of disk: reloading would drop this.
+        handler
+            .inner
+            .lock()
+            .unwrap()
+            .session
+            .messages
+            .push(AgentMessage::text(Role::User, "in memory"));
+
+        let (flow, items) = drive(&mut handler, Effect::LoadSession { id });
+        assert_eq!(flow, ControlFlow::Continue);
+        assert!(items.is_empty(), "{items:?}");
+        assert_eq!(handler.inner.lock().unwrap().session.messages.len(), 1);
+    }
+
+    #[test]
+    fn usage_reports_the_sessions_totals() {
         let fx = Fixture::new("usage");
         let usage = TokenUsage {
             prompt_tokens: 10,
@@ -1120,9 +1295,167 @@ mod tests {
             ..Default::default()
         };
         let mut handler = fx.handler(Box::new(FakeProvider::with_usage(usage)), Vec::new());
+        // The session, not the provider, is the display's source (ADR-0018 D4).
+        handler.inner.lock().unwrap().session.usage = usage;
         assert_eq!(
             lines(&command(&mut handler, "/usage")),
             ["tokens: 10 prompt (0 cached, 0%) + 5 completion = 15 total"]
+        );
+    }
+
+    #[test]
+    fn a_turn_accumulates_every_request_in_its_usage() {
+        let fx = Fixture::new("usage-turn");
+        // Two requests in one turn: a tool call, then the final answer. Each
+        // adds the same usage, so the turn must count both and only both.
+        let provider = FakeProvider::new(vec![
+            vec![
+                Delta::ToolCallStart {
+                    index: 0,
+                    id: "c1".to_string(),
+                    name: "probe".to_string(),
+                },
+                Delta::ToolCallArgs {
+                    index: 0,
+                    fragment: "{}".to_string(),
+                },
+                Delta::Done(FinishReason::ToolCalls),
+            ],
+            vec![
+                Delta::Text("done".to_string()),
+                Delta::Done(FinishReason::Stop),
+            ],
+        ])
+        .with_per_call(TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            ..Default::default()
+        });
+        let tool = Tool::new("probe", "a probe", serde_json::json!({}), |_args| {
+            Ok("probed".to_string())
+        });
+        let mut handler = fx.handler(Box::new(provider), vec![tool]);
+        let id = handler.session_id();
+
+        let mut items = Vec::new();
+        handler
+            .submit(user_message("go"), &mut |item| items.push(item))
+            .expect("turn succeeds");
+
+        // Two requests × (10 prompt + 5 completion), counted once each.
+        assert_eq!(
+            handler.inner.lock().unwrap().session.usage,
+            TokenUsage {
+                prompt_tokens: 20,
+                completion_tokens: 10,
+                total_tokens: 30,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            items.iter().rev().find_map(|item| match item {
+                RenderItem::Usage(usage) => Some(*usage),
+                _ => None,
+            }),
+            Some(FooterUsage::new(20, 10, 0, 0))
+        );
+        assert_eq!(
+            lines(&command(&mut handler, "/usage")),
+            ["tokens: 20 prompt (0 cached, 0%) + 10 completion = 30 total"]
+        );
+        // Usage is memory-only: the log stays free of it (ADR-0018 D4).
+        let log = fs::read_to_string(fx.store.session_path(&id).unwrap()).unwrap();
+        assert!(!log.contains("\"usage\""), "{log}");
+    }
+
+    #[test]
+    fn usage_accumulates_across_turns_without_double_counting() {
+        let fx = Fixture::new("usage-turns");
+        let provider = FakeProvider::new(vec![
+            vec![
+                Delta::Text("one".to_string()),
+                Delta::Done(FinishReason::Stop),
+            ],
+            vec![
+                Delta::Text("two".to_string()),
+                Delta::Done(FinishReason::Stop),
+            ],
+        ])
+        .with_per_call(TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            ..Default::default()
+        });
+        let handler = fx.handler(Box::new(provider), Vec::new());
+        handler.submit(user_message("one"), &mut |_| {}).unwrap();
+        handler.submit(user_message("two"), &mut |_| {}).unwrap();
+
+        // Each turn adds its own request only; the total is not the running
+        // counter read twice.
+        assert_eq!(
+            handler.inner.lock().unwrap().session.usage.total_tokens,
+            30,
+            "two turns × one request each"
+        );
+    }
+
+    #[test]
+    fn new_session_resets_the_usage_to_zero() {
+        let fx = Fixture::new("usage-new");
+        let provider = FakeProvider::new(vec![vec![
+            Delta::Text("hi".to_string()),
+            Delta::Done(FinishReason::Stop),
+        ]])
+        .with_per_call(TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            ..Default::default()
+        });
+        let mut handler = fx.handler(Box::new(provider), Vec::new());
+        handler.submit(user_message("one"), &mut |_| {}).unwrap();
+        assert_eq!(handler.inner.lock().unwrap().session.usage.total_tokens, 15);
+
+        command(&mut handler, "/new");
+        assert_eq!(
+            handler.inner.lock().unwrap().session.usage,
+            TokenUsage::default()
+        );
+        assert_eq!(
+            lines(&command(&mut handler, "/usage")),
+            ["tokens: 0 prompt (0 cached, 0%) + 0 completion = 0 total"]
+        );
+    }
+
+    #[test]
+    fn loading_a_session_resets_the_usage_to_zero() {
+        let fx = Fixture::new("usage-load");
+        let saved = saved_session(&fx.store, "old prompt", "old reply");
+        let provider = FakeProvider::new(vec![vec![
+            Delta::Text("hi".to_string()),
+            Delta::Done(FinishReason::Stop),
+        ]])
+        .with_per_call(TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            ..Default::default()
+        });
+        let mut handler = fx.handler(Box::new(provider), Vec::new());
+        handler.submit(user_message("one"), &mut |_| {}).unwrap();
+        assert_eq!(handler.inner.lock().unwrap().session.usage.total_tokens, 15);
+
+        // The previous session's numbers must not follow the load.
+        drive(&mut handler, Effect::LoadSession { id: saved });
+        assert_eq!(
+            handler.inner.lock().unwrap().session.usage,
+            TokenUsage::default()
+        );
+        assert_eq!(
+            lines(&command(&mut handler, "/usage")),
+            ["tokens: 0 prompt (0 cached, 0%) + 0 completion = 0 total"]
         );
     }
 
@@ -1233,6 +1566,7 @@ mod tests {
             calls: 0,
             fail_at: Some(1),
             usage: TokenUsage::default(),
+            per_call: TokenUsage::default(),
         };
         let tool = Tool::new("probe", "a probe", serde_json::json!({}), |_args| {
             Ok("probed".to_string())
@@ -1270,6 +1604,7 @@ mod tests {
             calls: 0,
             fail_at: Some(1),
             usage: TokenUsage::default(),
+            per_call: TokenUsage::default(),
         };
         let handler = fx.handler(Box::new(provider), Vec::new());
         let id = handler.session_id();

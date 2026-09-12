@@ -575,7 +575,7 @@ pub fn combined_suggestions<S: SkillView>(skills: &[S], input: &str) -> Vec<Stri
 /// commit to the input buffer and a short description.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompletionItem {
-    /// The `/`-prefixed spelling to commit (e.g. `/usage`, `/resume`, or
+    /// The `/`-prefixed spelling to commit (e.g. `/usage`, `/session`, or
     /// `/skill:name`). Unlike [`combined_suggestions`], this is the bare
     /// spelling — never the usage string with its argument placeholder.
     pub value: String,
@@ -599,8 +599,8 @@ pub fn complete<S: SkillView>(input: &str, skills: &[S]) -> Vec<CompletionItem> 
 
     // Candidate pool: every command spelling (canonical + alias) then every
     // skill, as `skill:name`. Commands first keeps the registry order for the
-    // bare-`/` case; aliases are real spellings, so `/res` completes to
-    // `/resume` which `find` resolves back to `/load`.
+    // bare-`/` case; aliases are real spellings, so `/qu` completes to
+    // `/quit` which `find` resolves back to `/exit`.
     let mut pool: Vec<(&str, &'static str)> = Vec::new();
     for command in COMMANDS {
         for spelling in command.spellings() {
@@ -1176,7 +1176,7 @@ mod tests {
     #[test]
     fn is_builtin_command_detects_collision() {
         assert!(is_builtin_command("help"));
-        assert!(is_builtin_command("load"));
+        assert!(is_builtin_command("session"));
         assert!(!is_builtin_command("my-skill"));
     }
 
@@ -1207,7 +1207,7 @@ mod tests {
         // Every command spelling (canonical + alias) precedes skills, which
         // appear under their canonical `/skill:name` spelling.
         assert!(values.contains(&"/help"));
-        assert!(values.contains(&"/resume")); // alias of /load
+        assert!(values.contains(&"/quit")); // alias of /exit
         assert!(values.contains(&"/skill:grill"));
         assert_eq!(*values.last().unwrap(), "/skill:grill");
         let help = items.iter().find(|i| i.value == "/help").unwrap();
@@ -1230,9 +1230,9 @@ mod tests {
 
     #[test]
     fn complete_matches_command_alias() {
-        let items = complete("/res", NO_SKILLS);
+        let items = complete("/qui", NO_SKILLS);
         let values: Vec<&str> = items.iter().map(|i| i.value.as_str()).collect();
-        assert!(values.contains(&"/resume"), "got: {values:?}");
+        assert!(values.contains(&"/quit"), "got: {values:?}");
     }
 
     #[test]
@@ -1337,12 +1337,14 @@ mod tests {
 
     #[test]
     fn complete_values_are_bare_spellings_not_usages() {
-        // The value must be commit-able (no `<id>` placeholder), unlike the
-        // usage strings combined_suggestions surfaces. Querying the exact
-        // canonical name yields its bare spelling, not `/load <id>`.
-        let items = complete("/load", NO_SKILLS);
+        // The value must be commit-able (no `<path>` placeholder), unlike the
+        // usage strings combined_suggestions surfaces.
+        let items = complete("/install-skill", NO_SKILLS);
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].value, "/load");
-        assert_eq!(items[0].description, "load a saved session");
+        assert_eq!(items[0].value, "/install-skill");
+        assert_eq!(
+            items[0].description,
+            "install a skill (user or project scope)"
+        );
     }
 }

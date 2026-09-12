@@ -94,7 +94,7 @@ slimcode --model qwen-max "为 README 补一段简介"
 
 运行结束后打印 token 用量（含缓存命中数，如
 `tokens: 3019 prompt (2048 cached, 67.8%) + 104 completion = 3123 total`）。
-one-shot 模式不落盘会话：它没有 `/load`/`/sessions` 工作流，与 TUI 的规则一致
+one-shot 模式不落盘会话：它没有交互式会话工作流（picker），与 TUI 的规则一致
 （没有 assistant 消息的一轮不产生会话文件，ADR-0009 D5）。
 
 one-shot 模式没有命令解析器：如果 prompt 以 `/skill:name` 开头，它会被自动改写为
@@ -144,7 +144,7 @@ slimcode
   与右对齐的模型名，超宽时两端截断；每轮结束后更新为累计值；
 - **状态指示器**：不再占独立一行——一轮运行期间，`⠋ Working...`（braille 旋转帧，约 80ms
   一帧）嵌入输入框上边框左侧，整行用运行色（青色）渲染，空闲时上边框恢复为纯 `─` 横线；
-- **终端标题**：进入 TUI 及 `/new` / `/load` 时设为 `slimcode - <session> - <cwd 目录名>`；
+- **终端标题**：进入 TUI、`/new` 及 picker 载入会话时设为 `slimcode - <session> - <cwd 目录名>`；
 - **补全弹框**：pi SelectList 裸行样式（无边框、无标题）——顶部一条全宽 `─` 分隔线（border 色）
   把弹框与上方 transcript 隔开；选中行 `→` 前缀与名称 accent、
   无反色，描述 muted，超出 5 条时带 muted 滚动窗口标记 `(i/n)`；显示在**输入框上方**，
@@ -192,7 +192,7 @@ recall 状态下按 `Enter` 会把选中的历史 prompt 作为**新一轮**运�
   不提交；
 - `Enter` 把选中项展开为完整命令名后**直接提交执行**（而不是提交你正在输入的部分文本）；
 - `Esc` 取消弹框、保留已输入文本；继续输入字符实时过滤，输入空格（进入参数段）时弹框关闭；
-- 候选值是命令的裸拼写（如 `/usage`、`/resume`）或 skill 的规范触发 `/skill:name`，
+- 候选值是命令的裸拼写（如 `/usage`、`/session`）或 skill 的规范触发 `/skill:name`，
   不含 `usage` 中的参数占位符；skill 匹配只看**名字部分**——`/skill:` 前缀不参与打分，
   所以输入 `s`/`k`/`i`/`l` 等会误中所有 skill 的前缀字母不会产生干扰，而 `/skill:name`
   这种带前缀的输入也会剥掉前缀后按名字匹配；
@@ -210,9 +210,8 @@ skills store），模糊匹配与候选合并仍是前端无关的 `slimcode-com
 | 命令 | 作用 |
 | --- | --- |
 | `/help` | 列出命令 |
-| `/new` | 新建会话（清空 transcript） |
-| `/load <id>` | 从磁盘恢复一个已保存会话（`/resume` 同义；清空 transcript 后载入其消息历史）。只查找当前项目的会话 |
-| `/sessions` | 列出**当前项目**已保存的会话 id |
+| `/new` | 新建会话（清空消息、清空用量、清空屏幕） |
+| `/session` | 打开 **session picker**：列出**当前项目**已保存的会话，`Enter` 载入所选（见下节） |
 | `/usage` | 显示累计 token 用量 |
 | `/history` | 列出输入历史（最近 20 条、最新在前、带编号） |
 | `/skills` | 列出已安装的 skill（含 user/project scope 与 manual-only 标记） |
@@ -220,6 +219,48 @@ skills store），模糊匹配与候选合并仍是前端无关的 `slimcode-com
 | `/!!` | 重跑最近一条 prompt（作为新一轮，不重复写入历史） |
 | `/!N` | 重跑编号 N 的 prompt（verbatim，多行原样） |
 | `/exit` / `/quit` | 退出 |
+
+#### Session picker（`/session`）
+
+`/session` 打开一个**占满整屏**的会话选择器，列出**当前项目**磁盘上真实存在的会话
+（刚 `/new` 出来、还没有日志文件的新会话不在其中）：
+
+```
+Sessions (this project)                                    3 saved
+  * Fix the parser crash                12 msgs  2026-02-14 15:32
+  › Ship the session picker              4 msgs  2026-02-14 15:40
+    slimcode-1756-1234-0                 1 msg   2026-02-11 09:02
+  (2/3)
+  Esc cancel · ↑/↓ move · PgUp/PgDn page · Enter load
+```
+
+- 每行左侧是会话标题（没有标题记录时回退到 session id），右侧是**消息条数**
+  （`1 msg` 单数）与日志文件的修改时间；列表按修改时间从新到旧排序；
+- `*` 标出**当前会话**（你现在这个），`›` 标出光标所在行；
+- 时间显示为 **UTC 时钟**（`YYYY-MM-DD HH:MM`，不做时区换算、不带 `Z` 后缀）；
+- 行数超出列表区时，最后一行改作 `(i/n)` 溢出指示（`i` = 当前选中序号）；
+- 当前项目一个会话都没有时，列表区显示空态 `no saved sessions in this project`，
+  底部提示变为 `Esc close`。
+
+**按键**：
+
+| 按键 | 作用 |
+| --- | --- |
+| `↑` / `↓` | 上/下移动一行（两端 clamp） |
+| `PgUp` / `PgDn` | 上/下翻页（10 行） |
+| 鼠标滚轮 | 上/下移动选中行（3 行/格）——在 picker 里滚的是**列表**，不是 transcript |
+| `Enter` | 载入所选会话并关闭 picker；选中当前会话那一行时什么都不发生 |
+| `Esc` | 关闭 picker，原样回到刚才的聊天视图（不产生任何操作） |
+| `Ctrl+C` / `Ctrl+D` | 退出程序 |
+
+picker 打开时其它按键都不会进入输入框，也不会触发输入历史 recall。载入与 `/new`
+都会清空 transcript、重新出现启动 Header，并更新 session id 与终端标题；载入一个需要
+修补的会话时，「跳过 N 条记录 / 修补 N 个工具调用」的提示会留在清屏之后的屏幕上。
+
+**用量从 0 起算**：token 用量属于**当前这个内存中的会话**，不落盘。`/new` 之后
+footer 的统计归零，用 picker 恢复一个会话之后同样从 0 起算（恢复后看不到这个会话
+历史累计的 token）——这是明确的设计取舍（ADR-0018 D4），不是 bug：统计只反映
+「这个会话这次被用掉多少」。
 
 **非 TTY**：不带 prompt 且 stdout 不是终端时，slimcode 打印明确错误并以非零退出码结束，不会尝试打开 TUI。
 
@@ -340,7 +381,7 @@ markdown 结构冲突。与 Skill 的区别：Skill 按需触发（`/skill:name`
 - **project home**：当前工作目录向上找最近的含 `.git` 的祖先目录；不在任何
   git 仓库内时回退到 OS 用户主目录（`$HOME`）。
 
-环境信息在会话首轮冻结：`/load` 恢复的会话沿用首轮的值，不会因当前启动目录
+环境信息在会话首轮冻结：picker 载入的会话沿用首轮的值，不会因当前启动目录
 不同而刷新（会话不记录工作目录）。
 
 ### 输入历史与多行 prompt
@@ -369,12 +410,12 @@ assistant 回复、每个工具结果）各占一行、随 turn 进行实时追�
 
 写入侧不校验、不 fsync，崩溃最多留下一个残缺尾行；读取侧**宽容**：未知/损坏的记录行
 会被跳过并计数，残缺尾行会被丢弃并补一个换行，悬空的工具调用批次会在内存中补上
-`Error: interrupted` 结果（磁盘字节不会被改写）。`/load` 若遇到跳过记录或修补的工具
-调用，会给出相应 notice。`/load` 恢复会话后，历史消息（含系统提示与 `## Environment`
-环境信息）原样继续，环境沿用首轮冻结值。
+`Error: interrupted` 结果（磁盘字节不会被改写）。载入（picker 的 `Enter`）若遇到跳过
+记录或修补的工具调用，会给出相应 notice。恢复会话后，历史消息（含系统提示与
+`## Environment` 环境信息）原样继续，环境沿用首轮冻结值。
 会话不记录工作目录——恢复后工具作用于当前启动目录。
 
-`/load` 与 `/sessions` **只作用于当前项目**：其他项目的会话不会被列出，也不会被加载。
+`/session` 的列表**只作用于当前项目**：其他项目的会话不会被列出，也不会被加载。
 升级前旧的整文件 `sessions/<id>.json` 会留在磁盘上但不可见（不列出、不加载、不被空
 会话清理删除），只计入磁盘配额（见下）。
 

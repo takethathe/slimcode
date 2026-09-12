@@ -6,7 +6,8 @@
 
 slimcode 是一个 Rust 编码 agent CLI：一条 prompt 在目标目录内自主执行
 read / write / edit / bash / grep / find / ls 工具循环直到完成，流式输出、
-token 用量统计、会话可保存/恢复（详见 `docs/development.md`）。有两个前端：
+token 用量统计、会话可保存并从全屏 picker（`/session`）恢复（详见
+`docs/development.md`）。有两个前端：
 带 prompt 时跑非交互 one-shot；不带 prompt 时进入全屏 TUI（ADR-0003），两者共用
 同一套渲染模型与 turn runner（ADR-0004）。
 
@@ -43,7 +44,7 @@ history**（`session.messages`）是会话中已发生的消息，可被当作 C
   无需再 read `SKILL.md`，直接按正文里的相对路径引用辅助文件。
 - 去重：若同一 skill 已在更早 message 加载过（扫描 `<skill name="..."` 标记），
   重触发时正文替换为 “already loaded” 提示、保留外壳与 base-dir 行，模型去更早
-  的 message 找指令，避免重复加载；扫描无状态，会话 `/load` 恢复后依然有效。
+  的 message 找指令，避免重复加载；扫描无状态，经 `/session` picker 恢复的会话依然有效。
 - 当轮 user 消息必须存在（`with_user_prompt`；skill 触发的消息文本由 CLI 用
   `skills::skill_prompt` 渲染后再传入），否则 `build()` 报错，而不是静默产出没有
   user 消息的 turn。

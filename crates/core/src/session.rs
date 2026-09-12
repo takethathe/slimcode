@@ -15,6 +15,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use slimcode_ai::TokenUsage;
+
 pub use slimcode_ai::message::{Message, Part, Role, ToolCall};
 
 /// Why a turn closed, recorded in a session-log message record's envelope
@@ -127,6 +129,12 @@ pub struct Session {
     pub messages: Vec<AgentMessage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The tokens this live session has spent, in memory only (ADR-0018 D4):
+    /// the frontend accumulates the provider's per-turn delta into it and
+    /// `/usage` and the footer read it. `serde(skip)` keeps it out of the log
+    /// format, so a new or resumed session always starts at zero.
+    #[serde(skip)]
+    pub usage: TokenUsage,
 }
 
 #[cfg(test)]
@@ -173,6 +181,7 @@ mod tests {
             id: "sess-1".to_string(),
             created_at: "2026-08-29T00:00:00Z".to_string(),
             title: None,
+            usage: TokenUsage::default(),
             messages: vec![
                 AgentMessage::text(Role::User, "weather?"),
                 AgentMessage::Llm(Message {
@@ -194,5 +203,26 @@ mod tests {
         let json = serde_json::to_string(&session).unwrap();
         let back: Session = serde_json::from_str(&json).unwrap();
         assert_eq!(session, back);
+    }
+
+    #[test]
+    fn session_usage_never_reaches_the_log() {
+        let session = Session {
+            id: "sess-1".to_string(),
+            created_at: "2026-08-29T00:00:00Z".to_string(),
+            title: None,
+            usage: TokenUsage {
+                prompt_tokens: 7,
+                completion_tokens: 3,
+                total_tokens: 10,
+                ..Default::default()
+            },
+            messages: vec![AgentMessage::text(Role::User, "hi")],
+        };
+        let json = serde_json::to_string(&session).unwrap();
+        assert!(!json.contains("usage"), "{json}");
+        // A deserialized session starts at zero: usage is not persisted.
+        let back: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.usage, TokenUsage::default());
     }
 }

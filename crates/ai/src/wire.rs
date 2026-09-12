@@ -109,6 +109,76 @@ impl TokenUsage {
         self.prompt_tokens_details
             .map_or(0, |d| d.cache_creation_input_tokens)
     }
+
+    /// Field-wise saturating addition, merging the cache details (absence on
+    /// either side counts as zero). Used to add one turn's delta onto a
+    /// session's own total (ADR-0018 D4).
+    pub fn saturating_add(&self, other: &Self) -> Self {
+        Self {
+            prompt_tokens: self.prompt_tokens.saturating_add(other.prompt_tokens),
+            completion_tokens: self
+                .completion_tokens
+                .saturating_add(other.completion_tokens),
+            total_tokens: self.total_tokens.saturating_add(other.total_tokens),
+            prompt_tokens_details: add_details(
+                self.prompt_tokens_details,
+                other.prompt_tokens_details,
+            ),
+        }
+    }
+
+    /// Field-wise saturating subtraction (`self - earlier`), the delta of a
+    /// running counter: each field clamps at zero, so a counter that moved
+    /// backwards yields zeros instead of wrapping. Cache details are kept only
+    /// when either side carries them.
+    pub fn saturating_sub(&self, earlier: &Self) -> Self {
+        Self {
+            prompt_tokens: self.prompt_tokens.saturating_sub(earlier.prompt_tokens),
+            completion_tokens: self
+                .completion_tokens
+                .saturating_sub(earlier.completion_tokens),
+            total_tokens: self.total_tokens.saturating_sub(earlier.total_tokens),
+            prompt_tokens_details: sub_details(
+                self.prompt_tokens_details,
+                earlier.prompt_tokens_details,
+            ),
+        }
+    }
+}
+
+/// Merge two optional cache-detail blocks, treating absence as zero.
+fn add_details(
+    a: Option<PromptTokensDetails>,
+    b: Option<PromptTokensDetails>,
+) -> Option<PromptTokensDetails> {
+    if a.is_none() && b.is_none() {
+        return None;
+    }
+    let (a, b) = (a.unwrap_or_default(), b.unwrap_or_default());
+    Some(PromptTokensDetails {
+        cached_tokens: a.cached_tokens.saturating_add(b.cached_tokens),
+        cache_creation_input_tokens: a
+            .cache_creation_input_tokens
+            .saturating_add(b.cache_creation_input_tokens),
+    })
+}
+
+/// Difference of two optional cache-detail blocks, treating absence as zero;
+/// `None` when neither side has any.
+fn sub_details(
+    a: Option<PromptTokensDetails>,
+    b: Option<PromptTokensDetails>,
+) -> Option<PromptTokensDetails> {
+    if a.is_none() && b.is_none() {
+        return None;
+    }
+    let (a, b) = (a.unwrap_or_default(), b.unwrap_or_default());
+    Some(PromptTokensDetails {
+        cached_tokens: a.cached_tokens.saturating_sub(b.cached_tokens),
+        cache_creation_input_tokens: a
+            .cache_creation_input_tokens
+            .saturating_sub(b.cache_creation_input_tokens),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1135,5 +1205,45 @@ mod tests {
         let v = serde_json::to_value(&req).unwrap();
         assert!(v.get("parallel_tool_calls").is_none());
         assert!(v.get("tools").is_none());
+    }
+
+    #[test]
+    fn usage_arithmetic_is_field_wise_and_saturating() {
+        let before = TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            prompt_tokens_details: Some(PromptTokensDetails {
+                cached_tokens: 4,
+                cache_creation_input_tokens: 2,
+            }),
+        };
+        let after = TokenUsage {
+            prompt_tokens: 30,
+            completion_tokens: 12,
+            total_tokens: 42,
+            prompt_tokens_details: Some(PromptTokensDetails {
+                cached_tokens: 9,
+                cache_creation_input_tokens: 2,
+            }),
+        };
+        let delta = after.saturating_sub(&before);
+        assert_eq!(delta.prompt_tokens, 20);
+        assert_eq!(delta.completion_tokens, 7);
+        assert_eq!(delta.total_tokens, 27);
+        assert_eq!(delta.cached_tokens(), 5);
+        assert_eq!(delta.cache_creation_tokens(), 0);
+        // Adding the delta back reproduces `after`.
+        assert_eq!(before.saturating_add(&delta), after);
+        // A counter that moved backwards clamps instead of wrapping.
+        assert_eq!(before.saturating_sub(&after).prompt_tokens, 0);
+        // Details stay absent when neither side has any.
+        let none = TokenUsage::default();
+        assert!(none.saturating_sub(&none).prompt_tokens_details.is_none());
+        assert!(none.saturating_add(&none).prompt_tokens_details.is_none());
+        // One side present is enough to keep the block.
+        assert_eq!(before.saturating_add(&none).cached_tokens(), 4);
+        assert_eq!(before.saturating_sub(&none).cached_tokens(), 4);
+        assert_eq!(none.saturating_add(&before).cached_tokens(), 4);
     }
 }

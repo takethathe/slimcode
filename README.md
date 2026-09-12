@@ -7,7 +7,7 @@
 ## 特性
 
 - 单次非交互模式：`slimcode "为 README 补一段简介"`
-- 交互式全屏 TUI：`/help`、`/new`、`/load`、`/usage`、`/history` 等命令，
+- 交互式全屏 TUI：`/help`、`/new`、`/session`、`/usage`、`/history` 等命令，
   未知 `/` 命令给出预测提示（前缀匹配建议）
 - 流式渲染 agent 输出，会话按消息逐条追加保存
 - 基于 DashScope（百炼）OpenAI 兼容接口，默认使用 `qwen-plus` 模型
@@ -106,9 +106,8 @@ slimcode
 | --- | --- |
 | `<prompt>` | 作为用户消息运行一轮 agent 循环（`Shift+Enter` 换行） |
 | `/help` | 列出命令 |
-| `/new` | 新建会话 |
-| `/load <id>` | 从磁盘恢复一个已保存会话（`/resume` 同义） |
-| `/sessions` | 列出已保存会话 id |
+| `/new` | 新建会话（清空消息、用量与屏幕） |
+| `/session` | 打开全屏 session picker：列出**当前项目**已保存的会话，`↑`/`↓`/`PgUp`/`PgDn`（或滚轮）移动，`Enter` 载入，`Esc` 关闭 |
 | `/usage` | 显示累计 token 用量 |
 | `/history` | 列出输入历史（最近 20 条、最新在前、带编号） |
 | `/!!` | 重跑最近一条 prompt |

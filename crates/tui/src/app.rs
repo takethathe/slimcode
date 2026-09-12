@@ -27,7 +27,7 @@ use unicode_width::UnicodeWidthChar;
 use crate::footer::FooterUsage;
 use crate::handler::{CompletionItem, CompletionProvider, Prompt};
 use crate::markdown::render_markdown;
-use crate::render::RenderItem;
+use crate::render::{RenderItem, SessionRow};
 use crate::text::{display_width, wrap_to_width};
 use crate::theme::{BgToken, Token, bg, fg};
 use crate::toolcall::{CallPart, tool_call_title};
@@ -44,7 +44,8 @@ const MAX_INPUT_RATIO: u16 = 30;
 /// Maximum number of rows the `/` completion popup shows before scrolling.
 const COMPLETION_VISIBLE: usize = 5;
 
-/// Number of lines a PageUp / PageDown key scrolls the transcript by.
+/// Number of lines a PageUp / PageDown key scrolls the transcript by. The
+/// picker reuses it as its page size.
 const PAGE_LINES: usize = 10;
 
 /// Lines one mouse-wheel notch scrolls the transcript by: a sibling of
@@ -74,6 +75,18 @@ const SCROLLBAR_FADE_TICKS: u8 = 12;
 /// stays under `/help`.
 const HEADER_HINTS: &str = "/help for commands · /skills to run · ↑ history · Ctrl+O expand";
 
+/// The session picker's header title (left column).
+const PICKER_TITLE: &str = "Sessions (this project)";
+
+/// The session picker's empty-list line.
+const PICKER_EMPTY_LIST: &str = "  no saved sessions in this project";
+
+/// The session picker's key hint (footer line 1) when it has rows.
+const PICKER_HINT: &str = "  Esc cancel · ↑/↓ move · PgUp/PgDn page · Enter load";
+
+/// The session picker's key hint when there is nothing to pick.
+const PICKER_EMPTY_HINT: &str = "  Esc close";
+
 /// Immutable status-line state shown at the bottom of the screen.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StatusLine {
@@ -88,9 +101,9 @@ pub struct StatusLine {
     /// Best-effort git branch of the cwd (`None` outside a repository), fed
     /// from the shell at startup and on session changes.
     pub branch: Option<String>,
-    /// Session-total token usage for the footer stats line. The shell feeds
-    /// the provider's cumulative usage after each turn (and `/usage` keeps
-    /// its own dim detail line).
+    /// The session-total token usage for the footer stats line. The shell
+    /// feeds the live session's accumulated usage after each turn (ADR-0018
+    /// D4); the provider's running total stops at the runtime seam.
     pub usage: FooterUsage,
 }
 
@@ -151,10 +164,14 @@ pub enum Effect {
     /// recalled prompt being replayed (not recorded).
     SubmitPrompt(Prompt),
     /// The user typed a `/`-prefixed command, with its optional argument.
-    /// Every semantic (`/help`, `/new`, `/load`, `/sessions`, `/usage`,
-    /// `/history`, `/skills`, `/install-skill`, `/exit`, `/!!`, `/!N`, a skill
-    /// name, or an unknown command) belongs to the CLI.
+    /// Every semantic (`/help`, `/new`, `/session`, `/usage`, `/history`,
+    /// `/skills`, `/install-skill`, `/exit`, `/!!`, `/!N`, a skill name, or an
+    /// unknown command) belongs to the CLI.
     Command { name: String, arg: Option<String> },
+    /// Load the session with this id: emitted when the user picks a row in the
+    /// session picker (`Enter`). The picker closes itself first; the CLI owns
+    /// what loading means and recognises its own session id as a no-op.
+    LoadSession { id: String },
     /// Quit the TUI (Ctrl+C / Ctrl+D while idle).
     Quit,
     /// Quit after the currently running turn finishes (Ctrl+C / Ctrl+D while
@@ -214,6 +231,21 @@ impl Completion {
     }
 }
 
+/// The full-screen session picker's state (ADR-0018 D2): the CLI's rows plus
+/// the library-owned selection. While it is set the picker replaces the whole
+/// frame and owns the keymap. `offset` is the first visible row of the scroll
+/// window; it is re-clamped on every draw, when the pane height (and so the
+/// visible row count) is known.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Picker {
+    /// The rows to show, in CLI order (newest first).
+    pub rows: Vec<SessionRow>,
+    /// Index of the highlighted row.
+    pub selected: usize,
+    /// First row of the visible window.
+    pub offset: usize,
+}
+
 /// The pure TUI app core.
 pub struct App {
     /// The transcript rendered in the top pane.
@@ -234,6 +266,9 @@ pub struct App {
     pub recall: Option<Recall>,
     /// Active `/` completion popup state, if any.
     pub completion: Option<Completion>,
+    /// Active session-picker state, if any: the library's first non-chat view
+    /// (ADR-0018 D2).
+    pub picker: Option<Picker>,
     /// Lines scrolled up from the bottom of the transcript (0 = at bottom).
     pub scroll: usize,
     /// Whether the view auto-follows new output.
@@ -284,6 +319,7 @@ impl App {
             history: Vec::new(),
             recall: None,
             completion: None,
+            picker: None,
             scroll: 0,
             follow: true,
             content_width: 0,
@@ -357,6 +393,12 @@ impl App {
                 }
                 _ => {}
             }
+        }
+        // The picker is modal: while it is open every other key belongs to its
+        // list, never to the input box or history recall. Closing it is a
+        // view gesture, so only Enter produces an effect.
+        if self.picker.is_some() {
+            return self.handle_picker_key(key);
         }
         let completion_open = self.completion.is_some();
         match key.code {
@@ -436,6 +478,61 @@ impl App {
         }
     }
 
+    /// Key handling while the session picker is open (ADR-0018 D2): `↑`/`↓`
+    /// move one row, `PgUp`/`PgDn` a page, `Enter` loads the picked session,
+    /// and `Esc` closes the view. Both ends clamp; no key reaches the input
+    /// box, and only `Enter` yields an [`Effect`].
+    fn handle_picker_key(&mut self, key: KeyEvent) -> Option<Effect> {
+        match key.code {
+            KeyCode::Up => {
+                self.picker_move(-1);
+                None
+            }
+            KeyCode::Down => {
+                self.picker_move(1);
+                None
+            }
+            KeyCode::PageUp => {
+                self.picker_move(-(PAGE_LINES as isize));
+                None
+            }
+            KeyCode::PageDown => {
+                self.picker_move(PAGE_LINES as isize);
+                None
+            }
+            // Enter on an empty list has nothing to load and leaves the
+            // picker open (its hint only offers Esc).
+            KeyCode::Enter => {
+                let row = self
+                    .picker
+                    .as_ref()
+                    .and_then(|p| p.rows.get(p.selected))
+                    .cloned()?;
+                self.picker = None;
+                Some(Effect::LoadSession { id: row.id })
+            }
+            KeyCode::Esc => {
+                self.picker = None;
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Move the picker selection by `delta` rows (negative = up), clamped to
+    /// the list.
+    fn picker_move(&mut self, delta: isize) {
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        if picker.rows.is_empty() {
+            picker.selected = 0;
+            return;
+        }
+        let max = picker.rows.len() - 1;
+        picker.selected = (picker.selected as isize + delta).clamp(0, max as isize) as usize;
+    }
+
     /// Mouse reducer, the wheel's sibling of [`App::handle_key`]: the wheel
     /// scrolls the transcript, everything else a mouse can report is ignored.
     ///
@@ -451,7 +548,19 @@ impl App {
     /// input-history recall (that keyboard semantic is untouched).
     ///
     /// Yields no [`Effect`]: the wheel is a view-only gesture, never an action.
+    ///
+    /// While the picker is open the wheel is the list's, not the transcript's:
+    /// it moves the selection by [`WHEEL_LINES`] rows and leaves `scroll`,
+    /// `follow` and the scrollbar fade counter untouched (ADR-0018 D2).
     pub fn handle_mouse(&mut self, event: MouseEvent) {
+        if self.picker.is_some() {
+            match event.kind {
+                MouseEventKind::ScrollUp => self.picker_move(-(WHEEL_LINES as isize)),
+                MouseEventKind::ScrollDown => self.picker_move(WHEEL_LINES as isize),
+                _ => {}
+            }
+            return;
+        }
         match event.kind {
             MouseEventKind::ScrollUp => self.scroll_up(WHEEL_LINES),
             MouseEventKind::ScrollDown => self.scroll_down(WHEEL_LINES),
@@ -656,6 +765,12 @@ impl App {
 
     /// Draw the whole screen into `area` of the given frame.
     pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
+        // The picker is the library's one non-chat view: while it is open it
+        // replaces the whole frame (transcript, popup, editor, footer alike).
+        if self.picker.is_some() {
+            self.draw_picker(frame, area);
+            return;
+        }
         // The completion popup (when open) is an extra region between the
         // input box and the footer: a bordered list of `visible` rows plus a
         // muted `(i/n)` scroll-info row when the list overflows.
@@ -730,6 +845,86 @@ impl App {
         // top border (render_input) while a turn runs; there is no separate
         // status row.
         self.render_footer(frame, footer_area);
+    }
+
+    /// Draw the full-screen session picker (ADR-0018 D2): a one-line header
+    /// (`Sessions (this project)` left, the row count right), the row list
+    /// with its `(i/n)` overflow indicator, and a two-line footer whose first
+    /// row is the key hint and whose second stays blank so the picker's bottom
+    /// edge sits where the chat footer's does. The selection window is
+    /// re-clamped here, where the pane height is known.
+    fn draw_picker(&mut self, frame: &mut Frame, area: Rect) {
+        let [header_area, list_area, footer_area] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(FOOTER_HEIGHT),
+        ])
+        .areas(area);
+
+        // Read the current-session marker before borrowing the picker mutably.
+        let session_id = self.status.session_id.clone();
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        let width = area.width as usize;
+        let total = picker.rows.len();
+
+        frame.render_widget(
+            Paragraph::new(right_aligned_pair(
+                PICKER_TITLE,
+                &format!("{total} saved"),
+                width,
+            )),
+            header_area,
+        );
+
+        let height = list_area.height as usize;
+        let mut rows: Vec<Line<'static>> = Vec::new();
+        if total == 0 {
+            rows.push(Line::styled(PICKER_EMPTY_LIST.to_string(), fg(Token::Dim)));
+        } else {
+            // The `(i/n)` indicator takes the last list row when the list does
+            // not fit, so the window shrinks by one.
+            let overflow = total > height;
+            let visible = if overflow {
+                height.saturating_sub(1)
+            } else {
+                height
+            };
+            if visible > 0 {
+                if picker.selected < picker.offset {
+                    picker.offset = picker.selected;
+                } else if picker.selected >= picker.offset + visible {
+                    picker.offset = picker.selected + 1 - visible;
+                }
+                picker.offset = picker.offset.min(total.saturating_sub(visible));
+            } else {
+                picker.offset = picker.offset.min(total - 1);
+            }
+            let end = (picker.offset + visible).min(total);
+            for i in picker.offset..end {
+                let selected = i == picker.selected;
+                let current = picker.rows[i].id == session_id;
+                rows.push(picker_row(&picker.rows[i], selected, current, width));
+            }
+            if overflow {
+                rows.push(Line::styled(
+                    format!("  ({}/{total})", picker.selected + 1),
+                    fg(Token::Muted),
+                ));
+            }
+        }
+        frame.render_widget(Paragraph::new(rows), list_area);
+
+        let hint = if total == 0 {
+            PICKER_EMPTY_HINT
+        } else {
+            PICKER_HINT
+        };
+        frame.render_widget(
+            Paragraph::new(vec![Line::styled(hint.to_string(), fg(Token::Dim))]),
+            footer_area,
+        );
     }
 
     /// Render the pi-style two-line dock footer (ADR-0006 D5): line 1 = dim
@@ -911,12 +1106,27 @@ impl App {
             RenderItem::UserPrompt(text) => self.transcript.push(Entry::UserPrompt { text }),
             RenderItem::Usage(usage) => self.status.usage = usage,
             RenderItem::Branch(branch) => self.status.branch = branch,
+            // The picker takes over the frame; opening it leaves the
+            // transcript (and its parked view) untouched.
+            RenderItem::SessionPicker { rows } => {
+                self.picker = Some(Picker {
+                    rows,
+                    selected: 0,
+                    offset: 0,
+                });
+                return;
+            }
             // A new or loaded session drops the old transcript — and the view
-            // state with it; the CLI emits the accompanying notice as its own
-            // item.
+            // state with it. The startup header returns, the footer's usage
+            // restarts at zero (usage belongs to the live session, ADR-0018
+            // D4) and any open picker closes; the CLI emits the accompanying
+            // notice as its own item.
             RenderItem::SessionChanged { id } => {
                 self.transcript.clear();
+                self.transcript.push(Entry::Header);
+                self.status.usage = FooterUsage::default();
                 self.status.session_id = id;
+                self.picker = None;
                 self.reset_view();
                 return;
             }
@@ -1542,6 +1752,74 @@ fn pad_line_to_width(spans: Vec<Span<'static>>, width: usize, bg: Style) -> Line
     Line::from(spans)
 }
 
+/// A header line with `left` at the start and `right` at the end of `width`
+/// columns; the right column is dropped first when the pane is too narrow for
+/// both.
+fn right_aligned_pair(left: &str, right: &str, width: usize) -> Line<'static> {
+    let left_w = display_width(left);
+    let right_w = display_width(right);
+    if left_w + 1 + right_w > width {
+        return Line::styled(
+            crate::footer::truncate_width_ellipsis(left, width),
+            fg(Token::Text),
+        );
+    }
+    Line::from(vec![
+        Span::styled(left.to_string(), fg(Token::Text)),
+        Span::styled(" ".repeat(width - left_w - right_w), Style::default()),
+        Span::styled(right.to_string(), fg(Token::Dim)),
+    ])
+}
+
+/// One picker row: the `› `/`  ` cursor column, the `* `/`  ` current-session
+/// marker column, the title, and the right-aligned meta. The title is
+/// truncated with `…` when the row is too narrow, and the meta is dropped
+/// before it so the title survives. A selected row is `selectedBg`-filled
+/// across the pane and bold; the current session's title is `accent`.
+fn picker_row(row: &SessionRow, selected: bool, current: bool, width: usize) -> Line<'static> {
+    let base = if selected {
+        bg(BgToken::SelectedBg)
+    } else {
+        Style::default()
+    };
+    let marker = base.fg(Token::Accent.color());
+    let mut title_style = base.fg(if current {
+        Token::Accent.color()
+    } else {
+        Token::Text.color()
+    });
+    if selected {
+        title_style = title_style.add_modifier(Modifier::BOLD);
+    }
+    let mut spans = vec![
+        Span::styled(if selected { "› " } else { "  " }, marker),
+        Span::styled(if current { "* " } else { "  " }, marker),
+    ];
+    let available = width.saturating_sub(4);
+    if available == 0 {
+        return pad_line_to_width(spans, width, base);
+    }
+    let meta_w = display_width(&row.meta);
+    let gap = 2;
+    let title_room = if !row.meta.is_empty() && available > meta_w + gap {
+        available - meta_w - gap
+    } else {
+        available
+    };
+    let keep_meta = !row.meta.is_empty() && title_room < available;
+    let title = crate::footer::truncate_width_ellipsis(&row.title, title_room);
+    let title_w = display_width(&title);
+    spans.push(Span::styled(title, title_style));
+    if keep_meta {
+        spans.push(Span::styled(
+            " ".repeat(available.saturating_sub(title_w + meta_w)),
+            base,
+        ));
+        spans.push(Span::styled(row.meta.clone(), base.fg(Token::Dim.color())));
+    }
+    pad_line_to_width(spans, width, base)
+}
+
 /// Pretty-print a tool arguments JSON string with two-space indentation;
 /// falls back to the raw string when it is not valid JSON (or is empty).
 fn pretty_args(raw: &str) -> Vec<String> {
@@ -1599,9 +1877,7 @@ mod tests {
                 pool: [
                     ("/help", "list commands"),
                     ("/new", "start a new session"),
-                    ("/load", "load a saved session"),
-                    ("/resume", "load a saved session"),
-                    ("/sessions", "list saved sessions"),
+                    ("/session", "browse this project's sessions"),
                     ("/usage", "show token usage"),
                     ("/history", "list input history"),
                     ("/skills", "list installed skills"),
@@ -1736,6 +2012,32 @@ mod tests {
             "9.9.9",
             Box::new(FakeCompletions::new()),
         )
+    }
+
+    /// The rows a CLI `/session` scan sends: two titled sessions plus the
+    /// seeded app's current session (`sess-1`, which has no title).
+    fn picker_rows() -> Vec<SessionRow> {
+        vec![
+            SessionRow {
+                id: "sess-3".into(),
+                title: "Ship the session picker".into(),
+                meta: "4 msgs  2026-02-14 15:40".into(),
+            },
+            SessionRow {
+                id: "sess-2".into(),
+                title: "Fix the parser crash".into(),
+                meta: "12 msgs  2026-02-14 15:32".into(),
+            },
+            SessionRow {
+                id: "sess-1".into(),
+                title: "slimcode-1756-1234-0".into(),
+                meta: "1 msg  2026-02-11 09:02".into(),
+            },
+        ]
+    }
+
+    fn open_picker(app: &mut App, rows: Vec<SessionRow>) {
+        app.apply(RenderItem::SessionPicker { rows });
     }
 
     /// The `Effect::Command` a slash line reduces to.
@@ -2407,22 +2709,266 @@ mod tests {
     }
 
     #[test]
-    fn slash_load_clears_transcript() {
+    fn picker_renders_header_rows_markers_and_hint() {
         let mut app = seeded_app();
         app.apply(RenderItem::Text("old content\n".to_string()));
+        open_picker(&mut app, picker_rows());
+        let buffer = render_buffer(&mut app, 60, 10);
 
-        type_text(&mut app, "/load sess-9");
+        assert!(buffer_contains(&buffer, "Sessions (this project)"));
+        assert!(buffer_contains(&buffer, "3 saved"));
+        assert!(buffer_contains(&buffer, "Fix the parser crash"));
+        assert!(buffer_contains(&buffer, "12 msgs  2026-02-14 15:32"));
+        assert!(buffer_contains(&buffer, "Enter load"));
+        // The picker replaces the whole frame: no transcript, no dock editor.
+        assert!(!buffer_contains(&buffer, "old content"));
+        assert!(!buffer_contains(&buffer, "slimcode v"));
+
+        // The cursor sits on row 0; the current session is marked `*` on its
+        // own row, and every title column lines up.
+        let first = row_containing(&buffer, "Ship the session picker").unwrap();
+        assert!(line_at(&buffer, first).starts_with("›   "), "{first}");
+        let second = row_containing(&buffer, "Fix the parser crash").unwrap();
+        assert!(line_at(&buffer, second).starts_with("    "), "{second}");
+        let current = row_containing(&buffer, "slimcode-1756-1234-0").unwrap();
+        assert!(line_at(&buffer, current).starts_with("  * "), "{current}");
+    }
+
+    #[test]
+    fn picker_marks_the_selected_row_with_bg_and_the_current_title_with_accent() {
+        let mut app = seeded_app();
+        open_picker(&mut app, picker_rows());
+        let buffer = render_buffer(&mut app, 60, 10);
+
+        let selected = row_containing(&buffer, "Ship the session picker").unwrap();
+        assert!(row_bg_equals(
+            &buffer,
+            selected,
+            BgToken::SelectedBg.color()
+        ));
+        let title_x = 4;
+        assert_eq!(
+            cell_style(&buffer, title_x, selected).fg,
+            Some(Token::Text.color())
+        );
+        assert!(
+            cell_style(&buffer, title_x, selected)
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+
+        let current = row_containing(&buffer, "slimcode-1756-1234-0").unwrap();
+        assert!(!row_bg_equals(
+            &buffer,
+            current,
+            BgToken::SelectedBg.color()
+        ));
+        assert_eq!(
+            cell_style(&buffer, title_x, current).fg,
+            Some(Token::Accent.color())
+        );
+    }
+
+    #[test]
+    fn picker_arrows_and_pages_clamp_at_both_ends() {
+        let mut app = seeded_app();
+        open_picker(&mut app, picker_rows());
+        let selected = |app: &App| app.picker.as_ref().unwrap().selected;
+        assert_eq!(selected(&app), 0);
+
+        // Up at the top clamps.
+        assert_eq!(app.handle_key(key(KeyCode::Up)), None);
+        assert_eq!(selected(&app), 0);
+
+        assert_eq!(app.handle_key(key(KeyCode::Down)), None);
+        assert_eq!(selected(&app), 1);
+        // PageDown jumps a page and clamps at the end.
+        assert_eq!(app.handle_key(key(KeyCode::PageDown)), None);
+        assert_eq!(selected(&app), 2);
+        assert_eq!(app.handle_key(key(KeyCode::PageDown)), None);
+        assert_eq!(selected(&app), 2);
+        // PageUp clamps at the top.
+        assert_eq!(app.handle_key(key(KeyCode::PageUp)), None);
+        assert_eq!(selected(&app), 0);
+        assert_eq!(app.handle_key(key(KeyCode::PageUp)), None);
+        assert_eq!(selected(&app), 0);
+    }
+
+    #[test]
+    fn picker_enter_loads_the_selected_row_and_closes() {
+        let mut app = seeded_app();
+        open_picker(&mut app, picker_rows());
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Some(Effect::LoadSession {
+                id: "sess-2".into()
+            })
+        );
+        assert!(app.picker.is_none());
+    }
+
+    #[test]
+    fn picker_esc_closes_without_an_effect() {
+        let mut app = seeded_app();
+        open_picker(&mut app, picker_rows());
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), None);
+        assert!(app.picker.is_none());
+        // The chat view is back, unchanged.
+        let buffer = render_buffer(&mut app, 60, 12);
+        assert!(buffer_contains(&buffer, "slimcode v"));
+        assert!(!buffer_contains(&buffer, "Sessions (this project)"));
+    }
+
+    #[test]
+    fn picker_empty_state_reports_no_sessions() {
+        let mut app = seeded_app();
+        open_picker(&mut app, Vec::new());
+        let buffer = render_buffer(&mut app, 60, 8);
+        assert!(buffer_contains(&buffer, "Sessions (this project)"));
+        assert!(buffer_contains(&buffer, "0 saved"));
+        assert!(buffer_contains(
+            &buffer,
+            "no saved sessions in this project"
+        ));
+        assert!(buffer_contains(&buffer, "Esc close"));
+        assert!(!buffer_contains(&buffer, "Enter load"));
+        // Enter has nothing to load and leaves the view open.
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), None);
+        assert!(app.picker.is_some());
+    }
+
+    #[test]
+    fn picker_overflow_shows_the_index_and_follows_the_selection() {
+        let mut app = seeded_app();
+        let rows = (0..12)
+            .map(|i| SessionRow {
+                id: format!("sess-{i}"),
+                title: format!("session {i}"),
+                meta: format!("{i} msgs  2026-02-14 15:32"),
+            })
+            .collect();
+        open_picker(&mut app, rows);
+
+        // A short pane: the last list row becomes the `(i/n)` indicator.
+        let buffer = render_buffer(&mut app, 60, 8);
+        assert!(buffer_contains(&buffer, "(1/12)"));
+        assert!(buffer_contains(&buffer, "session 0"));
+        assert!(!buffer_contains(&buffer, "session 11"));
+
+        // Walking to the end keeps the selection visible and updates `i`.
+        for _ in 0..12 {
+            app.handle_key(key(KeyCode::Down));
+        }
+        let buffer = render_buffer(&mut app, 60, 8);
+        assert!(buffer_contains(&buffer, "(12/12)"));
+        assert!(buffer_contains(&buffer, "session 11"));
+        assert!(!buffer_contains(&buffer, "session 0"));
+    }
+
+    #[test]
+    fn picker_truncates_a_long_title_and_drops_the_meta_first() {
+        let mut app = seeded_app();
+        open_picker(
+            &mut app,
+            vec![SessionRow {
+                id: "sess-x".into(),
+                title: "a very long session title that will not fit".into(),
+                meta: "3 msgs  2026-02-14 15:32".into(),
+            }],
+        );
+        let buffer = render_buffer(&mut app, 40, 8);
+        assert!(row_containing(&buffer, "…").is_some());
+        assert!(buffer_contains(&buffer, "2026-02-14 15:32"));
+
+        // Too narrow for both: the meta goes, the title stays.
+        let buffer = render_buffer(&mut app, 20, 8);
+        assert!(row_containing(&buffer, "…").is_some());
+        assert!(!buffer_contains(&buffer, "3 msgs"));
+    }
+
+    #[test]
+    fn picker_keys_never_reach_the_input_or_history_recall() {
+        let mut app = seeded_app();
+        app.set_history(vec!["first".into(), "second".into()]);
+        open_picker(&mut app, picker_rows());
+        for c in "hello".chars() {
+            assert_eq!(app.handle_key(key(KeyCode::Char(c))), None);
+        }
+        // ↑ moves the picker, not the recall.
+        assert_eq!(app.handle_key(key(KeyCode::Up)), None);
+        assert!(app.input_text().is_empty());
+        assert!(app.recall.is_none());
+        assert!(app.completion.is_none());
+        // The global quit keys still quit.
+        assert_eq!(app.handle_key(ctrl_key('c')), Some(Effect::Quit));
+        assert_eq!(app.handle_key(ctrl_key('d')), Some(Effect::Quit));
+    }
+
+    #[test]
+    fn picker_wheel_moves_the_selection_and_not_the_transcript() {
+        let mut app = seeded_app();
+        for i in 0..40 {
+            app.apply(RenderItem::Notice(format!("line {i}")));
+        }
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, 0, 0));
+        let scrolled = app.scroll;
+        assert!(scrolled > 0, "the transcript scrolled first");
+        app.scrollbar_ticks = 5;
+        open_picker(&mut app, picker_rows());
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 0, 0));
+        assert_eq!(app.picker.as_ref().unwrap().selected, WHEEL_LINES.min(2));
+        assert_eq!(app.scroll, scrolled, "the transcript must not move");
+        assert!(!app.follow, "follow must not change");
+        assert_eq!(app.scrollbar_ticks, 5, "the fade counter must not restart");
+    }
+
+    #[test]
+    fn picker_load_clears_the_transcript_and_keeps_the_notice() {
+        let mut app = seeded_app();
+        app.apply(RenderItem::Text("old content\n".to_string()));
+        open_picker(&mut app, picker_rows());
+
+        app.handle_key(key(KeyCode::Down));
         let effect = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(effect, Some(command("/load", Some("sess-9"))));
+        assert_eq!(
+            effect,
+            Some(Effect::LoadSession {
+                id: "sess-2".into()
+            })
+        );
+
+        // The loop fulfils the effect; the notice must survive the clear.
+        app.apply(RenderItem::SessionChanged {
+            id: "sess-2".into(),
+        });
+        app.apply(RenderItem::Notice("loaded session: sess-2".into()));
+        let buffer = render_buffer(&mut app, 60, 12);
+        assert!(!buffer_contains(&buffer, "old content"));
+        assert!(buffer_contains(&buffer, "loaded session: sess-2"));
+        assert_eq!(app.status.session_id, "sess-2");
+    }
+
+    #[test]
+    fn session_changed_resets_header_usage_and_picker() {
+        let mut app = seeded_app();
+        app.apply(RenderItem::Usage(FooterUsage::new(10, 5, 8, 2)));
+        app.apply(RenderItem::Text("old content".into()));
+        open_picker(&mut app, picker_rows());
 
         app.apply(RenderItem::SessionChanged {
             id: "sess-9".into(),
         });
-        app.apply(RenderItem::Notice("loaded session: sess-9".into()));
-        let buffer = render_buffer(&mut app, 60, 12);
-        assert!(!buffer_contains(&buffer, "old content"));
-        assert!(buffer_contains(&buffer, "loaded session: sess-9"));
+        assert!(app.picker.is_none());
         assert_eq!(app.status.session_id, "sess-9");
+        assert_eq!(app.status.usage, FooterUsage::default());
+        assert_eq!(app.transcript, vec![Entry::Header]);
+
+        let buffer = render_buffer(&mut app, 60, 12);
+        assert!(buffer_contains(&buffer, "slimcode v9.9.9"));
+        assert!(!buffer_contains(&buffer, "old content"));
+        assert!(!buffer_contains(&buffer, "Sessions (this project)"));
     }
 
     #[test]
@@ -2460,12 +3006,12 @@ mod tests {
     }
 
     #[test]
-    fn slash_sessions_usage_history_effects() {
+    fn slash_session_usage_history_effects() {
         let mut app = seeded_app();
-        type_text(&mut app, "/sessions");
+        type_text(&mut app, "/session");
         assert_eq!(
             app.handle_key(key(KeyCode::Enter)),
-            Some(command("/sessions", None))
+            Some(command("/session", None))
         );
         type_text(&mut app, "/usage");
         assert_eq!(
@@ -2651,9 +3197,10 @@ mod tests {
         let mut app = seeded_app();
         type_text(&mut app, "/");
         let comp = app.completion.as_ref().expect("popup should open on /");
-        assert_eq!(comp.items.len(), 13);
+        assert_eq!(comp.items.len(), 11);
         assert_eq!(comp.selected, 0);
         assert!(comp.items.iter().any(|i| i.value == "/help"));
+        assert!(comp.items.iter().any(|i| i.value == "/session"));
     }
 
     #[test]
@@ -2698,11 +3245,11 @@ mod tests {
     #[test]
     fn tab_commits_alias_spelling() {
         let mut app = seeded_app();
-        type_text(&mut app, "/res");
+        type_text(&mut app, "/qu");
         app.handle_key(key(KeyCode::Tab));
-        // `/res` fuzzy-matches the `/resume` alias; committing that spelling
-        // still resolves to `/load` on submit.
-        assert_eq!(app.input_text(), "/resume ");
+        // `/qu` completes the `/quit` alias of `/exit`; committing that
+        // spelling still resolves to `/exit` on submit.
+        assert_eq!(app.input_text(), "/quit ");
     }
 
     #[test]
@@ -2720,13 +3267,13 @@ mod tests {
     #[test]
     fn enter_runs_selected_not_typed_when_multiple_candidates() {
         let mut app = seeded_app();
-        // `/s` matches several commands; the best match (first) is `/sessions`
+        // `/s` matches several commands; the best match (first) is `/session`
         // (registry order, all score equally at a leading-s boundary hit).
         type_text(&mut app, "/s");
         let comp = app.completion.as_ref().unwrap();
-        assert_eq!(comp.items[0].value, "/sessions");
+        assert_eq!(comp.items[0].value, "/session");
         let effect = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(effect, Some(command("/sessions", None)));
+        assert_eq!(effect, Some(command("/session", None)));
     }
 
     #[test]
@@ -2756,7 +3303,7 @@ mod tests {
     #[test]
     fn selection_survives_recompute_when_still_a_candidate() {
         let mut app = seeded_app();
-        // `/s`: candidates include /sessions (first) and /skills. Move down to
+        // `/s`: candidates include /session (first) and /skills. Move down to
         // /skills, then narrow to `/sk` where /skills is still present: the
         // selection sticks to /skills.
         type_text(&mut app, "/s");
@@ -2899,8 +3446,9 @@ mod tests {
     // --- pi display alignment features (ticket 02) -------------------------
 
     #[test]
-    fn header_renders_at_startup_and_new_clears_it() {
+    fn header_renders_at_startup_and_returns_after_new() {
         let mut app = seeded_app();
+        app.apply(RenderItem::Text("old content".to_string()));
         let buffer = render_buffer(&mut app, 60, 12);
         assert!(buffer_contains(&buffer, "slimcode"));
         assert!(buffer_contains(&buffer, "v9.9.9"));
@@ -2914,13 +3462,15 @@ mod tests {
                 .contains(Modifier::BOLD)
         );
 
-        // `/new` clears the header together with the transcript.
+        // `/new` clears the transcript and re-pushes the startup header, so
+        // the old content is gone but the header is back.
         app.apply(RenderItem::SessionChanged {
             id: "sess-2".into(),
         });
         app.apply(RenderItem::Notice("new session: sess-2".into()));
         let buffer = render_buffer(&mut app, 60, 12);
-        assert!(!buffer_contains(&buffer, "slimcode"));
+        assert!(!buffer_contains(&buffer, "old content"));
+        assert!(buffer_contains(&buffer, "slimcode"));
         assert!(buffer_contains(&buffer, "new session: sess-2"));
     }
 

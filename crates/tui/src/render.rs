@@ -48,4 +48,23 @@ pub enum RenderItem {
     /// A new or loaded session: clear the transcript and point the status line
     /// at `id`. The accompanying notice is the CLI's wording.
     SessionChanged { id: String },
+    /// The session picker's rows: opens the library's full-screen picker view.
+    /// `Esc` (or a later `SessionChanged`) closes it again. The rows are the
+    /// CLI's data — the title is already the session's, or its id when it has
+    /// none, and `meta` is the preformatted right column — while the library
+    /// owns the selection, the layout and the `*`/`›` markers.
+    SessionPicker { rows: Vec<SessionRow> },
+}
+
+/// One row of the session picker: the id the CLI loads when the row is picked,
+/// the display title and the preformatted right column.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionRow {
+    /// The session id that `Effect::LoadSession` names.
+    pub id: String,
+    /// The display title (the session's title, or its id when it has none).
+    pub title: String,
+    /// The right-aligned detail column (message count and modification time),
+    /// composed by the CLI. Empty when there is nothing to show.
+    pub meta: String,
 }

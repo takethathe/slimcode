@@ -3,12 +3,12 @@
 //!
 //! Sessions are partitioned per project: the store is rooted at the sessions
 //! directory plus a project key derived from the project home path (git root,
-//! falling back to the OS user home), so `/load` and `/sessions` only ever see
-//! the current project's sessions. Disk use is bounded two ways: a startup
-//! sweep drops the current project's empty logs, and every append enforces a
-//! whole-store byte quota by evicting oldest-first down to half the quota
-//! (legacy whole-file `.json` sessions still count toward the quota, though
-//! they are invisible to load/list/cleanup).
+//! falling back to the OS user home), so `/session` only ever sees the current
+//! project's sessions. Disk use is bounded two ways: a startup sweep drops the
+//! current project's empty logs, and every append enforces a whole-store byte
+//! quota by evicting oldest-first down to half the quota (legacy whole-file
+//! `.json` sessions still count toward the quota, though they are invisible to
+//! load/summarize/cleanup).
 //!
 //! A log is a header line plus one typed record per line: the header carries
 //! the identity (`type`/`v`/`id`/`created_at`/`project_home`) and is mandatory,
@@ -25,7 +25,7 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -33,6 +33,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use slimcode_ai::TokenUsage;
 use slimcode_core::session::{AgentMessage, Message, MessageStopReason, Role, Session};
 
 /// Max title length before truncation.
@@ -114,11 +115,27 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 /// RFC3339 UTC string for the current time.
 pub fn now_rfc3339() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    unix_to_rfc3339(unix_secs(SystemTime::now()))
+}
+
+/// Unix seconds for `time`, clamped to 0 when it predates the epoch (the same
+/// treatment [`now_rfc3339`] gives a clock before 1970).
+pub fn unix_secs(time: SystemTime) -> i64 {
+    time.duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    unix_to_rfc3339(secs)
+        .unwrap_or(0)
+}
+
+/// Convert unix epoch seconds to a UTC `YYYY-MM-DD HH:MM` string — the session
+/// picker's minute-resolution timestamp. The clock is UTC: no zone conversion
+/// and no zone designator, because sessions are only ever compared against
+/// each other (ADR-0018 D5).
+pub fn format_minute(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (h, mi) = (rem / 3600, (rem % 3600) / 60);
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}")
 }
 
 /// Infer a session title from the first user message (truncated).
@@ -221,6 +238,22 @@ pub struct LoadOutcome {
     pub repaired_tool_calls: usize,
 }
 
+/// One row of the session picker's data (ADR-0018 D5): what a single
+/// streaming scan of a log yields — identity, the first title record (if any),
+/// the file's modification time and the number of `message` records.
+///
+/// The count is the number of `type` = `message` records in the log, which is
+/// not always what a load produces: only a log that needs repair differs,
+/// because a repaired tool call adds an in-memory result that was never a
+/// record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionSummary {
+    pub id: String,
+    pub title: Option<String>,
+    pub modified: SystemTime,
+    pub messages: usize,
+}
+
 /// A project-scoped, directory-backed session store
 /// (`<base>/<project-key>/<id>.jsonl`).
 pub struct SessionStore {
@@ -282,6 +315,7 @@ impl SessionStore {
             created_at: now_rfc3339(),
             messages: Vec::new(),
             title: None,
+            usage: TokenUsage::default(),
         }
     }
 
@@ -530,33 +564,60 @@ impl SessionStore {
                 created_at: header.created_at,
                 title,
                 messages,
+                // Usage is never persisted: a resumed session starts at zero
+                // (ADR-0018 D4).
+                usage: TokenUsage::default(),
             },
             skipped_records,
             repaired_tool_calls,
         })
     }
 
-    /// List this project's session ids (stable-sorted). Legacy `.json` files
-    /// stay invisible (ADR-0009 D1).
-    pub fn list(&self) -> Result<Vec<String>, String> {
+    /// Summarize this project's session logs, newest first (ADR-0018 D5).
+    ///
+    /// Each log gets one streaming pass: the header must parse — a log whose
+    /// header does not is skipped, matching the load's "unreadable" verdict —
+    /// and then every record line is classified by its `type` tag, a cheap
+    /// prefix recognition rather than a full JSON parse, so a `message`
+    /// record is counted and the first `title` record is taken. Ordering is by
+    /// the file's mtime, newest first, with the id as a descending tie-break
+    /// so the result is deterministic. Legacy `.json` files stay invisible
+    /// (ADR-0009 D1), and a file whose metadata cannot be read is skipped.
+    pub fn entries(&self) -> Result<Vec<SessionSummary>, String> {
         let dir = self.base.join(&self.project);
         if !dir.exists() {
             return Ok(Vec::new());
         }
-        let mut ids: Vec<String> = fs::read_dir(&dir)
-            .map_err(|e| format!("{}: {e}", dir.display()))?
-            .filter_map(|e| e.ok())
-            .filter_map(|e| {
-                let path = e.path();
-                let name = e.file_name().to_string_lossy().into_owned();
-                if !is_log_file(&path) {
-                    return None;
-                }
-                name.strip_suffix(".jsonl").map(str::to_string)
-            })
-            .collect();
-        ids.sort();
-        Ok(ids)
+        let mut entries: Vec<SessionSummary> = Vec::new();
+        for entry in fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+            let Ok(entry) = entry else { continue };
+            let path = entry.path();
+            if !is_log_file(&path) {
+                continue;
+            }
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            let Some(id) = file_name.strip_suffix(".jsonl") else {
+                continue;
+            };
+            let Ok(meta) = fs::metadata(&path) else {
+                continue;
+            };
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
+            let Some((title, messages)) = scan_summary(&path) else {
+                continue;
+            };
+            entries.push(SessionSummary {
+                id: id.to_string(),
+                title,
+                modified,
+                messages,
+            });
+        }
+        entries.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| b.id.cmp(&a.id)));
+        Ok(entries)
     }
 
     /// Delete empty session logs in this project's directory and return how
@@ -620,6 +681,51 @@ impl SessionStore {
         }
         remove_empty_subdirs(&self.base);
     }
+}
+
+/// One streaming pass over a log, cheap enough to run on the UI thread while
+/// the picker opens (ADR-0018 D5): `None` when the header does not parse (or
+/// is not a session header), else the first `title` record and the count of
+/// `message` records. Unknown record types and malformed lines are ignored, so
+/// the scan never fails on a log the load would replay leniently.
+fn scan_summary(path: &Path) -> Option<(Option<String>, usize)> {
+    let file = fs::File::open(path).ok()?;
+    let mut lines = BufReader::new(file).lines();
+    let header = lines.next()?.ok()?;
+    let header: LogHeader = serde_json::from_str(&header).ok()?;
+    if header.kind != "session" {
+        return None;
+    }
+    let mut title = None;
+    let mut messages = 0usize;
+    for line in lines {
+        let Ok(line) = line else { continue };
+        match record_type(&line) {
+            Some("message") => messages += 1,
+            Some("title") if title.is_none() => {
+                title = serde_json::from_str::<Value>(&line)
+                    .ok()
+                    .and_then(|v| v.get("title").and_then(Value::as_str).map(str::to_string));
+            }
+            _ => {}
+        }
+    }
+    Some((title, messages))
+}
+
+/// The `type` tag of a record line, read as a prefix instead of a full JSON
+/// parse (ADR-0018 D5): the record envelope is written with `type` first, so
+/// classifying a line costs a few byte comparisons instead of a deserialize.
+/// Whitespace around the brace, the key and the colon is tolerated; a line
+/// that does not open with a `"type"` key yields `None`.
+fn record_type(line: &str) -> Option<&str> {
+    let rest = line.trim_start();
+    let rest = rest.strip_prefix('{')?.trim_start();
+    let rest = rest.strip_prefix("\"type\"")?.trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(&rest[..end])
 }
 
 /// Append one record line to `path` (adding a trailing newline).
@@ -824,6 +930,7 @@ mod tests {
             id: id.to_string(),
             created_at: now_rfc3339(),
             title: None,
+            usage: TokenUsage::default(),
             messages: vec![AgentMessage::text(Role::User, "hi")],
         }
     }
@@ -863,6 +970,7 @@ mod tests {
 
     /// Write `contents` to `path` with an mtime `age` in the past.
     fn write_aged(path: &Path, contents: &[u8], age: Duration) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, contents).unwrap();
         let mtime = SystemTime::now() - age;
         fs::File::options()
@@ -871,6 +979,28 @@ mod tests {
             .unwrap()
             .set_modified(mtime)
             .unwrap();
+    }
+
+    /// Set `path`'s mtime to an explicit instant (so two files can share one).
+    fn set_mtime(path: &Path, mtime: SystemTime) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+    }
+
+    /// A complete raw log: the header plus the given record lines.
+    fn raw_log(id: &str, records: &[&str]) -> String {
+        let mut lines = vec![raw_header(id, "2026-02-14T15:32:00Z")];
+        lines.extend(records.iter().map(|s| s.to_string()));
+        lines.join("\n")
+    }
+
+    /// The ids of a summary list, in order.
+    fn ids(entries: Vec<SessionSummary>) -> Vec<String> {
+        entries.into_iter().map(|e| e.id).collect()
     }
 
     // --- metadata (unchanged behaviors) ------------------------------------
@@ -1014,6 +1144,7 @@ mod tests {
             id: "slimcode-1".to_string(),
             created_at: "2026-08-29T00:00:00Z".to_string(),
             title: Some("hello".to_string()),
+            usage: TokenUsage::default(),
             messages: vec![
                 AgentMessage::text(Role::User, "hi"),
                 AgentMessage::text(Role::Assistant, "hey!"),
@@ -1052,6 +1183,7 @@ mod tests {
             id: "slimcode-1".to_string(),
             created_at: "2026-08-29T00:00:00Z".to_string(),
             title: None,
+            usage: TokenUsage::default(),
             messages: vec![
                 AgentMessage::text(Role::User, "hi"),
                 AgentMessage::text(Role::Assistant, "first reply"),
@@ -1114,6 +1246,7 @@ mod tests {
             id: "slimcode-1".to_string(),
             created_at: "2026-08-29T00:00:00Z".to_string(),
             title: None,
+            usage: TokenUsage::default(),
             messages: vec![AgentMessage::text(Role::User, "hi")],
         };
         let asst = AgentMessage::text(Role::Assistant, "hello");
@@ -1439,7 +1572,7 @@ mod tests {
     // --- listing + isolation ------------------------------------------------
 
     #[test]
-    fn list_only_current_project() {
+    fn entries_only_current_project() {
         let dir = temp_dir();
         let a = store(&dir);
         let b = SessionStore::new(&dir, "proj-b", dir.join("home"));
@@ -1455,8 +1588,10 @@ mod tests {
         let asst = AgentMessage::text(Role::Assistant, "hi");
         s3.messages.push(asst.clone());
         a.append(&s3, &asst).unwrap();
-        assert_eq!(a.list().unwrap(), vec!["slimcode-1-a", "slimcode-3-a"]);
-        assert_eq!(b.list().unwrap(), vec!["slimcode-2-b"]);
+        let mut project_a = ids(a.entries().unwrap());
+        project_a.sort();
+        assert_eq!(project_a, vec!["slimcode-1-a", "slimcode-3-a"]);
+        assert_eq!(ids(b.entries().unwrap()), vec!["slimcode-2-b"]);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1485,30 +1620,195 @@ mod tests {
     }
 
     #[test]
-    fn list_ignores_a_directory_named_like_a_session_file() {
+    fn entries_ignore_a_directory_named_like_a_session_file() {
         let dir = temp_dir();
         let store = store(&dir);
         let mut s = session_with("slimcode-real");
         let asst = AgentMessage::text(Role::Assistant, "hi");
         s.messages.push(asst.clone());
         store.append(&s, &asst).unwrap();
-        // A directory whose name ends in `.jsonl` must not be listed.
+        // A directory whose name ends in `.jsonl` must not be summarized.
         fs::create_dir_all(dir.join("proj-a/slimcode-fake.jsonl")).unwrap();
-        assert_eq!(store.list().unwrap(), vec!["slimcode-real"]);
+        assert_eq!(ids(store.entries().unwrap()), vec!["slimcode-real"]);
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn list_ignores_legacy_json_files() {
+    fn entries_ignore_legacy_json_files() {
         let dir = temp_dir();
         let store = store(&dir);
         let mut s = session_with("slimcode-jsonl");
         let asst = AgentMessage::text(Role::Assistant, "hi");
         s.messages.push(asst.clone());
         store.append(&s, &asst).unwrap();
-        // A legacy whole-file session stays invisible to the listing.
+        // A legacy whole-file session stays invisible to the summaries.
         fs::write(dir.join("proj-a/slimcode-legacy.json"), "{}").unwrap();
-        assert_eq!(store.list().unwrap(), vec!["slimcode-jsonl"]);
+        assert_eq!(ids(store.entries().unwrap()), vec!["slimcode-jsonl"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- picker summaries (ticket 02) --------------------------------------
+
+    #[test]
+    fn entries_are_empty_for_a_missing_or_empty_project_dir() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        assert!(store.entries().unwrap().is_empty());
+        fs::create_dir_all(dir.join("proj-a")).unwrap();
+        assert!(store.entries().unwrap().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn format_minute_is_utc_with_no_zone() {
+        assert_eq!(format_minute(0), "1970-01-01 00:00");
+        // 2026-08-29T12:34:56Z, the instant the RFC3339 test pins.
+        let days = 56 * 365 + 14 + (31 + 28 + 31 + 30 + 31 + 30 + 31 + 28);
+        let secs = days as i64 * 86_400 + 12 * 3600 + 34 * 60 + 56;
+        assert_eq!(format_minute(secs), "2026-08-29 12:34");
+    }
+
+    #[test]
+    fn unix_secs_clamps_before_the_epoch() {
+        assert_eq!(unix_secs(UNIX_EPOCH), 0);
+        assert_eq!(unix_secs(UNIX_EPOCH + Duration::from_secs(10)), 10);
+        assert_eq!(unix_secs(UNIX_EPOCH - Duration::from_secs(10)), 0);
+    }
+
+    #[test]
+    fn entries_read_title_count_and_mtime() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let id = "slimcode-1-a";
+        let path = store.session_path(id).unwrap();
+        let log = raw_log(
+            id,
+            &[
+                &title_line("Fix the parser crash"),
+                &msg_line(&AgentMessage::text(Role::User, "hi")),
+                &msg_line(&AgentMessage::text(Role::Assistant, "hello")),
+            ],
+        );
+        write_aged(&path, log.as_bytes(), Duration::from_secs(60));
+
+        let entries = store.entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, id);
+        assert_eq!(entries[0].title.as_deref(), Some("Fix the parser crash"));
+        assert_eq!(entries[0].messages, 2);
+        // The mtime is the file's own, not the header's created_at.
+        let elapsed = unix_secs(SystemTime::now()) - unix_secs(entries[0].modified);
+        assert!((59..=61).contains(&elapsed), "mtime was {elapsed}s ago");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn entries_count_only_message_records() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let id = "slimcode-1-a";
+        let path = store.session_path(id).unwrap();
+        // A user message whose own text contains the literal `{"type":"message"`
+        // (escaped in the record), an unknown record type, and a bad line: the
+        // count must still be the two real message records.
+        let tricky = msg_line(&AgentMessage::text(
+            Role::User,
+            "the line {\"type\":\"message\"} is content",
+        ));
+        let log = raw_log(
+            id,
+            &[
+                &title_line("tricky"),
+                &tricky,
+                "{\"type\":\"future\",\"payload\":1}",
+                "not json at all",
+                &msg_line(&AgentMessage::text(Role::Assistant, "ok")),
+            ],
+        );
+        write_aged(&path, log.as_bytes(), Duration::from_secs(1));
+
+        let entries = store.entries().unwrap();
+        assert_eq!(entries[0].messages, 2, "only message records count");
+        assert_eq!(entries[0].title.as_deref(), Some("tricky"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_type_agrees_with_a_full_parse() {
+        let spaced =
+            msg_line(&AgentMessage::text(Role::User, "hi")).replacen("\"type\":", "\"type\" : ", 1);
+        let lines = [
+            msg_line(&AgentMessage::text(
+                Role::User,
+                "content {\"type\":\"message\"} here",
+            )),
+            spaced,
+            title_line("t"),
+            "{\"type\":\"future\",\"v\":1}".to_string(),
+            "not json at all".to_string(),
+            String::new(),
+        ];
+        for line in &lines {
+            let by_prefix = record_type(line) == Some("message");
+            let by_parse = matches!(parse_record(line), Ok(Record::Message(_)));
+            assert_eq!(by_prefix, by_parse, "line: {line}");
+        }
+    }
+
+    #[test]
+    fn entries_skip_a_log_whose_header_does_not_parse() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let good = "slimcode-good";
+        let log = raw_log(good, &[&msg_line(&AgentMessage::text(Role::User, "hi"))]);
+        write_aged(
+            &store.session_path(good).unwrap(),
+            log.as_bytes(),
+            Duration::from_secs(60),
+        );
+        for (id, contents) in [
+            ("slimcode-malformed", "{not json"),
+            ("slimcode-wrong-type", "{\"type\":\"nope\"}"),
+            ("slimcode-empty", ""),
+        ] {
+            write_aged(
+                &store.session_path(id).unwrap(),
+                contents.as_bytes(),
+                Duration::from_secs(1),
+            );
+        }
+
+        assert_eq!(ids(store.entries().unwrap()), vec![good]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn entries_order_by_mtime_then_id_descending() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let older = SystemTime::now() - Duration::from_secs(1000);
+        let middle = SystemTime::now() - Duration::from_secs(100);
+        let newer = SystemTime::now() - Duration::from_secs(10);
+        for (id, mtime) in [
+            ("slimcode-old", older),
+            ("slimcode-a", middle),
+            ("slimcode-b", middle),
+            ("slimcode-new", newer),
+        ] {
+            let path = store.session_path(id).unwrap();
+            let log = raw_log(id, &[&msg_line(&AgentMessage::text(Role::Assistant, "hi"))]);
+            write_raw(&path, &[&log]);
+            set_mtime(&path, mtime);
+        }
+
+        let entries = store.entries().unwrap();
+        // Newest first; equal mtimes break on the id, descending.
+        assert_eq!(
+            ids(entries.clone()),
+            vec!["slimcode-new", "slimcode-b", "slimcode-a", "slimcode-old"]
+        );
+        // No title record in any of them, so the id is the row's fallback.
+        assert!(entries.iter().all(|e| e.title.is_none()));
         let _ = fs::remove_dir_all(&dir);
     }
 

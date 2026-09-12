@@ -148,18 +148,36 @@ pub fn stats_line(stats: &[String], model: &str, width: usize) -> String {
 /// wide (CJK) chars never split in half. Exposed so the `App` can truncate
 /// footer line 1 (the dim pwd line) the same way the stats line is truncated.
 pub fn truncate_width_str(text: &str, width: usize) -> String {
+    truncate_width(text, width, false)
+}
+
+/// [`truncate_width_str`] with the cut marked by a trailing `…` (which takes
+/// one of the `width` columns); used by the session picker's row titles. A
+/// zero width yields an empty string — there is no room even for the marker.
+pub fn truncate_width_ellipsis(text: &str, width: usize) -> String {
+    truncate_width(text, width, true)
+}
+
+fn truncate_width(text: &str, width: usize, ellipsis: bool) -> String {
+    if width == 0 {
+        return String::new();
+    }
     if display_width(text) <= width {
         return text.to_string();
     }
+    let budget = if ellipsis { width - 1 } else { width };
     let mut out = String::new();
     let mut w = 0;
     for ch in text.chars() {
         let cw = display_width(&ch.to_string());
-        if w + cw > width {
+        if w + cw > budget {
             break;
         }
         out.push(ch);
         w += cw;
+    }
+    if ellipsis {
+        out.push('…');
     }
     out
 }
@@ -276,6 +294,22 @@ mod tests {
         // Narrower than stats: stats alone (truncated to width).
         let line = stats_line(&stats, "m", 6);
         assert_eq!(line, "↑1.5k ");
+    }
+
+    #[test]
+    fn truncate_width_marks_the_ellipsis_inside_the_budget() {
+        // Fits: untouched, no marker.
+        assert_eq!(truncate_width_ellipsis("short", 10), "short");
+        assert_eq!(truncate_width_ellipsis("abcde", 5), "abcde");
+        // Cut: the marker takes one of the columns.
+        assert_eq!(truncate_width_ellipsis("abcdef", 5), "abcd…");
+        assert_eq!(display_width(&truncate_width_ellipsis("abcdef", 5)), 5);
+        // Wide chars never split, and the marker still fits the budget.
+        assert_eq!(truncate_width_ellipsis("你好世界", 5), "你好…");
+        // No room at all: empty, not a lone marker.
+        assert_eq!(truncate_width_ellipsis("abc", 0), "");
+        // The plain variant is the same cut without the marker.
+        assert_eq!(truncate_width_str("abcdef", 5), "abcde");
     }
 
     #[test]
