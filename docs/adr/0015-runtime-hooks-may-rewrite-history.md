@@ -71,5 +71,7 @@ renderer error.
   (each hook fires once, at the right point; all-`None` is byte-identical to the old loop).
 - `AgentEvent` is unchanged: the events keep reporting what actually happened, now including a
   skipped call's synthesized result.
-- Future compaction (still in `TODO.md`) has its mounting point: `turn_end` already hands the hook
-  the whole history.
+- **Amended by ADR-0020**: compaction was implemented, and it deliberately does *not* mount on
+  `turn_end`. A hook that issued its own provider request would make a summary failure abort the
+  run; the frontend runs compaction as a separate provider call after a completed turn instead.
+  `turn_end` still hands the hook the whole history if a future feature needs to observe it.

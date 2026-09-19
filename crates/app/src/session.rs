@@ -142,7 +142,9 @@ pub fn format_minute(secs: i64) -> String {
 pub fn infer_title(messages: &[AgentMessage]) -> Option<String> {
     let text = messages
         .iter()
-        .find(|m| m.role() == &Role::User)
+        // A compaction checkpoint reports `Role::User` for injection, but it
+        // is not a prompt: never let a summary become the session title.
+        .find(|m| !m.is_compact_summary() && m.role() == &Role::User)
         .map(AgentMessage::text_content)?;
     let text = text.trim();
     if text.is_empty() {
@@ -557,6 +559,15 @@ impl SessionStore {
             }
         }
         close_batch(&mut batch, &mut messages, &mut repaired_tool_calls);
+
+        // A compaction checkpoint is a boundary (ADR-0020 D2): the records
+        // before the newest one were replaced by its summary. The append-only
+        // log keeps them, but the restored Session must not — it holds the
+        // effective history the next `ContextBuilder::build()` assembles, so
+        // a reloaded session never sends a compacted-away span to the model.
+        if let Some(index) = messages.iter().rposition(AgentMessage::is_compact_summary) {
+            messages.drain(..index);
+        }
 
         Ok(LoadOutcome {
             session: Session {
@@ -1053,6 +1064,18 @@ mod tests {
     }
 
     #[test]
+    fn title_skips_a_compaction_checkpoint() {
+        let msgs = vec![
+            AgentMessage::compact_summary("## Goal\nnot a title", 1, None),
+            AgentMessage::text(Role::User, "the real prompt"),
+        ];
+        assert_eq!(infer_title(&msgs).unwrap(), "the real prompt");
+        // A history that is only a checkpoint has no title.
+        let only = vec![AgentMessage::compact_summary("summary", 1, None)];
+        assert!(infer_title(&only).is_none());
+    }
+
+    #[test]
     fn new_id_is_unique_and_prefixed() {
         let s = SessionStore::new(std::env::temp_dir(), "proj-test", std::env::temp_dir());
         let a = s.new_id();
@@ -1257,6 +1280,67 @@ mod tests {
         assert_eq!(outcome.session.created_at, "2026-08-29T00:00:00Z");
         assert_eq!(outcome.skipped_records, 0);
         assert_eq!(outcome.repaired_tool_calls, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_restores_a_compaction_checkpoint() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let path = store.session_path("slimcode-1").unwrap();
+        let checkpoint = AgentMessage::compact_summary(
+            "## Goal\nfinish compaction",
+            117_760,
+            Some("## Goal\nolder".to_string()),
+        );
+        write_raw(
+            &path,
+            &[
+                &raw_header("slimcode-1", "2026-08-29T00:00:00Z"),
+                &msg_line(&AgentMessage::text(Role::User, "hi")),
+                &msg_line(&AgentMessage::text(Role::Assistant, "hello")),
+                &msg_line(&checkpoint),
+                &msg_line(&AgentMessage::text(Role::Assistant, "after")),
+            ],
+        );
+        let outcome = store.load("slimcode-1").unwrap();
+        assert_eq!(outcome.skipped_records, 0);
+        assert_eq!(outcome.repaired_tool_calls, 0);
+        // The checkpoint is restored verbatim, and the records before it —
+        // the span it replaced — are dropped from the session (ADR-0020 D2).
+        assert_eq!(
+            outcome.session.messages.len(),
+            2,
+            "{:?}",
+            outcome.session.messages
+        );
+        assert_eq!(outcome.session.messages[0], checkpoint);
+        assert_eq!(outcome.session.messages[1].text_content(), "after");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_keeps_records_after_the_newest_checkpoint_only() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let path = store.session_path("slimcode-1").unwrap();
+        let first = AgentMessage::compact_summary("first summary", 1, None);
+        let last = AgentMessage::compact_summary("last summary", 2, Some("first summary".into()));
+        write_raw(
+            &path,
+            &[
+                &raw_header("slimcode-1", "2026-08-29T00:00:00Z"),
+                &msg_line(&AgentMessage::text(Role::User, "replaced")),
+                &msg_line(&first),
+                &msg_line(&AgentMessage::text(Role::Assistant, "kept before second")),
+                &msg_line(&last),
+                &msg_line(&AgentMessage::text(Role::Assistant, "kept after second")),
+            ],
+        );
+        let messages = store.load("slimcode-1").unwrap().session.messages;
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert_eq!(messages[0], last);
+        assert_eq!(messages[1].text_content(), "kept after second");
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -2,11 +2,10 @@
 //! `Session` wrapper and the `to_llm`/`convert` step to the wire model.
 //!
 //! Two layers (ADR-0012): `slimcode_ai::Message` is the LLM wire message;
-//! `AgentMessage` is what a Session's history holds — today the user /
-//! assistant / tool messages, plus kinds the model must never see (the first
-//! planned one is a compaction summary). `AgentMessage::to_llm` is the only
-//! conversion point; the LLM variant returns its message, session-only
-//! variants decide to transform or drop.
+//! `AgentMessage` is what a Session's history holds — the user / assistant /
+//! tool messages plus the compaction summary the model must never see as such.
+//! `AgentMessage::to_llm` is the only conversion point; the LLM variant returns
+//! its message, the compaction summary drops itself.
 //!
 //! The system prompt is not part of a message history (ADR-0012 D3): it is
 //! assembled fresh every turn and never stored. Log-only metadata
@@ -37,13 +36,27 @@ pub enum MessageStopReason {
 }
 
 /// One message in a Session's history (ADR-0012 D1). A serde-tagged enum so
-/// session-only kinds can join the same history later; today only the LLM
-/// kind exists.
+/// session-only kinds can join the same history: today the LLM kind plus the
+/// compaction-summary kind.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentMessage {
     /// A message the model sees (and `to_llm` passes through).
     Llm(Message),
+    /// A session-only compaction checkpoint: the structured summary that
+    /// replaced an earlier span of history. The model never sees this variant
+    /// itself — `ContextBuilder` injects `summary` as a `user` message at the
+    /// variant's position — so `to_llm` drops it (ADR-0012 D2).
+    CompactSummary {
+        /// The structured summary text (`## Goal`, `## Progress`, ...).
+        summary: String,
+        /// Estimated tokens the history held before this compaction.
+        tokens_before: usize,
+        /// The summary this one supersedes, when it was produced by an
+        /// incremental update rather than from scratch.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous_summary: Option<String>,
+    },
 }
 
 impl AgentMessage {
@@ -62,33 +75,58 @@ impl AgentMessage {
         Self::Llm(Message::tool_result(id, content))
     }
 
+    /// A compaction checkpoint convenience constructor.
+    pub fn compact_summary(
+        summary: impl Into<String>,
+        tokens_before: usize,
+        previous_summary: Option<String>,
+    ) -> Self {
+        Self::CompactSummary {
+            summary: summary.into(),
+            tokens_before,
+            previous_summary,
+        }
+    }
+
+    /// Whether this is a session-only compaction checkpoint.
+    pub fn is_compact_summary(&self) -> bool {
+        matches!(self, Self::CompactSummary { .. })
+    }
+
     /// The only conversion to the wire model (ADR-0012 D2): the LLM variant
-    /// returns its message; a session-only variant would decide its own fate
-    /// (`None` drops it).
+    /// returns its message; the compaction checkpoint returns `None` so it
+    /// never reaches the provider directly.
     pub fn to_llm(&self) -> Option<Message> {
         match self {
             Self::Llm(message) => Some(message.clone()),
+            Self::CompactSummary { .. } => None,
         }
     }
 
-    /// The message role.
+    /// The message role. A compaction checkpoint reports [`Role::User`]: that
+    /// is the role its summary takes when injected into a request, and it is
+    /// how a loaded log replays the entry as ordinary history.
     pub fn role(&self) -> &Role {
         match self {
             Self::Llm(message) => &message.role,
+            Self::CompactSummary { .. } => &Role::User,
         }
     }
 
-    /// Concatenated text of the message's text parts.
+    /// Concatenated text: the wire message's text parts, or the summary.
     pub fn text_content(&self) -> String {
         match self {
             Self::Llm(message) => message.text_content(),
+            Self::CompactSummary { summary, .. } => summary.clone(),
         }
     }
 
-    /// The tool calls the message carries (assistant messages only).
+    /// The tool calls the message carries (assistant messages only; a
+    /// compaction checkpoint carries none).
     pub fn tool_calls(&self) -> &[ToolCall] {
         match self {
             Self::Llm(message) => &message.tool_calls,
+            Self::CompactSummary { .. } => &[],
         }
     }
 
@@ -96,16 +134,18 @@ impl AgentMessage {
     pub fn tool_call_id(&self) -> Option<&str> {
         match self {
             Self::Llm(message) => message.tool_call_id.as_deref(),
+            Self::CompactSummary { .. } => None,
         }
     }
 
     /// The single mutation entry point (ADR-0015 D3): run hooks rewrite the
-    /// wire message a run is about to store. Only the LLM variant exists
-    /// today, so this cannot fail; a future session-only variant would decide
-    /// how a rewrite applies (or refuse it).
-    pub fn llm_mut(&mut self) -> &mut Message {
+    /// wire message a run is about to store. Only the LLM variant has a wire
+    /// message to rewrite; a session-only variant (a compaction checkpoint)
+    /// has none and returns `None`, so a hook cannot corrupt it.
+    pub fn llm_mut(&mut self) -> Option<&mut Message> {
         match self {
-            Self::Llm(message) => message,
+            Self::Llm(message) => Some(message),
+            Self::CompactSummary { .. } => None,
         }
     }
 }
@@ -159,6 +199,64 @@ mod tests {
     }
 
     #[test]
+    fn compact_summary_serializes_with_its_own_kind_tag() {
+        let m = AgentMessage::compact_summary("## Goal\nfinish", 42, None);
+        let v: serde_json::Value = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["kind"], "compact_summary");
+        assert_eq!(v["summary"], "## Goal\nfinish");
+        assert_eq!(v["tokens_before"], 42);
+        // The absent previous summary is omitted (not serialized as null).
+        assert!(v.get("previous_summary").is_none(), "{v}");
+    }
+
+    #[test]
+    fn compact_summary_round_trips_losslessly() {
+        for previous in [None, Some("## Goal\nolder".to_string())] {
+            let m = AgentMessage::compact_summary("## Goal\nnewer", 1024, previous);
+            let json = serde_json::to_string(&m).unwrap();
+            let back: AgentMessage = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, m);
+        }
+    }
+
+    #[test]
+    fn to_llm_drops_the_compact_summary() {
+        // The model never sees the checkpoint as such: the context builder
+        // injects its summary as a user message instead (ADR-0012 D2).
+        let m = AgentMessage::compact_summary("summary", 10, None);
+        assert!(m.to_llm().is_none());
+    }
+
+    #[test]
+    fn compact_summary_reports_user_role_and_its_summary_text() {
+        let m = AgentMessage::compact_summary("the summary", 10, None);
+        assert!(m.is_compact_summary());
+        // It replays as a user-role history entry (the role its injection
+        // takes), carrying the summary as its text.
+        assert_eq!(m.role(), &Role::User);
+        assert_eq!(m.text_content(), "the summary");
+        assert!(m.tool_calls().is_empty());
+        assert_eq!(m.tool_call_id(), None);
+    }
+
+    #[test]
+    fn llm_variant_is_not_a_compact_summary() {
+        assert!(!AgentMessage::text(Role::User, "hi").is_compact_summary());
+    }
+
+    #[test]
+    fn llm_mut_refuses_the_compact_summary() {
+        let mut m = AgentMessage::compact_summary("summary", 10, None);
+        assert!(m.llm_mut().is_none());
+        // A wire message is still rewritable, the hook seam's purpose.
+        let mut llm = AgentMessage::text(Role::Assistant, "hi");
+        llm.llm_mut().unwrap().parts = vec![Part::Text {
+            text: "rewritten".to_string(),
+        }];
+        assert_eq!(llm.text_content(), "rewritten");
+    }
+
+    #[test]
     fn convert_prefixes_the_system_message_in_history_order() {
         let system = Message::text(Role::System, "be helpful");
         let history = vec![
@@ -198,6 +296,7 @@ mod tests {
                 }),
                 AgentMessage::tool_result("call_1", "{\"temp\": \"25C\"}"),
                 AgentMessage::text(Role::Assistant, "Beijing is 25C."),
+                AgentMessage::compact_summary("## Goal\nweather", 128_000, None),
             ],
         };
         let json = serde_json::to_string(&session).unwrap();

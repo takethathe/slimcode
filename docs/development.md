@@ -33,7 +33,7 @@ cargo workspace，六个 crate，唯一二进制 `slimcode`：
 | --- | --- | --- | --- |
 | `crates/ai` | `slimcode-ai` | LLM 层：`Message`（wire 消息）/ `Provider` / `ToolSpec` / `Delta` / `FinishReason` / `CancelToken` / `TokenUsage` / wire 模型 | 无 slimcode 依赖 |
 | `crates/core` | `slimcode-core` | agent 运行时：`AgentEvent` / `AgentRunner`（借用式 per-run 值：tools/cfg/`&ProviderConfig`/cancel/事件订阅，`run(provider, system, messages)`，ADR-0015 加可选 hook 字段）/ `AgentMessage`(+`to_llm`) / `convert` / `Tool{spec,run}` / `RunConfig` / `StopReason` | → ai |
-| `crates/app` | `slimcode-app` | 前端无关应用层：`DisplayItem` / `map_event` / `Renderer` / `usage_summary` / `ContextBuilder`→`Context{system,messages}` / 会话与输入历史持久化 / skills / context_files / 七工具 / setup / `run_turn` | → ai, core, commands |
+| `crates/app` | `slimcode-app` | 前端无关应用层：`DisplayItem` / `map_event` / `Renderer` / `usage_summary` / `ContextBuilder`→`Context{system,messages}` / compaction（token 估算 + 阈值 + 摘要执行）/ 会话与输入历史持久化 / skills / context_files / 七工具 / setup / `run_turn` | → ai, core, commands |
 | `crates/commands` | `slimcode-commands` | `/` 命令注册表 + fuzzy 预测（纯数据 + 纯函数，无 I/O） | 无 |
 | `crates/tui` | `slimcode-tui` | 终端图形库：`RenderItem` / `Effect` / `App`(new/apply/draw/handle_key) / `run(terminal, app, handler)` / `UiHandler` / 组件（theme/markdown/toolcall/footer/text/git） | **无 slimcode 依赖** |
 | `crates/cli` | `slimcode` | 唯一二进制 = 总入口：argv / 模式选择（one-shot 文本 vs 交互 TUI）/ 配置解析 / 服务构建 / 命令语义 / 会话落盘 / `TextRenderer` / `TuiAdapter` / 补全与文案 | → 全部 |
@@ -80,8 +80,9 @@ cargo workspace，六个 crate，唯一二进制 `slimcode`：
   - `prompt_tokens_details`：可选嵌套，缺省视为 0（未命中/未开缓存时端点可能不带该块）；其它
     `*_tokens_details` 等未知字段：直接忽略；
 - **tool_call 拼接**：首片段带 `id`/`name`（`arguments: ""`）→ `ToolCallStart`，续传只有 `index`+`arguments` → `ToolCallArgs`，按 index 拼接；
-- **配置**：`ProviderConfig` 为纯 provider 数据（api key / base URL / model / cache，保留
-  `chat_completions_url()`）。端点默认值（`DEFAULT_BASE_URL` / `DEFAULT_MODEL`）由本 crate 拥有，
+- **配置**：`ProviderConfig` 为纯 provider 数据（api key / base URL / model / cache / 可选
+  `max_tokens`，保留 `chat_completions_url()`）。`max_tokens` 默认 `None`（wire 上省略该字段，
+  普通请求字节不变）；仅压缩摘要请求用 `with_max_tokens(2048)` 设一个保守上限。端点默认值（`DEFAULT_BASE_URL` / `DEFAULT_MODEL`）由本 crate 拥有，
   与 provider 放在一起；四层优先级解析与 env 变量名的唯一 owner 是 `slimcode-app::config`
   （frontend overrides > env > `config.toml` > 默认值），它 re-export 这两个默认值再产出
   `ProviderConfig`；ai 不提供 `from_env`、不读 env/文件，因此本 crate 无任何 slimcode 依赖
@@ -106,9 +107,11 @@ cargo workspace，六个 crate，唯一二进制 `slimcode`：
 两层消息模型（ADR-0012 D1/D2）：`slimcode-ai` 拥有 wire `Message`（role + parts + tool_calls +
 tool_call_id，已不含日志专用字段），`core` 拥有会话单元 `AgentMessage` 与唯一转换：
 
-- `AgentMessage` 是 serde-tagged enum（`{"kind":"llm",…}`，今天只有 LLM 变体；compact 摘要等
-  会话专有种类后续加入同一 enum）；`AgentMessage::to_llm(&self) -> Option<ai::Message>` 是唯一转换，
-  LLM 变体返回其消息，会话专有变体自己决定“转化或丢弃”；
+- `AgentMessage` 是 serde-tagged enum（`llm` 与 `compact_summary` 两个变体）：
+  `AgentMessage::to_llm(&self) -> Option<ai::Message>` 是唯一转换，LLM 变体返回其消息，
+  `CompactSummary` 返回 `None`（从不直接进 provider wire）；`role()`/`text_content()`/
+  `tool_calls()`/`tool_call_id()` 对两变体都成立，`llm_mut()` 对会话专有变体返回 `None`
+  （ADR-0015 的 hook 无法改写它）；
 - `convert(system: &ai::Message, history: &[AgentMessage]) -> Vec<ai::Message>` = system 前缀 +
   `filter_map(to_llm)`，在**每次** provider 请求前调用（ADR-0012 D2），因此 run 中途的 compact
   下一轮自然生效；
@@ -278,7 +281,22 @@ provider config seam 见 ADR-0016，hook seam 见 ADR-0015）。折入自 ticket
   （ADR-0013 D3）；
   `build()` 返回 `Context { system: ai::Message, messages: Vec<AgentMessage> }`（ADR-0012 D3）：
   system 由现组状态（基础提示、环境、context files、skills）合成，与 messages 分开返回，
-  缺 user 时报错；一个回合只向 history 新增一条 prompt 消息；
+  缺 user 时报错；一个回合只向 history 新增一条 prompt 消息；历史中的 `CompactSummary` 是压缩边界，
+  `build()` 把它就地包成 `user` 消息（含 `<summary>` 标签），前后消息按原顺序保留；而被它
+  替代的旧记录由 **load** 边界丢弃（见下节 `compaction`）；
+- `compaction`（spec `.scratch/compact`）：自动压缩的纯逻辑与 LLM 执行。
+  - 估算与阈值：`estimate_message_tokens` 用 `字符数 / 4` 向上取整（连同工具调用的 name+arguments），
+    `estimate_total_tokens` 求和，`estimated_context_window()` = 128_000；`should_compact` 在总量超过
+    窗口 92% 且最新一条不是 `CompactSummary` 时为真；
+  - `compact_messages(provider, &ProviderConfig, &CancelToken, &[AgentMessage])`：从末尾向前累计
+    token 到 `keep_recent_tokens()`（窗口 8%，且不落在 `tool` 结果上，避免拆散 tool call/result），
+    把边界之前的 span（去掉旧 `CompactSummary`）序列化成 `[User]: …` / `[Assistant]: …` /
+    `[Assistant tool calls]: read(path="a.rs")` / `[Tool result]: …`（result 截断到 2000 字符），
+    用 pi 的 `SUMMARIZATION_SYSTEM_PROMPT` + `SUMMARIZATION_PROMPT`/`UPDATE_SUMMARIZATION_PROMPT`
+    请求一次摘要（`with_cache(false)` + `max_tokens=2048`，有旧摘要时合并而非重写），
+    返回 `[CompactSummary, ...kept]`；失败/取消/空摘要返回 `Err`，调用方保留原历史；
+  - 持久化：`CompactSummary` 作为普通 message 记录追加到 .jsonl；load 把**最新** checkpoint 之前
+    的消息记录丢弃，所以恢复的 Session 与模型看到的一致（ADR-0020 D2）；
 - `context_files`：`AGENTS.md` 上下文文件的发现与渲染（对齐 pi 的项目上下文加载）：
   先读全局 `<home>/AGENTS.md`（scope `global`）；project 只判定两个位置——cwd 自身
   与 **git 仓库根**（最近的含 `.git` 条目的祖先目录，`.git` 可以是目录或
@@ -522,14 +540,17 @@ stdout 是否 TTY）：
   同一恢复函数，所以异常退出也不会把鼠标留在 app 手里（ADR-0017 D2/D8）；`TuiSession` 实现 `UiHandler`，拥有 provider
   与工具（`Mutex` 里，turn 期间 take 出来跑、结束后归还）、session store、input history、
   skills、context files、environment，并实现**全部命令语义**（`/help` / `/new` / `/session` /
-  `/usage` / `/history` / `/skills` / `/install-skill` / `/exit` / `/!!` /
+  `/usage` / `/compact` / `/history` / `/skills` / `/install-skill` / `/exit` / `/!!` /
   `/!N` / skill 触发 / 未知命令 + did-you-mean）、每轮的上下文组装与会话落盘、失败/取消
-  收尾。`/session` 在 UI 线程同步扫 `store.entries()`，把每个摘要拼成
+  收尾。每轮 `Completed` 后按 `compaction::should_compact` 自动压缩（超 92% 才触发），
+  `/compact` 强制压缩；两者都走 `run_compaction`（调 `compaction::compact_messages`、把
+  `CompactSummary` 追加到日志、替换 `session.messages`），失败只报错不改历史。`/session` 在 UI 线程同步扫 `store.entries()`，把每个摘要拼成
   `SessionRow { id, title: title ?? id, meta: "N msgs  YYYY-MM-DD HH:MM" }` 后发
   `RenderItem::SessionPicker { rows }`；`Effect::LoadSession { id }` 走与旧 `/load` 同一路径，
   但先发 `SessionChanged` 再发 title/skipped/repaired/`loaded session` notice（否则清屏会
   吃掉提示），**随后把该会话的历史消息重放为 transcript 条目**（`history_to_render_items`：
-  user prompt 框 / assistant 文本 / 成对的工具 start-result 块），屏幕恢复这段对话而非停在
+  user prompt 框 / assistant 文本 / 成对的工具 start-result 块 / `CompactSummary` 压缩边界
+  notice），屏幕恢复这段对话而非停在
   header，且选中当前 session 时直接 no-op（ADR-0018 D3）。`CliCompletions` 是注入 TUI 的 `/` 候选 provider（命令表 + skills 快照，
   `/install-skill` 后就地刷新）。
 - `render`：两个 `Renderer` 实现。`TextRenderer` 把共享 `DisplayItem` 流（流式文本 / 流式思考 / 结构行 / 用量汇总）渲染为终端输出，原始 tool_call delta 与

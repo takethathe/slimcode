@@ -87,15 +87,24 @@ pub fn history_to_render_items(messages: &[AgentMessage]) -> Vec<RenderItem> {
     for message in messages {
         if *message.role() == Role::Tool {
             let text = message.text_content();
-            if let Some((name, content)) = parse_skill_block(&text) {
-                if let Some(id) = message.tool_call_id() {
-                    skill_results.insert(id.to_string(), (name.to_string(), content.to_string()));
-                }
+            if let Some((name, content)) = parse_skill_block(&text)
+                && let Some(id) = message.tool_call_id()
+            {
+                skill_results.insert(id.to_string(), (name.to_string(), content.to_string()));
             }
         }
     }
     let mut out = Vec::with_capacity(messages.len());
     for message in messages {
+        // A compaction checkpoint replays as a boundary notice, not a prompt
+        // box: its summary is what the model reads next, not a user message
+        // the user ever typed.
+        if let AgentMessage::CompactSummary { tokens_before, .. } = message {
+            out.push(RenderItem::Notice(format!(
+                "context compacted ({tokens_before} tokens before)"
+            )));
+            continue;
+        }
         match message.role() {
             Role::User => {
                 let text = message.text_content();
@@ -193,6 +202,9 @@ pub struct TuiAdapter<'a> {
 }
 
 impl<'a> TuiAdapter<'a> {
+    /// Only the tests build a plain adapter; production always uses
+    /// [`TuiAdapter::with_skills`], which carries the CLI's skill context.
+    #[cfg(test)]
     pub fn new(emit: &'a mut dyn FnMut(RenderItem)) -> Self {
         Self {
             emit,
@@ -290,7 +302,9 @@ pub struct TextRenderer<'a> {
 }
 
 impl<'a> TextRenderer<'a> {
-    /// Wrap a `Write` target.
+    /// Wrap a `Write` target. Only the tests build a skill-less renderer;
+    /// production uses [`TextRenderer::with_skills`].
+    #[cfg(test)]
     pub fn new(out: &'a mut dyn Write) -> Self {
         Self {
             out,
@@ -867,6 +881,23 @@ Body.
                 name: "grill".to_string(),
                 content: "References are relative to /x.\n\n# Grill a plan\n\nBody.".to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn history_replay_renders_a_compaction_checkpoint_as_a_notice() {
+        let history = vec![
+            AgentMessage::text(Role::User, "old"),
+            AgentMessage::compact_summary("## Goal\nx", 117_760, None),
+            AgentMessage::text(Role::Assistant, "new"),
+        ];
+        assert_eq!(
+            history_to_render_items(&history),
+            vec![
+                RenderItem::UserPrompt("old".to_string()),
+                RenderItem::Notice("context compacted (117760 tokens before)".to_string()),
+                RenderItem::Text("new".to_string()),
+            ]
         );
     }
 

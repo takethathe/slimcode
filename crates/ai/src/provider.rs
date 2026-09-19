@@ -159,6 +159,9 @@ impl Provider for BailianProvider {
             // independent multi-tool request in one response. The flag rides
             // only when tools are declared (never on a plain-answer request).
             parallel_tool_calls: !tools.is_empty(),
+            // A response cap is a per-call setting (ADR-0016): `None` omits the
+            // field, so ordinary turns keep their byte shape.
+            max_tokens: config.max_tokens,
             stream: true,
             stream_options: wire::WireStreamOptions {
                 include_usage: true,

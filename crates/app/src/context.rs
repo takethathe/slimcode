@@ -93,6 +93,33 @@ pub fn skill_loaded_in(history: &[AgentMessage], skill: &Skill) -> bool {
     history.iter().any(|m| m.text_content().contains(&marker))
 }
 
+/// Render a compaction checkpoint as the `user` message the model reads: the
+/// structured summary wrapped in `<summary>` tags behind a fixed preamble
+/// (pi's compaction injection).
+fn format_compaction_summary(summary: &str) -> String {
+    format!(
+        "The conversation history before this point was compacted into the following summary:\n\n\
+         <summary>\n{summary}\n</summary>"
+    )
+}
+
+/// Turn a stored history into the message list the model should read by
+/// replacing each compaction checkpoint with the `user` message that carries
+/// its summary. Messages keep their stored order; the newest checkpoint only
+/// supersedes an earlier one at the load boundary (ADR-0020 D2), so this is a
+/// position-preserving substitution.
+fn inject_compaction(history: Vec<AgentMessage>) -> Vec<AgentMessage> {
+    history
+        .into_iter()
+        .map(|message| match message {
+            AgentMessage::CompactSummary { summary, .. } => {
+                AgentMessage::text(Role::User, format_compaction_summary(&summary))
+            }
+            llm => llm,
+        })
+        .collect()
+}
+
 /// One turn's assembled context (ADR-0012 D3): the system message is
 /// assembled fresh from live state and handed to the runtime separately; only
 /// the `messages` (history plus this turn's prompt) ever enter a Session.
@@ -202,7 +229,7 @@ impl ContextBuilder {
                 &self.context_files,
             ),
         );
-        let mut messages = self.history;
+        let mut messages = inject_compaction(self.history);
         messages.push(AgentMessage::text(Role::User, user));
         Ok(Context { system, messages })
     }
@@ -286,6 +313,82 @@ mod tests {
         assert_eq!(context.messages[0].role(), &Role::Assistant);
         assert_eq!(context.messages[0].text_content(), "earlier");
         assert_eq!(context.messages[1].text_content(), "again");
+    }
+
+    // --- compaction checkpoint injection ----------------------------------
+
+    #[test]
+    fn compact_summary_is_injected_as_a_user_message_at_its_position() {
+        let history = vec![
+            AgentMessage::text(Role::User, "before"),
+            AgentMessage::compact_summary("## Goal\nfinish", 42, None),
+            AgentMessage::text(Role::Assistant, "after"),
+        ];
+        let context = ContextBuilder::new()
+            .with_history(history)
+            .with_user_prompt("next")
+            .build()
+            .unwrap();
+        // The checkpoint becomes a user message in place; the messages around
+        // it pass through unchanged (the load boundary already dropped any
+        // span a checkpoint replaced).
+        assert_eq!(context.messages.len(), 4, "{:?}", context.messages);
+        assert_eq!(context.messages[0].text_content(), "before");
+        assert_eq!(context.messages[1].role(), &Role::User);
+        let injected = context.messages[1].text_content();
+        assert!(
+            injected.starts_with(
+                "The conversation history before this point was compacted into the following summary:"
+            ),
+            "got: {injected}"
+        );
+        assert!(
+            injected.contains("<summary>\n## Goal\nfinish\n</summary>"),
+            "got: {injected}"
+        );
+        assert_eq!(context.messages[2].role(), &Role::Assistant);
+        assert_eq!(context.messages[2].text_content(), "after");
+        assert_eq!(context.messages[3].text_content(), "next");
+        // No compaction variant leaks into the assembled list.
+        assert!(context.messages.iter().all(|m| !m.is_compact_summary()));
+    }
+
+    #[test]
+    fn earlier_and_later_compact_summaries_each_inject_in_history_order() {
+        let history = vec![
+            AgentMessage::text(Role::User, "first"),
+            AgentMessage::compact_summary("old summary", 1, None),
+            AgentMessage::text(Role::Assistant, "middle"),
+            AgentMessage::compact_summary("new summary", 2, Some("old summary".into())),
+            AgentMessage::text(Role::Assistant, "recent"),
+        ];
+        let context = ContextBuilder::new()
+            .with_history(history)
+            .with_user_prompt("next")
+            .build()
+            .unwrap();
+        assert_eq!(context.messages.len(), 6, "{:?}", context.messages);
+        assert_eq!(context.messages[0].text_content(), "first");
+        assert!(context.messages[1].text_content().contains("old summary"));
+        assert_eq!(context.messages[2].text_content(), "middle");
+        assert!(context.messages[3].text_content().contains("new summary"));
+        assert_eq!(context.messages[4].text_content(), "recent");
+        assert_eq!(context.messages[5].text_content(), "next");
+    }
+
+    #[test]
+    fn history_without_a_compact_summary_is_unchanged() {
+        let history = vec![
+            AgentMessage::text(Role::User, "one"),
+            AgentMessage::text(Role::Assistant, "two"),
+        ];
+        let context = ContextBuilder::new()
+            .with_history(history.clone())
+            .with_user_prompt("three")
+            .build()
+            .unwrap();
+        assert_eq!(context.messages[..2], history[..]);
+        assert_eq!(context.messages[2].text_content(), "three");
     }
 
     #[test]

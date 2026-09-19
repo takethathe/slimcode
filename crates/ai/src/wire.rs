@@ -196,6 +196,10 @@ pub struct WireRequest<'a> {
     /// plain-answer request keeps its pre-parallel byte shape.
     #[serde(skip_serializing_if = "is_false")]
     pub parallel_tool_calls: bool,
+    /// Cap on the response length. Omitted when unset, so ordinary turns keep
+    /// their byte shape; one-off requests (compaction summaries) set it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
     pub stream: bool,
     pub stream_options: WireStreamOptions,
 }
@@ -1090,6 +1094,7 @@ mod tests {
             messages,
             tools,
             parallel_tool_calls,
+            max_tokens: None,
             stream: true,
             stream_options: WireStreamOptions {
                 include_usage: true,
@@ -1356,6 +1361,23 @@ mod tests {
         let v = serde_json::to_value(&req).unwrap();
         assert!(v.get("parallel_tool_calls").is_none());
         assert!(v.get("tools").is_none());
+    }
+
+    #[test]
+    fn request_omits_max_tokens_when_unset_and_serializes_it_when_set() {
+        // The default (None) keeps ordinary requests byte-identical; a
+        // one-off request (a compaction summary) carries its cap.
+        let req = wire_request(Vec::new(), None);
+        assert!(
+            serde_json::to_value(&req)
+                .unwrap()
+                .get("max_tokens")
+                .is_none()
+        );
+
+        let mut req = wire_request(Vec::new(), None);
+        req.max_tokens = Some(2048);
+        assert_eq!(serde_json::to_value(&req).unwrap()["max_tokens"], 2048);
     }
 
     #[test]

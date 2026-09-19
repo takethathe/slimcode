@@ -213,6 +213,7 @@ skills store），模糊匹配与候选合并仍是前端无关的 `slimcode-com
 | `/new` | 新建会话（清空消息、清空用量、清空屏幕） |
 | `/session` | 打开 **session picker**：列出**当前项目**已保存的会话，`Enter` 载入所选（见下节） |
 | `/usage` | 显示累计 token 用量 |
+| `/compact` | 手动压缩上下文：把较旧的消息概括成一段结构化摘要（见「自动压缩」） |
 | `/history` | 列出输入历史（最近 20 条、最新在前、带编号） |
 | `/skills` | 列出已安装的 skill（含 user/project scope 与 manual-only 标记） |
 | `/install-skill <path> --user\|--project` | 从路径安装一个 skill（目录含 `SKILL.md`，或单个 markdown 文件） |
@@ -263,6 +264,28 @@ footer 的统计归零，用 picker 恢复一个会话之后同样从 0 起算�
 「这个会话这次被用掉多少」。
 
 **非 TTY**：不带 prompt 且 stdout 不是终端时，slimcode 打印明确错误并以非零退出码结束，不会尝试打开 TUI。
+
+#### 自动压缩（compaction）
+
+长对话会持续消耗上下文窗口。每完成一轮（`Completed`）后，slimcode 估算消息历史的
+token 数（`字符数 / 4` 的保守启发式，连同工具调用的参数一起算）；一旦超过估算窗口
+（128k）的 **92%**，就在后台自动压缩：
+
+- 调用同一个 provider 生成一段**结构化摘要**（`## Goal` / `## Constraints & Preferences` /
+  `## Progress` / `## Key Decisions` / `## Next Steps` / `## Critical Context`），把较旧的消息
+  替换为一条会话内部的 **CompactSummary**，并保留最近约 8% 的历史原样（该尾部只在本进程内
+  有效：重载后边界之前的记录会被丢弃，模型看到的是摘要 + 压缩之后的新消息）；
+- 摘要**从不出现在发给模型的 wire 消息里**：下一轮组装上下文时，它被注入为一条 `user`
+  消息（`<summary>…</summary>`），代表它之前被压缩掉的那段历史；
+- 摘要写入会话日志（`compact_summary` 记录），重新载入会话时恢复；被它替代的旧记录仍留在
+  追加式日志里，载入时以**最新一条 `compact_summary` 为边界**丢弃（日志字节不改写）；
+- 连续压缩会**合并**上一条摘要（请求 LLM 更新而不是重写），因此上下文持续累积而不是丢失。
+
+不想等阈值也可以手动触发 **`/compact`**：它跳过 92% 判断，立即压缩并可读出
+`context compacted: <before> → <after> tokens`。压缩失败（网络/模型错误）不会丢失当前
+对话：历史保持完整，错误以红字显示，下一轮继续。
+
+单次非交互模式（`-p`）没有持久会话，**从不压缩**。
 
 #### `/` 命令预测提示
 

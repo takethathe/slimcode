@@ -21,6 +21,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use slimcode_ai::ProviderConfig;
+use slimcode_app::compaction;
 use slimcode_app::context::{ContextBuilder, Environment, skill_loaded_in};
 use slimcode_app::context_files::ContextFile;
 use slimcode_app::history::{HISTORY_DISPLAY, HistoryStore, render_history, resolve_replay_index};
@@ -259,6 +260,7 @@ impl TuiSession<'_> {
                 "/new" => return self.new_session(emit),
                 "/session" => return self.open_session_picker(emit),
                 "/usage" => return self.show_usage(emit),
+                "/compact" => return self.compact_now(emit),
                 "/history" => return self.list_history(emit),
                 "/skills" => return self.list_skills(emit),
                 "/install-skill" => return self.install_skill(arg, emit),
@@ -590,6 +592,77 @@ impl TuiSession<'_> {
         }
     }
 
+    /// `/compact`: summarize the live session's older history on demand,
+    /// regardless of the threshold (spec `.scratch/compact`).
+    fn compact_now(&self, emit: &mut dyn FnMut(RenderItem)) -> ControlFlow {
+        let mut state = match self.take_turn() {
+            Ok(state) => state,
+            Err(e) => {
+                emit(RenderItem::Error(e));
+                return ControlFlow::Continue;
+            }
+        };
+        self.run_compaction(
+            &mut state.session,
+            &mut state.provider,
+            &state.cancel,
+            true,
+            emit,
+        );
+        self.put_turn(state);
+        ControlFlow::Continue
+    }
+
+    /// Compact `session`'s history when it crossed the threshold (or when the
+    /// user forced it with `/compact`), persist the checkpoint, and report the
+    /// token change. A failure leaves the history untouched (the turn's result
+    /// survives) and surfaces an error line.
+    fn run_compaction(
+        &self,
+        session: &mut Session,
+        provider: &mut Box<dyn Provider + Send>,
+        cancel: &CancelToken,
+        force: bool,
+        emit: &mut dyn FnMut(RenderItem),
+    ) {
+        if !force && !compaction::should_compact(&session.messages) {
+            return;
+        }
+        let before = compaction::estimate_total_tokens(&session.messages);
+        emit(RenderItem::Notice("compressing context…".to_string()));
+        // The summary request spends tokens too (ADR-0018 D4): snapshot the
+        // provider total so the compaction's own cost lands in `session.usage`.
+        let usage_before = provider.total_usage();
+        let compacted =
+            match compaction::compact_messages(provider, &self.config, cancel, &session.messages) {
+                Ok(compacted) => compacted,
+                Err(e) => {
+                    emit(RenderItem::Error(format!("compaction failed: {e}")));
+                    return;
+                }
+            };
+        session.messages = compacted;
+        // Persist the checkpoint as the boundary it is. The log is
+        // append-only: the records it replaces stay on disk, and the load path
+        // drops everything before the newest checkpoint, so a reload feeds the
+        // model the same compacted view (ADR-0020 D2).
+        if let Some(checkpoint) = session.messages.first()
+            && let Err(e) = self.store.append(session, checkpoint)
+        {
+            emit(RenderItem::Notice(format!("session log: {e}")));
+        }
+        session.usage = session
+            .usage
+            .saturating_add(&provider.total_usage().saturating_sub(&usage_before));
+        emit(RenderItem::Usage(crate::render::to_footer_usage(
+            &session.usage,
+        )));
+        let after = compaction::estimate_total_tokens(&session.messages);
+        emit(RenderItem::Notice(format!(
+            "context compacted: {before} → {after} tokens"
+        )));
+    }
+
     /// Run one whole turn: assemble the context, record the prompt, stream the
     /// agent loop into the transcript, append every message that enters
     /// history, and close the log on failure (ADR-0009 D2/D5).
@@ -620,7 +693,9 @@ impl TuiSession<'_> {
             emit(RenderItem::Notice(format!("session log: {e}")));
         }
         if title_was_none {
-            state.session.title = infer_title(&context.messages);
+            // Read the raw history, not the assembled context: a compaction
+            // checkpoint is not a prompt and must never become the title.
+            state.session.title = infer_title(&state.session.messages);
         }
         // A title that only became known now must reach an existing log: the
         // creation header is already written, so it needs its own record
@@ -728,7 +803,14 @@ impl TuiSession<'_> {
             &session.usage,
         )));
         match result {
-            Ok((_, StopReason::Completed)) => {}
+            Ok((_, StopReason::Completed)) => {
+                // Auto-compaction (spec `.scratch/compact`): only a completed
+                // turn triggers it, and only once the history crossed the
+                // threshold. The compaction call reuses the same provider, so
+                // a failed compaction leaves the turn's result in place and
+                // the next turn simply sees the full history again.
+                self.run_compaction(session, provider, cancel, false, emit);
+            }
             Ok((_, StopReason::Cancelled)) => {
                 // Esc: the partial turn is adopted; the log is closed on an
                 // assistant boundary so it never ends on a dangling tool batch
@@ -1831,5 +1913,180 @@ mod tests {
         );
         handler.put_turn(state);
         assert!(handler.submit(user_message("go"), &mut |_| {}).is_ok());
+    }
+
+    /// A string that alone pushes the estimated history past the 92% threshold.
+    fn over_threshold_text() -> String {
+        "y".repeat(slimcode_app::compaction::estimated_context_window() * 4)
+    }
+
+    #[test]
+    fn a_completed_turn_over_the_threshold_auto_compacts() {
+        let fx = Fixture::new("auto-compact");
+        let provider = FakeProvider::new(vec![
+            vec![
+                Delta::Text(over_threshold_text()),
+                Delta::Done(FinishReason::Stop),
+            ],
+            vec![
+                Delta::Text("## Goal\ncompacted".to_string()),
+                Delta::Done(FinishReason::Stop),
+            ],
+        ]);
+        let handler = fx.handler(Box::new(provider), Vec::new());
+        let id = handler.session_id();
+        let mut items = Vec::new();
+        handler
+            .submit(user_message("long task"), &mut |i| items.push(i))
+            .expect("turn succeeds");
+
+        {
+            let session = &handler.inner.lock().unwrap().session;
+            assert_eq!(session.messages.len(), 1, "{:?}", session.messages);
+            assert!(session.messages[0].is_compact_summary());
+            assert_eq!(session.messages[0].text_content(), "## Goal\ncompacted");
+        }
+        assert!(
+            items
+                .iter()
+                .any(|i| matches!(i, RenderItem::Notice(t) if t.contains("context compacted"))),
+            "{items:?}"
+        );
+
+        // The checkpoint is persisted, and a reload drops the replaced span:
+        // the resumed Session matches the model's view, not the raw log.
+        let loaded = fx.store.load(&id).expect("log loads").session;
+        assert_eq!(loaded.messages.len(), 1, "{:?}", loaded.messages);
+        assert!(loaded.messages[0].is_compact_summary());
+        // The assembled context injects the summary and never the old prompt.
+        let context = ContextBuilder::new()
+            .with_history(loaded.messages.clone())
+            .with_user_prompt("next")
+            .build()
+            .unwrap();
+        assert!(
+            context.messages[0]
+                .text_content()
+                .contains("<summary>\n## Goal\ncompacted\n</summary>")
+        );
+        assert!(
+            context
+                .messages
+                .iter()
+                .all(|m| m.text_content() != "long task"),
+            "the compacted-away prompt must not reach the request"
+        );
+    }
+
+    #[test]
+    fn a_small_completed_turn_does_not_compact() {
+        let fx = Fixture::new("no-auto-compact");
+        let provider = FakeProvider::new(vec![vec![
+            Delta::Text("short answer".to_string()),
+            Delta::Done(FinishReason::Stop),
+        ]]);
+        let handler = fx.handler(Box::new(provider), Vec::new());
+        let mut items = Vec::new();
+        handler
+            .submit(user_message("small task"), &mut |i| items.push(i))
+            .expect("turn succeeds");
+        let session = &handler.inner.lock().unwrap().session;
+        assert_eq!(session.messages.len(), 2);
+        assert!(session.messages.iter().all(|m| !m.is_compact_summary()));
+        assert!(
+            !items
+                .iter()
+                .any(|i| matches!(i, RenderItem::Notice(t) if t.contains("compacting"))),
+            "{items:?}"
+        );
+    }
+
+    /// Put an over-budget history into the live session without running a turn.
+    fn seed_long_history(handler: &TuiSession<'_>) {
+        let mut inner = handler.inner.lock().expect("session lock");
+        inner
+            .session
+            .messages
+            .push(AgentMessage::text(Role::User, "write a lot"));
+        inner
+            .session
+            .messages
+            .push(AgentMessage::text(Role::Assistant, over_threshold_text()));
+    }
+
+    #[test]
+    fn compact_command_summarizes_on_demand() {
+        let fx = Fixture::new("compact-cmd");
+        let provider = FakeProvider::new(vec![vec![
+            Delta::Text("## Goal\ndone".to_string()),
+            Delta::Done(FinishReason::Stop),
+        ]]);
+        let mut handler = fx.handler(Box::new(provider), Vec::new());
+        seed_long_history(&handler);
+
+        let items = command(&mut handler, "/compact");
+        // The usage footer refresh rides the same batch.
+        assert!(
+            items.iter().any(|i| matches!(i, RenderItem::Usage(_))),
+            "{items:?}"
+        );
+        let lines: Vec<&str> = items
+            .iter()
+            .filter_map(|i| match i {
+                RenderItem::Notice(t) | RenderItem::Error(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(lines[0].contains("compressing context"), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("context compacted:")),
+            "{lines:?}"
+        );
+        let session = &handler.inner.lock().unwrap().session;
+        assert_eq!(session.messages.len(), 1);
+        assert!(session.messages[0].is_compact_summary());
+    }
+
+    #[test]
+    fn compact_command_on_a_short_history_reports_nothing_to_do() {
+        let fx = Fixture::new("compact-short");
+        let provider = FakeProvider::new(Vec::new());
+        let mut handler = fx.handler(Box::new(provider), Vec::new());
+        {
+            let mut inner = handler.inner.lock().unwrap();
+            inner
+                .session
+                .messages
+                .push(AgentMessage::text(Role::User, "hi"));
+            inner
+                .session
+                .messages
+                .push(AgentMessage::text(Role::Assistant, "hello"));
+        }
+        let items = command(&mut handler, "/compact");
+        let lines = lines(&items);
+        assert!(
+            lines
+                .last()
+                .is_some_and(|l| l.contains("nothing to compact")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_compaction_keeps_the_history() {
+        let fx = Fixture::new("compact-fail");
+        let mut handler = fx.handler(Box::new(FakeProvider::failing_at_zero()), Vec::new());
+        seed_long_history(&handler);
+        let items = command(&mut handler, "/compact");
+        let lines = lines(&items);
+        assert!(
+            lines.iter().any(|l| l.starts_with("compaction failed:")),
+            "{lines:?}"
+        );
+        // The turn's history is untouched.
+        let session = &handler.inner.lock().unwrap().session;
+        assert_eq!(session.messages.len(), 2);
+        assert!(session.messages.iter().all(|m| !m.is_compact_summary()));
     }
 }

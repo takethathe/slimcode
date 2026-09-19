@@ -1717,7 +1717,7 @@ mod tests {
         ]];
         let mut hooks = RunHooks::default();
         hooks.before_tool = Some(Box::new(|asst: &mut AgentMessage, _index: usize| {
-            asst.llm_mut().tool_calls[0].arguments = "{\"city\": \"Beijing\"}".to_string();
+            asst.llm_mut().unwrap().tool_calls[0].arguments = "{\"city\": \"Beijing\"}".to_string();
             Ok(ToolDecision::Run)
         }));
         let tools = [echo];
@@ -1900,7 +1900,7 @@ mod tests {
         // a vanished index is an error, not a panic.
         let mut hooks = RunHooks::default();
         hooks.before_tool = Some(Box::new(|asst: &mut AgentMessage, _index: usize| {
-            asst.llm_mut().tool_calls.clear();
+            asst.llm_mut().unwrap().tool_calls.clear();
             Ok(ToolDecision::Run)
         }));
         let script = vec![vec![
@@ -1931,7 +1931,7 @@ mod tests {
         // would leave a call unpaired with a result on the next request.
         let mut hooks = RunHooks::default();
         hooks.before_tool = Some(Box::new(|asst: &mut AgentMessage, _index: usize| {
-            asst.llm_mut().tool_calls.push(ToolCall {
+            asst.llm_mut().unwrap().tool_calls.push(ToolCall {
                 id: "extra".to_string(),
                 name: "get_weather".to_string(),
                 arguments: "{}".to_string(),
@@ -1967,7 +1967,7 @@ mod tests {
         // history carry the same rewritten arguments (ADR-0015 D3).
         let mut hooks = RunHooks::default();
         hooks.before_tool = Some(Box::new(|asst: &mut AgentMessage, _index: usize| {
-            asst.llm_mut().tool_calls[0].arguments = "{\"city\": \"Beijing\"}".to_string();
+            asst.llm_mut().unwrap().tool_calls[0].arguments = "{\"city\": \"Beijing\"}".to_string();
             Ok(ToolDecision::Run)
         }));
         let script = vec![vec![

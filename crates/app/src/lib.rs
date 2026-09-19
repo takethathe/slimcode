@@ -13,6 +13,9 @@
 //! - [`context`]: `ContextBuilder` assembling one turn's message list from a
 //!   system prompt, context files, skills, history, and a user prompt / skill
 //!   trigger.
+//! - [`compaction`]: token estimation, the auto-compaction threshold, and the
+//!   LLM-backed summarization that replaces an old history span with a
+//!   `CompactSummary`.
 //! - [`context_files`]: `AGENTS.md` discovery (global home file + project
 //!   cwd/git-root files) and its `## Project context` system-prompt rendering.
 //! - [`tools`]: the seven-tool set bound to a working directory.
@@ -22,6 +25,7 @@
 //!   `Renderer` live (ADR-0004).
 //! - [`setup`]: shared frontend runtime construction (provider + tools).
 
+pub mod compaction;
 pub mod config;
 pub mod context;
 pub mod context_files;

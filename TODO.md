@@ -4,7 +4,6 @@
 
 ## 待办
 
-- [ ] compact（autocompact）功能支持
 - [ ] tui中status line信息显示支持
 - [ ] config文件支持
 - [ ] skill在query中注入方式支持

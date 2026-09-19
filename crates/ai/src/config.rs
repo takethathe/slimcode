@@ -28,11 +28,18 @@ pub struct ProviderConfig {
     /// `with_cache(false)` to keep request bytes byte-identical to a
     /// non-cache client.
     pub cache: bool,
+    /// Optional response cap for this request (the wire `max_tokens`). `None`
+    /// omits the field entirely, so ordinary turns keep their byte shape;
+    /// one-off requests (compaction summaries) set a conservative cap with
+    /// [`ProviderConfig::with_max_tokens`].
+    pub max_tokens: Option<u32>,
 }
 
 impl ProviderConfig {
     /// Construct explicitly (used by callers with their own config / tests).
-    /// Cache is on by default — call [`ProviderConfig::with_cache`] to disable.
+    /// Cache is on by default and no response cap is set — call
+    /// [`ProviderConfig::with_cache`] / [`ProviderConfig::with_max_tokens`] to
+    /// override.
     pub fn new(
         api_key: impl Into<String>,
         base_url: impl Into<String>,
@@ -43,6 +50,7 @@ impl ProviderConfig {
             base_url: base_url.into(),
             model: model.into(),
             cache: true,
+            max_tokens: None,
         }
     }
 
@@ -50,6 +58,12 @@ impl ProviderConfig {
     /// `new` signature stable so existing call sites do not break).
     pub fn with_cache(mut self, cache: bool) -> Self {
         self.cache = cache;
+        self
+    }
+
+    /// Builder-style setter for the response cap (the wire `max_tokens`).
+    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = Some(max_tokens);
         self
     }
 
@@ -92,5 +106,12 @@ mod tests {
         let cfg = ProviderConfig::new("k", "https://x.example.com/v1", "m");
         assert!(cfg.clone().with_cache(true).cache);
         assert!(!cfg.clone().with_cache(false).cache);
+    }
+
+    #[test]
+    fn max_tokens_defaults_to_unset_and_is_settable() {
+        let cfg = ProviderConfig::new("k", "https://x.example.com/v1", "m");
+        assert_eq!(cfg.max_tokens, None);
+        assert_eq!(cfg.with_max_tokens(2048).max_tokens, Some(2048));
     }
 }

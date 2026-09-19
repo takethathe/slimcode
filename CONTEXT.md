@@ -156,8 +156,16 @@ A single LLM-visible message (role, content parts, tool calls) as it goes on the
 _Avoid_: wire message, llm message
 
 **AgentMessage**:
-A message in a Session's message history, owned by `slimcode-core`: the user/assistant/tool messages the model sees, plus kinds it must never see (e.g. a compaction summary). `to_llm` converts or drops it on the way to the provider.
+A message in a Session's message history, owned by `slimcode-core`: the user/assistant/tool messages the model sees, plus the session-only CompactSummary it must never see as such. `to_llm` converts the LLM variant or drops the checkpoint on the way to the provider.
 _Avoid_: session message (ambiguous with a session-log record), stored message
+
+**Compaction**:
+Replacing an older span of a Session's message history with one CompactSummary so a long conversation keeps fitting the context window. Compaction triggers after a completed turn once the estimated history exceeds 92% of the assumed window, or on demand with `/compact`; it keeps the most recent ~8% of history and asks the provider for a structured summary (merging any previous summary). A failed compaction leaves the history untouched.
+_Avoid_: summarization (the LLM step inside compaction), truncation, pruning
+
+**CompactSummary**:
+The session-only `AgentMessage` variant a compaction writes: the structured summary text, the estimated tokens before compaction, and the summary it supersedes (if any). It is persisted in the session log and restored on load, but never sent to the provider directly. Loading a session drops every record before the newest CompactSummary (the span it replaced); `ContextBuilder` then injects its text as a `user` message at that position.
+_Avoid_: compaction entry (ambiguous with the boundary position), summary message
 
 **Message history**:
 The conversation messages of a Session (`session.messages`), restorable through the Session picker. The system prompt is not part of it: it is assembled per request and never stored.

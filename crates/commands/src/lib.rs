@@ -90,6 +90,11 @@ pub const COMMANDS: &[Command] = &[
     Command::new("/new", "/new", "start a new session"),
     Command::new("/session", "/session", "browse this project's sessions"),
     Command::new("/usage", "/usage", "show token usage"),
+    Command::new(
+        "/compact",
+        "/compact",
+        "summarize older messages to free context",
+    ),
     Command::new("/history", "/history", "list input history"),
     Command::new("/skills", "/skills", "list installed skills"),
     Command::new(
