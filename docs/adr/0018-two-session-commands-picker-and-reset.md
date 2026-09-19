@@ -106,8 +106,11 @@ owner explicitly rejected a timezone dependency.
 ## Consequences
 
 - `SessionChanged` now clears the transcript, re-pushes the startup header, resets the footer
-  usage and closes the picker, so `/new` and `/load` both leave a clean, freshly-headed view.
-  The CLI must emit it *before* the load notices; it previously emitted the "title / skipped
+  usage and closes the picker, so `/new` leaves a clean, freshly-headed view. `/load` then
+  **replays the loaded session's history into the transcript** (prompt boxes, assistant text,
+  paired tool start/result blocks) so the screen shows the conversation again instead of ending
+  at the header; usage still restarts at zero (D4). The CLI must emit `SessionChanged` *before*
+  the load notices; it previously emitted the "title / skipped
   N / repaired N" notices first, where the clear wiped them — a latent bug this fixes.
 - Usage numbers are per live session: resuming shows zeros until the session earns tokens
   again. Documented as a user-visible rule, not a defect.

@@ -688,3 +688,103 @@ fn tmux_smoke_one_shot_prints_a_run() {
         redact(&ui.capture())
     );
 }
+
+/// Loading a saved session through the `/session` picker replays that session's
+/// history into the transcript: after the load, the screen shows the old
+/// conversation (prompt box, tool block with real output, final answer) again
+/// instead of ending at the startup header — the regression this test locks.
+#[test]
+fn tmux_session_load_replays_history_into_the_transcript() {
+    if Command::new("tmux").arg("-V").output().is_err() {
+        eprintln!("skipping: tmux not available");
+        return;
+    }
+
+    let dir = std::env::temp_dir().join(format!("slimcode-load-{}", std::process::id()));
+    let home = std::env::temp_dir().join(format!("slimcode-load-home-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(dir.join("marker.txt"), "marker").unwrap();
+
+    let mock = MockServer::start(vec![sse(true), sse(false)]);
+    let ui = Tmux::new();
+    launch(&mock, &ui, &dir, &home);
+    assert!(
+        ui.wait_for("/help for commands", Duration::from_secs(8)),
+        "header not shown: {}",
+        redact(&ui.capture())
+    );
+
+    // 1. Run one conversation so a session log is written (the first
+    // assistant message creates it, ADR-0009 D2). Wait for the turn to fully
+    // end (answer on screen and no spinner) so the keys below are not
+    // swallowed by a running turn.
+    ui.send_literal("list the directory");
+    ui.send_keys("Enter");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let cap = ui.capture();
+        if cap.contains("Second answer.") && !cap.contains("Working") {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("turn did not complete: {}", redact(&cap));
+        }
+        thread::sleep(Duration::from_millis(120));
+    }
+
+    // 2. `/new` starts a fresh session, so the picker's first row is the
+    // saved one (the current session is a no-op row, ADR-0018 D3).
+    ui.send_keys("/new");
+    ui.send_keys("Enter");
+    assert!(
+        ui.wait_for("new session:", Duration::from_secs(3)),
+        "/new notice not shown: {}",
+        redact(&ui.capture())
+    );
+
+    // 3. Open the picker and load the saved session with Enter.
+    ui.send_keys("/session");
+    ui.send_keys("Enter");
+    assert!(
+        ui.wait_for("Sessions (this project)", Duration::from_secs(3)),
+        "picker not shown: {}",
+        redact(&ui.capture())
+    );
+    ui.send_keys("Enter");
+
+    // 4. The history is replayed onto the fresh view: the loaded notice plus
+    // the old prompt box, the tool block's real output and the final answer.
+    assert!(
+        ui.wait_for("loaded session:", Duration::from_secs(3)),
+        "loaded notice not shown: {}",
+        redact(&ui.capture())
+    );
+    assert!(
+        ui.wait_for("list the directory", Duration::from_secs(3)),
+        "replayed prompt not shown: {}",
+        redact(&ui.capture())
+    );
+    assert!(
+        ui.wait_for("Second answer.", Duration::from_secs(3)),
+        "replayed answer not shown: {}",
+        redact(&ui.capture())
+    );
+    assert!(
+        ui.wait_for("marker.txt", Duration::from_secs(3)),
+        "replayed tool output not shown: {}",
+        redact(&ui.capture())
+    );
+
+    // 5. The status line names the loaded session (not the fresh `/new` one).
+    let cap = ui.capture();
+    let lines: Vec<&str> = cap.lines().collect();
+    let status = lines[lines.len() - 2];
+    assert!(
+        status.contains("slimcode-"),
+        "status should name the loaded session: {:?}",
+        status
+    );
+}

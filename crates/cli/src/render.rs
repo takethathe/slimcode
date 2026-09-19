@@ -19,9 +19,12 @@
 
 use std::io::Write;
 
+use std::collections::HashMap;
+
 use slimcode_ai::TokenUsage;
 use slimcode_app::render::{DisplayItem, Renderer, usage_summary};
 use slimcode_core::agent::StopReason;
+use slimcode_core::session::{AgentMessage, Role};
 use slimcode_tui::footer::FooterUsage;
 use slimcode_tui::render::RenderItem;
 
@@ -58,6 +61,61 @@ pub fn to_render_item(item: &DisplayItem) -> Option<RenderItem> {
         DisplayItem::Usage(u) => RenderItem::Usage(to_footer_usage(u)),
         DisplayItem::Turn { .. } | DisplayItem::Stop(_) => return None,
     })
+}
+
+/// Replay a loaded session's history as the render items the TUI appends to
+/// the transcript (the `SessionChanged` clear already happened, so these items
+/// build the fresh view back up). The mapping mirrors the streaming path:
+/// user messages become prompt boxes, assistant text (non-empty parts) becomes
+/// streamed text, each assistant tool call becomes a pending tool block, and
+/// every tool result fills the matching block (or keeps its own when the start
+/// was never seen). `ok` is not persisted in the log, so it is recovered the
+/// way the runner writes errors: a result whose text starts with `Error: ` is a
+/// failure (ADR-0012 D1). `System` messages never reach a history (ADR-0012 D3)
+/// and are skipped defensively.
+pub fn history_to_render_items(messages: &[AgentMessage]) -> Vec<RenderItem> {
+    // Assistant tool calls carry the name; the matching tool result only has
+    // the call id, so the name is remembered until the result arrives.
+    let mut tool_names: HashMap<&str, &str> = HashMap::new();
+    let mut out = Vec::with_capacity(messages.len());
+    for message in messages {
+        match message.role() {
+            Role::User => out.push(RenderItem::UserPrompt(message.text_content())),
+            Role::Assistant => {
+                let text = message.text_content();
+                if !text.is_empty() {
+                    out.push(RenderItem::Text(text));
+                }
+                for call in message.tool_calls() {
+                    tool_names.insert(call.id.as_str(), call.name.as_str());
+                    out.push(RenderItem::ToolStart {
+                        tool_call_id: call.id.clone(),
+                        name: call.name.clone(),
+                        arguments: call.arguments.clone(),
+                    });
+                }
+            }
+            Role::Tool => {
+                let tool_call_id = message
+                    .tool_call_id()
+                    .map(str::to_string)
+                    .unwrap_or_default();
+                let name = tool_names
+                    .remove(tool_call_id.as_str())
+                    .unwrap_or("tool")
+                    .to_string();
+                let result = message.text_content();
+                out.push(RenderItem::ToolResult {
+                    tool_call_id,
+                    name,
+                    ok: !result.starts_with("Error: "),
+                    result,
+                });
+            }
+            Role::System => {}
+        }
+    }
+    out
 }
 
 /// The TUI's view of a provider's cumulative usage (ADR-0014 D1): the CLI does
@@ -521,5 +579,141 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(emitted, vec![RenderItem::Text("answer".to_string())]);
+    }
+
+    #[test]
+    fn history_replay_maps_text_messages_in_order() {
+        let history = vec![
+            AgentMessage::text(Role::User, "hello"),
+            AgentMessage::text(Role::Assistant, "hi there"),
+            AgentMessage::text(Role::User, "again"),
+        ];
+        assert_eq!(
+            history_to_render_items(&history),
+            vec![
+                RenderItem::UserPrompt("hello".to_string()),
+                RenderItem::Text("hi there".to_string()),
+                RenderItem::UserPrompt("again".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn history_replay_pairs_tool_calls_with_results() {
+        use slimcode_core::session::Message;
+        let history = vec![
+            AgentMessage::text(Role::User, "check git"),
+            AgentMessage::llm(Message {
+                role: Role::Assistant,
+                parts: vec![slimcode_ai::message::Part::Text {
+                    text: String::new(),
+                }],
+                tool_calls: vec![slimcode_core::session::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "bash".to_string(),
+                    arguments: r#"{"command":"git log"}"#.to_string(),
+                }],
+                tool_call_id: None,
+            }),
+            AgentMessage::tool_result("call_1", "commit abc"),
+            AgentMessage::text(Role::Assistant, "done"),
+        ];
+        assert_eq!(
+            history_to_render_items(&history),
+            vec![
+                RenderItem::UserPrompt("check git".to_string()),
+                RenderItem::ToolStart {
+                    tool_call_id: "call_1".to_string(),
+                    name: "bash".to_string(),
+                    arguments: r#"{"command":"git log"}"#.to_string(),
+                },
+                RenderItem::ToolResult {
+                    tool_call_id: "call_1".to_string(),
+                    name: "bash".to_string(),
+                    ok: true,
+                    result: "commit abc".to_string(),
+                },
+                RenderItem::Text("done".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn history_replay_marks_error_results_as_failed() {
+        use slimcode_core::session::Message;
+        let history = vec![
+            AgentMessage::llm(Message {
+                role: Role::Assistant,
+                parts: vec![slimcode_ai::message::Part::Text {
+                    text: String::new(),
+                }],
+                tool_calls: vec![slimcode_core::session::ToolCall {
+                    id: "call_2".to_string(),
+                    name: "bash".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+                tool_call_id: None,
+            }),
+            AgentMessage::tool_result("call_2", "Error: boom"),
+        ];
+        let items = history_to_render_items(&history);
+        assert_eq!(
+            items[1],
+            RenderItem::ToolResult {
+                tool_call_id: "call_2".to_string(),
+                name: "bash".to_string(),
+                ok: false,
+                result: "Error: boom".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn history_replay_skips_system_and_keeps_text_before_tool_calls() {
+        use slimcode_core::session::Message;
+        let history = vec![
+            AgentMessage::text(Role::System, "be helpful"),
+            AgentMessage::llm(Message {
+                role: Role::Assistant,
+                parts: vec![slimcode_ai::message::Part::Text {
+                    text: "reasoning aloud".to_string(),
+                }],
+                tool_calls: vec![slimcode_core::session::ToolCall {
+                    id: "call_3".to_string(),
+                    name: "read".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+                tool_call_id: None,
+            }),
+        ];
+        let items = history_to_render_items(&history);
+        assert_eq!(
+            items,
+            vec![
+                RenderItem::Text("reasoning aloud".to_string()),
+                RenderItem::ToolStart {
+                    tool_call_id: "call_3".to_string(),
+                    name: "read".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn history_replay_orphan_tool_result_becomes_its_own_block() {
+        // A repaired tool result (ADR-0012) has no matching start in the
+        // history; it must still render as its own block instead of panicking
+        // or being dropped.
+        let history = vec![AgentMessage::tool_result("call_9", "Error: interrupted")];
+        assert_eq!(
+            history_to_render_items(&history),
+            vec![RenderItem::ToolResult {
+                tool_call_id: "call_9".to_string(),
+                name: "tool".to_string(),
+                ok: false,
+                result: "Error: interrupted".to_string(),
+            }]
+        );
     }
 }

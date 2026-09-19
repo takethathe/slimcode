@@ -505,7 +505,9 @@ stdout 是否 TTY）：
   `SessionRow { id, title: title ?? id, meta: "N msgs  YYYY-MM-DD HH:MM" }` 后发
   `RenderItem::SessionPicker { rows }`；`Effect::LoadSession { id }` 走与旧 `/load` 同一路径，
   但先发 `SessionChanged` 再发 title/skipped/repaired/`loaded session` notice（否则清屏会
-  吃掉提示），且选中当前 session 时直接 no-op（ADR-0018 D3）。`CliCompletions` 是注入 TUI 的 `/` 候选 provider（命令表 + skills 快照，
+  吃掉提示），**随后把该会话的历史消息重放为 transcript 条目**（`history_to_render_items`：
+  user prompt 框 / assistant 文本 / 成对的工具 start-result 块），屏幕恢复这段对话而非停在
+  header，且选中当前 session 时直接 no-op（ADR-0018 D3）。`CliCompletions` 是注入 TUI 的 `/` 候选 provider（命令表 + skills 快照，
   `/install-skill` 后就地刷新）。
 - `render`：两个 `Renderer` 实现。`TextRenderer` 把共享 `DisplayItem` 流（流式文本 / 流式思考 / 结构行 / 用量汇总）渲染为终端输出，原始 tool_call delta 与
   `Done` 事件被抑制；流式文本与思考（带 `> ` 前缀）按 delta 拼接、不逐 delta 换行，换行只来自内容本身的 `\n`，结构行（工具开始/结果、停止标记、turn 标记）总是另起一行；事件→DisplayItem 的映射是共享的 `app::render::map_event`。

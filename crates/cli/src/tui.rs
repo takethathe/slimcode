@@ -38,7 +38,7 @@ use slimcode_tui::handler::{
 };
 use slimcode_tui::render::{RenderItem, SessionRow};
 
-use crate::render::TuiAdapter;
+use crate::render::{TuiAdapter, history_to_render_items};
 
 /// Enter the TUI: build the runtime, take over the terminal, run the frame
 /// loop, and restore the terminal on every exit path.
@@ -357,7 +357,10 @@ impl TuiSession<'_> {
     /// cursor often starts on should do.
     ///
     /// `SessionChanged` is emitted *before* the load notices: it clears the
-    /// transcript, so notices emitted first would be wiped (ADR-0018 D2).
+    /// transcript, so notices emitted first would be wiped (ADR-0018 D2). The
+    /// notices stay right under the header, and the loaded history is then
+    /// replayed after them so the fresh view shows the conversation again
+    /// instead of ending at the header.
     fn load_session(&self, id: &str, emit: &mut dyn FnMut(RenderItem)) -> ControlFlow {
         if id == self.session_id() {
             return ControlFlow::Continue;
@@ -374,6 +377,9 @@ impl TuiSession<'_> {
         let repaired_tool_calls = outcome.repaired_tool_calls;
         let session = outcome.session;
         let id = session.id.clone();
+        // Replay the loaded conversation into the transcript (before the
+        // session moves into `self.inner`).
+        let history_items = history_to_render_items(&session.messages);
         self.inner.lock().expect("session lock").session = session;
         emit(RenderItem::SessionChanged { id: id.clone() });
         if let Some(title) = &title {
@@ -390,6 +396,9 @@ impl TuiSession<'_> {
             )));
         }
         emit(RenderItem::Notice(format!("loaded session: {id}")));
+        for item in history_items {
+            emit(item);
+        }
         emit(RenderItem::Branch(current_branch(&self.cwd)));
         set_title(&id, &self.cwd);
         ControlFlow::Continue
@@ -1269,6 +1278,84 @@ mod tests {
             changed < skipped,
             "notice must survive the clear: {items:?}"
         );
+    }
+
+    #[test]
+    fn load_session_replays_the_history_into_the_transcript() {
+        let fx = Fixture::new("load-replay");
+        // A session with a tool round trip, so the replay covers prompt boxes,
+        // assistant text, a tool start/result pair and the final answer.
+        let mut session = fx.store.new_session();
+        session.title = Some("replay".to_string());
+        session
+            .messages
+            .push(AgentMessage::text(Role::User, "list it"));
+        session.messages.push(AgentMessage::llm(Message {
+            role: Role::Assistant,
+            parts: vec![slimcode_ai::message::Part::Text {
+                text: String::new(),
+            }],
+            tool_calls: vec![slimcode_core::session::ToolCall {
+                id: "call_1".to_string(),
+                name: "bash".to_string(),
+                arguments: r#"{"command":"ls"}"#.to_string(),
+            }],
+            tool_call_id: None,
+        }));
+        session
+            .messages
+            .push(AgentMessage::tool_result("call_1", "marker.txt"));
+        session
+            .messages
+            .push(AgentMessage::text(Role::Assistant, "done listing"));
+        let last = session.messages.last().unwrap().clone();
+        let id = session.id.clone();
+        fx.store.append(&session, &last).expect("log created");
+
+        let mut handler = fx.handler(Box::new(FakeProvider::new(Vec::new())), Vec::new());
+        let (_, items) = drive(&mut handler, Effect::LoadSession { id });
+
+        // The change clears first, then the notices, then the replayed
+        // history restores the conversation onto the fresh view.
+        let changed = items
+            .iter()
+            .position(|i| matches!(i, RenderItem::SessionChanged { .. }))
+            .expect("session change");
+        let replay: Vec<&RenderItem> = items
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    RenderItem::UserPrompt(_)
+                        | RenderItem::Text(_)
+                        | RenderItem::ToolStart { .. }
+                        | RenderItem::ToolResult { .. }
+                )
+            })
+            .collect();
+        assert!(
+            changed < items.len(),
+            "history must follow the clear: {items:?}"
+        );
+        assert_eq!(
+            replay,
+            vec![
+                &RenderItem::UserPrompt("list it".to_string()),
+                &RenderItem::ToolStart {
+                    tool_call_id: "call_1".to_string(),
+                    name: "bash".to_string(),
+                    arguments: r#"{"command":"ls"}"#.to_string(),
+                },
+                &RenderItem::ToolResult {
+                    tool_call_id: "call_1".to_string(),
+                    name: "bash".to_string(),
+                    ok: true,
+                    result: "marker.txt".to_string(),
+                },
+                &RenderItem::Text("done listing".to_string()),
+            ]
+        );
+        assert_eq!(handler.inner.lock().unwrap().session.messages.len(), 4);
     }
 
     #[test]
