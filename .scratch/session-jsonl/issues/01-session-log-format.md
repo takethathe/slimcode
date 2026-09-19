@@ -17,32 +17,32 @@ carries.
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] A session log is `<id>.jsonl`: a log header line (`type`, `v`, `id`, `created_at`,
+- [x] A session log is `<id>.jsonl`: a log header line (`type`, `v`, `id`, `created_at`,
       `project_home`) followed by one record per line (`{"type":"message",…}`,
       `{"type":"title",…}`); a record with an unknown `type` is skipped.
-- [ ] Appending before the first assistant message writes no file.
-- [ ] The first assistant message creates the file exclusively (a pre-existing file is a loud
+- [x] Appending before the first assistant message writes no file.
+- [x] The first assistant message creates the file exclusively (a pre-existing file is a loud
       error) with the header, a title record when the title is known, and one record for every
       message already in the session history.
-- [ ] After creation, each append adds exactly one record line, so a session with N messages has
+- [x] After creation, each append adds exactly one record line, so a session with N messages has
       1 + N record lines (plus title records).
-- [ ] A title record can be appended for a title that becomes known after the log exists; loading
+- [x] A title record can be appended for a title that becomes known after the log exists; loading
       resolves the title from the last title record, or none.
-- [ ] Loading replays records in order, skips malformed lines and reports how many were skipped,
+- [x] Loading replays records in order, skips malformed lines and reports how many were skipped,
       and reports how many tool calls were repaired.
-- [ ] A torn trailing line is dropped when it does not parse (kept when it is complete JSON) and the
+- [x] A torn trailing line is dropped when it does not parse (kept when it is complete JSON) and the
       file is sealed with one appended newline so a later append stays line-aligned.
-- [ ] A missing or malformed header makes loading fail with an error naming the log.
-- [ ] Dangling tool batch repair is in-memory only: missing tool-call ids get an
+- [x] A missing or malformed header makes loading fail with an error naming the log.
+- [x] Dangling tool batch repair is in-memory only: missing tool-call ids get an
       `Error: interrupted` tool result in order, orphan tool results are dropped, and the log's
       bytes are identical before and after a load.
-- [ ] The message model's optional `stop_reason` (`stop` / `tool_calls` / `error` / `aborted`) and
+- [x] The message model's optional `stop_reason` (`stop` / `tool_calls` / `error` / `aborted`) and
       `error` round-trip, and an ordinary message serializes byte-identically to before.
-- [ ] The existing whole-file save / load / list / startup cleanup / quota eviction paths are
+- [x] The existing whole-file save / load / list / startup cleanup / quota eviction paths are
       untouched and their tests still pass; no production caller uses the new API yet.
-- [ ] Unit tests in the `session` module cover the whole list above (unique-temp-dir pattern).
+- [x] Unit tests in the `session` module cover the whole list above (unique-temp-dir pattern).
 
 ## Notes
 

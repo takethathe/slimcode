@@ -10,6 +10,8 @@ transcript gives up that row); the input box and footer stay anchored.
 
 ## Files
 
+**Status:** resolved
+
 - `crates/tui/src/app.rs`:
   - `App::draw` — `popup_height` gains `+1` for the separator line.
   - `render_completion` — prepend a full-width `─` line in `Token::Border`.
@@ -19,11 +21,11 @@ transcript gives up that row); the input box and footer stay anchored.
 
 ## Acceptance
 
-- [ ] The row directly above the first candidate row is a full-width `─` line in the
+- [x] The row directly above the first candidate row is a full-width `─` line in the
       border color.
-- [ ] Popup still renders above the input; input box position still stable open vs closed.
-- [ ] `cargo test` green (incl. both tmux smoke tests), clippy 0 warnings, `cargo fmt --all`.
-- [ ] Docs updated: ADR-0007 D3/D4 (divergence note), `user-manual.md`, `development.md`.
+- [x] Popup still renders above the input; input box position still stable open vs closed.
+- [x] `cargo test` green (incl. both tmux smoke tests), clippy 0 warnings, `cargo fmt --all`.
+- [x] Docs updated: ADR-0007 D3/D4 (divergence note), `user-manual.md`, `development.md`.
 
 ## Notes
 

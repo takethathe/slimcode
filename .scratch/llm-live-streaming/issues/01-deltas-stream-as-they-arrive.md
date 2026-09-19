@@ -14,6 +14,8 @@ once.
 
 **Decision:** see ADR-0019 (`docs/adr/0019-deltas-stream-through-the-provider-seam.md`).
 
+**Status:** resolved
+
 - [x] `Provider::chat` carries `on_delta: &mut dyn FnMut(Delta) -> Result<(), String>`
       and returns `Result<(), String>` — one delivery path, no double render.
 - [x] `wire::SseFramer` frames SSE incrementally; `parse_sse_events`/`parse_stream`

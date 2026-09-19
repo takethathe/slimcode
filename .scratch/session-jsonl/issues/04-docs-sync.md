@@ -8,24 +8,24 @@ store, Eviction) already exist and only need checking against the code.
 
 **Blocked by:** 03 (switch session persistence to the appended log)
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] `README.md`: the command list no longer advertises `/save`; the session file example uses a
+- [x] `README.md`: the command list no longer advertises `/save`; the session file example uses a
       `.jsonl` log.
-- [ ] `docs/user-manual.md`: the 会话文件 section describes the log (header + one record per
+- [x] `docs/user-manual.md`: the 会话文件 section describes the log (header + one record per
       message, appended per message, created at the first assistant message, lenient load with the
       skipped-records notice, in-memory repair of dangling tool batches); the 磁盘清理 section uses
       the new empty-log rule; the session command table drops `/save`.
-- [ ] `docs/configuration.md`: the 会话存储配额 section refers to session logs (`.jsonl`) and keeps
+- [x] `docs/configuration.md`: the 会话存储配额 section refers to session logs (`.jsonl`) and keeps
       the "legacy `.json` invisible but counted" statement.
-- [ ] `docs/development.md`: the `slimcode-common` session notes and the `slimcode-agent` session
+- [x] `docs/development.md`: the `slimcode-common` session notes and the `slimcode-agent` session
       notes cover the log format, append-per-message, the new per-message event and the removal of
       the whole-file save API.
-- [ ] No stale wording left behind (grep for the old session path, `/save`, "空会话（messages 为空、
+- [x] No stale wording left behind (grep for the old session path, `/save`, "空会话（messages 为空、
       0 字节或 JSON 损坏）", "每轮后自动保存", "unparseable").
-- [ ] ADR-0008 is not rewritten: if a pointer helps, add a "superseded in part by ADR-0009" note
+- [x] ADR-0008 is not rewritten: if a pointer helps, add a "superseded in part by ADR-0009" note
       rather than editing its decisions.
-- [ ] `cargo fmt --all`; `cargo clippy --all-targets --all-features --message-format=json --
+- [x] `cargo fmt --all`; `cargo clippy --all-targets --all-features --message-format=json --
       -D warnings` reports 0 errors / 0 warnings; `cargo test` is green.
 
 ## Notes

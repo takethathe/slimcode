@@ -15,34 +15,34 @@ and `/save` is removed since an append-only log has nothing left for it to do.
 **Blocked by:** 01 (session log format and store-side log API), 02 (per-message agent event and
 runner sink)
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] A new session's first turn creates `<id>.jsonl` when the first assistant message arrives,
+- [x] A new session's first turn creates `<id>.jsonl` when the first assistant message arrives,
       containing the log header, the title record and one record per message already in history.
-- [ ] Every message that enters history during a turn is appended as it enters (system message and
+- [x] Every message that enters history during a turn is appended as it enters (system message and
       prompt at submit, assistant when assembled, each tool result as it completes), so `tail -f`
       shows records appearing before the turn ends.
-- [ ] A turn that fails or is cancelled appends a closing assistant message (`stop_reason` =
+- [x] A turn that fails or is cancelled appends a closing assistant message (`stop_reason` =
       `error` / `aborted`, `error` set, non-empty text) and the live session adopts the partial turn
       plus that message; the log never ends on a dangling tool batch or a trailing tool result.
-- [ ] A turn that fails before its first assistant message leaves no session file on disk.
-- [ ] The system message and prompt are pushed into the session history before the context is built,
+- [x] A turn that fails before its first assistant message leaves no session file on disk.
+- [x] The system message and prompt are pushed into the session history before the context is built,
       so memory, log and context are one message sequence (no message built or persisted twice).
-- [ ] `/load` restores the replayed history and reports skipped records and repaired tool calls as a
+- [x] `/load` restores the replayed history and reports skipped records and repaired tool calls as a
       notice; a log with a bad record line still loads, one with a torn last line loads and gets
       sealed.
-- [ ] Listing, path resolution and the startup sweep operate on `.jsonl` only; the startup sweep
+- [x] Listing, path resolution and the startup sweep operate on `.jsonl` only; the startup sweep
       deletes zero-byte logs and logs that replay to no assistant record.
-- [ ] The quota still bounds the store: `.jsonl` and legacy `.json` bytes are counted together,
+- [x] The quota still bounds the store: `.jsonl` and legacy `.json` bytes are counted together,
       oldest-first by mtime, down to half the quota, never the active session.
-- [ ] The old whole-file save and load paths are deleted along with every caller; the whole-file
+- [x] The old whole-file save and load paths are deleted along with every caller; the whole-file
       `save(&Session)` API no longer exists.
-- [ ] `/save` and its effect are removed (the command table entry, the dispatch arm and the
+- [x] `/save` and its effect are removed (the command table entry, the dispatch arm and the
       completion-popup tests that used it as a sample command); `/load`, `/sessions`, `/new` still
       work.
-- [ ] Legacy `.json` sessions are neither listed nor loaded, and are still removed by quota
+- [x] Legacy `.json` sessions are neither listed nor loaded, and are still removed by quota
       eviction.
-- [ ] `cargo test` passes; manual acceptance: watch records appear line by line, `kill -9` a turn
+- [x] `cargo test` passes; manual acceptance: watch records appear line by line, `kill -9` a turn
       mid-tool-batch and confirm the completed tool results are on disk, and `/load` that session.
 
 ## Notes

@@ -10,18 +10,18 @@ message.
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] The loop emits one event carrying the assembled assistant message, after that message enters
+- [x] The loop emits one event carrying the assembled assistant message, after that message enters
       history.
-- [ ] The loop emits one event per tool result, after that result enters history (serial and
+- [x] The loop emits one event per tool result, after that result enters history (serial and
       parallel execution alike).
-- [ ] The shared runner forwards the event to a sink the caller injects, without mapping it to a
+- [x] The shared runner forwards the event to a sink the caller injects, without mapping it to a
       display item and without touching disk.
-- [ ] Existing events (`Turn`, `Stream`, `ToolStart`, `ToolResult`, `Stop`) and the rendered
+- [x] Existing events (`Turn`, `Stream`, `ToolStart`, `ToolResult`, `Stop`) and the rendered
       transcript are unchanged; existing agent and runner tests still pass.
-- [ ] A scripted-fake-provider test pins the emitted event sequence for a tool-calling turn.
-- [ ] The agent crate still has no filesystem dependency.
+- [x] A scripted-fake-provider test pins the emitted event sequence for a tool-calling turn.
+- [x] The agent crate still has no filesystem dependency.
 
 ## Notes
 
