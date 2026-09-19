@@ -259,6 +259,21 @@ pub fn escape_xml(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+/// Split a skill active block into its name and inner content (pi's
+/// `ParsedSkillBlock`): the opening tag's `name` attribute and everything
+/// between the tag's newline and the closing `</skill>` — the
+/// "References are relative to …" line plus the body. Reuses pi's non-greedy
+/// match, so the first `</skill>` ends the block and a trailing task argument
+/// stays outside `content`. `None` when `text` does not *start* with a skill
+/// block (a skill trigger prompt and a skill-serving tool result both do).
+pub fn parse_skill_block(text: &str) -> Option<(&str, &str)> {
+    let rest = text.strip_prefix("<skill name=\"")?;
+    let (name, rest) = rest.split_once("\" location=\"")?;
+    let (_, rest) = rest.split_once("\">\n")?;
+    let (content, _) = rest.split_once("\n</skill>")?;
+    Some((name, content))
+}
+
 /// Find the installed skill a `read` tool path refers to, if any. The path is
 /// resolved against `cwd` (an absolute path is used as-is) and must name the
 /// skill's own `SKILL.md` (or its single-file skill) for a match; reads of
@@ -989,6 +1004,36 @@ mod tests {
         assert!(skill_for_read_args(&skills, &cwd, r#"{}"#).is_none());
         assert!(skill_for_read_args(&skills, &cwd, "not json").is_none());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_skill_block_splits_name_and_inner_content() {
+        let text = "<skill name=\"grill\" location=\"/x/SKILL.md\">\nReferences are relative to /x.\n\nBody.\n</skill>";
+        assert_eq!(
+            parse_skill_block(text),
+            Some(("grill", "References are relative to /x.\n\nBody."))
+        );
+        // A trailing task argument stays outside the block content.
+        let with_arg = format!("{text}\n\nmy plan");
+        assert_eq!(
+            parse_skill_block(&with_arg),
+            Some(("grill", "References are relative to /x.\n\nBody."))
+        );
+        // Escaped XML in the name is kept verbatim (pi does not unescape).
+        assert_eq!(
+            parse_skill_block("<skill name=\"a&amp;b\" location=\"/y\">\nx\n</skill>"),
+            Some(("a&amp;b", "x"))
+        );
+        // Not a skill block, an unterminated tag, or a mid-text mention.
+        assert_eq!(parse_skill_block("hello"), None);
+        assert_eq!(
+            parse_skill_block("<skill name=\"x\" location=\"/y\">\nunterminated"),
+            None
+        );
+        assert_eq!(
+            parse_skill_block("see <skill name=\"x\" location=\"/y\">\nz\n</skill>"),
+            None
+        );
     }
 
     #[test]

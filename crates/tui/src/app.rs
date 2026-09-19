@@ -1511,7 +1511,7 @@ fn entry_rows(
     match entry {
         Entry::Header => header_rows(version),
         Entry::UserPrompt { text } => user_box_rows(text, width),
-        Entry::Skill { name, content } => skill_box_rows(name, content, width),
+        Entry::Skill { name, content } => skill_box_rows(name, content, width, tool_expanded),
         Entry::Assistant { text } => render_markdown(text, width),
         Entry::Thinking { text } => render_markdown(text, width)
             .into_iter()
@@ -1574,43 +1574,60 @@ fn user_box_rows(text: &str, width: usize) -> Vec<Line<'static>> {
     rows
 }
 
-/// A skill active block: a boxed block like a user prompt, with a bold
-/// `[skill] <name>` header row and the full skill content (the `<skill>` XML
-/// block) rendered as plain wrapped text below it. The content is deliberately
-/// NOT markdown-rendered: a `<skill name=…>` opening tag would otherwise be
-/// eaten as an HTML block by the markdown renderer. Distinct from the user
-/// prompt box so an activated skill reads as its own display unit.
-fn skill_box_rows(name: &str, content: &str, width: usize) -> Vec<Line<'static>> {
+/// A skill active block (pi `SkillInvocationMessageComponent`): a
+/// `customMessageBg`-filled box whose collapsed form is a single
+/// `[skill] <name> (Ctrl+O to expand)` line — the skill content is hidden,
+/// matching pi. `expanded` (the global Ctrl+O flag, pi's
+/// `toolOutputExpanded`) reveals the `[skill]` label, the skill name and the
+/// content as markdown.
+fn skill_box_rows(name: &str, content: &str, width: usize, expanded: bool) -> Vec<Line<'static>> {
     let inner = width.saturating_sub(2).max(1);
-    let bg = BgToken::UserMessageBg.color();
+    let bg = BgToken::CustomMessageBg.color();
     let bg_style = Style::default().bg(bg);
     let mut rows = vec![Line::styled(" ".repeat(width), bg_style)];
-    // `[skill] <name>` header (bold accent), padded like the content rows.
-    let header = Span::styled(
-        format!("[skill] {name}"),
+    let label = Span::styled(
+        "[skill]",
         bg_style
-            .fg(Token::Accent.color())
+            .fg(Token::CustomMessageLabel.color())
             .add_modifier(Modifier::BOLD),
     );
-    let header_w = display_width(&header.content);
-    let header_pad = inner.saturating_sub(header_w);
-    rows.push(Line::from(vec![
-        Span::styled(" ", bg_style),
-        header,
-        Span::styled(" ".repeat(header_pad + 1), bg_style),
-    ]));
-    // The content: the full `<skill>` block, wrapped to the inner width as
-    // plain text so the XML renders literally.
-    for line in content.lines() {
-        for piece in wrap_to_width(line, inner) {
-            let content_w = display_width(&piece);
+    if expanded {
+        // Expanded: the `[skill]` label, then the name and content as
+        // markdown (pi renders `**<name>**` + content).
+        rows.push(pad_line_to_width(
+            vec![Span::styled(" ", bg_style), label],
+            width,
+            bg_style,
+        ));
+        let md = render_markdown(&format!("**{name}**\n\n{content}"), inner);
+        for line in md {
+            let mut spans: Vec<Span> = line
+                .spans
+                .into_iter()
+                .map(|s| Span::styled(s.content.clone(), s.style.bg(bg)))
+                .collect();
+            let content_w: usize = spans.iter().map(|s| display_width(&s.content)).sum();
             let pad = inner.saturating_sub(content_w);
-            rows.push(Line::from(vec![
-                Span::styled(" ", bg_style),
-                Span::styled(piece, bg_style),
-                Span::styled(" ".repeat(pad + 1), bg_style),
-            ]));
+            spans.insert(0, Span::styled(" ", bg_style));
+            spans.push(Span::styled(" ".repeat(pad + 1), bg_style));
+            rows.push(Line::from(spans));
         }
+    } else {
+        // Collapsed: one line, no content (pi's default).
+        let text_style = bg_style.fg(Token::CustomMessageText.color());
+        let hint_style = bg_style.fg(Token::Muted.color());
+        rows.push(pad_line_to_width(
+            vec![
+                Span::styled(" ", bg_style),
+                label,
+                Span::styled(format!(" {name}"), text_style),
+                Span::styled(" (", hint_style),
+                Span::styled("Ctrl+O", bg_style.fg(Token::Dim.color())),
+                Span::styled(" to expand)", hint_style),
+            ],
+            width,
+            bg_style,
+        ));
     }
     rows.push(Line::styled(" ".repeat(width), bg_style));
     rows
@@ -3543,35 +3560,55 @@ mod tests {
     }
 
     #[test]
-    fn skill_block_renders_with_header_and_bg() {
+    fn skill_block_is_collapsed_until_expanded() {
         let mut app = seeded_app();
         app.apply(RenderItem::Skill {
             name: "grill".to_string(),
-            content: "<skill name=\"grill\">\nBody.\n</skill>".to_string(),
+            content: "References are relative to /x.\n\nBody.".to_string(),
         });
+        // Collapsed (pi default): one `[skill] <name> (Ctrl+O to expand)` line,
+        // no skill content.
         let buffer = render_buffer(&mut app, 60, 30);
-        // The `[skill] <name>` header is a distinct row.
         assert!(buffer_contains(&buffer, "[skill] grill"));
+        assert!(buffer_contains(&buffer, "(Ctrl+O to expand)"));
+        assert!(!buffer_contains(&buffer, "Body."));
         let y = row_containing(&buffer, "[skill] grill").unwrap();
-        let x = line_at(&buffer, y).find("[skill] grill").unwrap() as u16;
-        let style = cell_style(&buffer, x, y);
-        assert_eq!(style.fg, Some(Token::Accent.color()));
-        assert!(style.add_modifier.contains(Modifier::BOLD));
-        // The block's rows carry the same bg as a user prompt box.
-        assert!(row_bg_equals(&buffer, y, BgToken::UserMessageBg.color()));
-        // The content renders inside the box, XML shown literally (not eaten
-        // as an HTML block by markdown).
-        let content_y = row_containing(&buffer, "<skill name=\"grill\">").unwrap();
+        let line = line_at(&buffer, y);
+        // `[skill]` is the bold custom-message label; the name is custom text.
+        let label_x = line.find("[skill]").unwrap() as u16;
+        let label = cell_style(&buffer, label_x, y);
+        assert_eq!(label.fg, Some(Token::CustomMessageLabel.color()));
+        assert!(label.add_modifier.contains(Modifier::BOLD));
+        let name_x = line.find("grill").unwrap() as u16;
+        assert_eq!(
+            cell_style(&buffer, name_x, y).fg,
+            Some(Token::CustomMessageText.color())
+        );
+        // The whole block sits on `customMessageBg`, not the user-prompt bg.
+        assert!(row_bg_equals(&buffer, y, BgToken::CustomMessageBg.color()));
+        assert_eq!(
+            cell_bg_at(&buffer, 0, y.saturating_sub(1)),
+            Some(BgToken::CustomMessageBg.color())
+        );
+
+        // Ctrl+O expands: the label row plus the name and content as markdown.
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        let buffer = render_buffer(&mut app, 60, 30);
+        assert!(buffer_contains(&buffer, "[skill]"));
+        assert!(!buffer_contains(&buffer, "(Ctrl+O to expand)"));
+        // The name renders as a bold markdown heading, then the content.
+        let name_y = row_containing(&buffer, "grill").unwrap();
+        let name_x = line_at(&buffer, name_y).find("grill").unwrap() as u16;
+        assert!(
+            cell_style(&buffer, name_x, name_y)
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        let content_y = row_containing(&buffer, "Body.").unwrap();
         assert!(row_bg_equals(
             &buffer,
             content_y,
-            BgToken::UserMessageBg.color()
-        ));
-        let body_y = row_containing(&buffer, "Body.").unwrap();
-        assert!(row_bg_equals(
-            &buffer,
-            body_y,
-            BgToken::UserMessageBg.color()
+            BgToken::CustomMessageBg.color()
         ));
     }
 

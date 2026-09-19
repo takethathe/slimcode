@@ -24,7 +24,7 @@ use std::path::PathBuf;
 
 use slimcode_ai::TokenUsage;
 use slimcode_app::render::{DisplayItem, Renderer, usage_summary};
-use slimcode_app::skills::{Skill, skill_for_read_args};
+use slimcode_app::skills::{Skill, parse_skill_block, skill_for_read_args};
 use slimcode_core::agent::StopReason;
 use slimcode_core::session::{AgentMessage, Role};
 use slimcode_tui::footer::FooterUsage;
@@ -81,14 +81,15 @@ pub fn history_to_render_items(messages: &[AgentMessage]) -> Vec<RenderItem> {
     let mut tool_names: HashMap<&str, &str> = HashMap::new();
     // Skill reads were turned into skill active blocks: the tool result text
     // carries the `<skill>` block, so on replay it renders as a `Skill` block
-    // and the paired `read` call's start is suppressed.
-    let mut skill_results: HashMap<String, String> = HashMap::new();
+    // (name + inner content, the same split pi's `ParsedSkillBlock` uses) and
+    // the paired `read` call's start is suppressed.
+    let mut skill_results: HashMap<String, (String, String)> = HashMap::new();
     for message in messages {
         if *message.role() == Role::Tool {
             let text = message.text_content();
-            if let Some(name) = skill_block_name(&text) {
+            if let Some((name, content)) = parse_skill_block(&text) {
                 if let Some(id) = message.tool_call_id() {
-                    skill_results.insert(id.to_string(), name.to_string());
+                    skill_results.insert(id.to_string(), (name.to_string(), content.to_string()));
                 }
             }
         }
@@ -101,10 +102,10 @@ pub fn history_to_render_items(messages: &[AgentMessage]) -> Vec<RenderItem> {
                 // A skill-trigger user message starts with the `<skill>` block
                 // (the trigger injects it), so it replays as a skill block
                 // rather than a boxed prompt.
-                match skill_block_name(&text) {
-                    Some(name) => out.push(RenderItem::Skill {
+                match parse_skill_block(&text) {
+                    Some((name, content)) => out.push(RenderItem::Skill {
                         name: name.to_string(),
-                        content: text,
+                        content: content.to_string(),
                     }),
                     None => out.push(RenderItem::UserPrompt(text)),
                 }
@@ -133,10 +134,12 @@ pub fn history_to_render_items(messages: &[AgentMessage]) -> Vec<RenderItem> {
                     .tool_call_id()
                     .map(str::to_string)
                     .unwrap_or_default();
-                if let Some(skill_name) = skill_results.remove(tool_call_id.as_str()) {
+                if let Some((skill_name, skill_content)) =
+                    skill_results.remove(tool_call_id.as_str())
+                {
                     out.push(RenderItem::Skill {
-                        name: skill_name.to_string(),
-                        content: message.text_content(),
+                        name: skill_name,
+                        content: skill_content,
                     });
                     continue;
                 }
@@ -158,17 +161,6 @@ pub fn history_to_render_items(messages: &[AgentMessage]) -> Vec<RenderItem> {
     out
 }
 
-/// The skill name in a skill active block's opening tag, e.g. `grill` in
-/// `<skill name="grill" …>`, or `None` when `text` does not *start* with a
-/// skill block (a skill trigger prompt and the skill-serving tool result both
-/// start with it; a message merely quoting the tag mid-text is not one).
-fn skill_block_name(text: &str) -> Option<&str> {
-    let marker = "<skill name=\"";
-    let rest = text.strip_prefix(marker)?;
-    let end = rest.find('"')?;
-    Some(&rest[..end])
-}
-
 /// The TUI's view of a provider's cumulative usage (ADR-0014 D1): the CLI does
 /// the conversion, so `slimcode-tui` never names the AI type.
 pub fn to_footer_usage(usage: &TokenUsage) -> FooterUsage {
@@ -188,8 +180,9 @@ pub fn to_footer_usage(usage: &TokenUsage) -> FooterUsage {
 /// With a skills list (and a cwd to resolve read paths against), a `read` of
 /// a skill's `SKILL.md` renders as a [`RenderItem::Skill`] active block
 /// instead of a `read` tool block: the start is suppressed and the result
-/// becomes the skill block (the runner already replaced the file content with
-/// the `<skill>` block). Without skills the adapter is a plain mapper.
+/// becomes the skill block (name + inner content, split from the `<skill>`
+/// block the runner wrote in place of the file content). Without skills the
+/// adapter is a plain mapper.
 pub struct TuiAdapter<'a> {
     emit: &'a mut dyn FnMut(RenderItem),
     skills: Vec<Skill>,
@@ -245,9 +238,12 @@ impl Renderer for TuiAdapter<'_> {
                 ..
             } => {
                 if let Some(skill_name) = self.pending_skill.remove(tool_call_id) {
+                    let content = parse_skill_block(result)
+                        .map(|(_, inner)| inner.to_string())
+                        .unwrap_or_default();
                     (self.emit)(RenderItem::Skill {
                         name: skill_name,
-                        content: result.clone(),
+                        content,
                     });
                     return Ok(());
                 }
@@ -277,10 +273,10 @@ enum OpenLine {
 /// runner.
 ///
 /// With a skills list (and a cwd to resolve read paths against), a `read` of
-/// a skill's `SKILL.md` renders as a `[skill] <name>` active block instead of
-/// a `read` tool block: the start is suppressed and the result prints the
-/// skill block (the runner already replaced the file content with the
-/// `<skill>` block). Without skills the renderer prints tool blocks verbatim.
+/// a skill's `SKILL.md` renders as a `[skill] <name>` line instead of a `read`
+/// tool block: the start is suppressed and the result prints only the skill
+/// name (pi's collapsed skill block; the one-shot has no expand key). Without
+/// skills the renderer prints tool blocks verbatim.
 pub struct TextRenderer<'a> {
     out: &'a mut dyn Write,
     /// The kind of streamed line currently open (no trailing newline), if any
@@ -384,11 +380,10 @@ impl Renderer for TextRenderer<'_> {
 }
 
 impl TextRenderer<'_> {
-    /// Render a skill-read pair as a `[skill]` active block, returning `true`
-    /// when `item` was consumed. A `read` start naming an installed skill's
-    /// file is remembered (nothing printed); its result prints the `[skill]
-    /// <name>` header and the skill block content instead of a `read` tool
-    /// block.
+    /// Render a skill-read pair as a `[skill]` line, returning `true` when
+    /// `item` was consumed. A `read` start naming an installed skill's file is
+    /// remembered (nothing printed); its result prints `[skill] <name>` only —
+    /// the collapsed pi form, since the one-shot has no expand key.
     fn render_skill(&mut self, item: &DisplayItem) -> Result<bool, String> {
         match item {
             DisplayItem::ToolStart {
@@ -402,20 +397,13 @@ impl TextRenderer<'_> {
                     return Ok(true);
                 }
             }
-            DisplayItem::ToolResult {
-                tool_call_id,
-                result,
-                ..
-            } => {
+            DisplayItem::ToolResult { tool_call_id, .. } => {
                 if let Some(skill_name) = self.pending_skill.remove(tool_call_id) {
                     if self.open.is_some() {
                         writeln!(self.out).map_err(|e| e.to_string())?;
                         self.open = None;
                     }
                     writeln!(self.out, "  [skill] {skill_name}").map_err(|e| e.to_string())?;
-                    for line in result.lines() {
-                        writeln!(self.out, "    {line}").map_err(|e| e.to_string())?;
-                    }
                     self.out.flush().map_err(|e| e.to_string())?;
                     return Ok(true);
                 }
@@ -839,7 +827,7 @@ mod tests {
             vec![
                 RenderItem::Skill {
                     name: "grill".to_string(),
-                    content: skill_block.to_string(),
+                    content: "References are relative to /x.\n\nBody.".to_string(),
                 },
                 RenderItem::UserPrompt("look at <skill name=\"x\">".to_string()),
             ]
@@ -871,12 +859,13 @@ Body.
             }),
             AgentMessage::tool_result("call_skill", skill_block),
         ];
-        // The read's start is suppressed; its result becomes the skill block.
+        // The read's start is suppressed; its result becomes the skill block
+        // (name + inner content, the `location` tag split off).
         assert_eq!(
             history_to_render_items(&history),
             vec![RenderItem::Skill {
                 name: "grill".to_string(),
-                content: skill_block.to_string(),
+                content: "References are relative to /x.\n\n# Grill a plan\n\nBody.".to_string(),
             }]
         );
     }
@@ -913,7 +902,8 @@ Body.
                     tool_call_id: "c1".to_string(),
                     name: "read".to_string(),
                     ok: true,
-                    result: "<skill name=\"grill\">…</skill>".to_string(),
+                    result: "<skill name=\"grill\" location=\"/x/SKILL.md\">\nReferences are relative to /x.\n\nBody.\n</skill>"
+                        .to_string(),
                 })
                 .unwrap();
             // A plain read still renders as a tool block.
@@ -938,7 +928,7 @@ Body.
             vec![
                 RenderItem::Skill {
                     name: "grill".to_string(),
-                    content: "<skill name=\"grill\">…</skill>".to_string(),
+                    content: "References are relative to /x.\n\nBody.".to_string(),
                 },
                 RenderItem::ToolStart {
                     tool_call_id: "c2".to_string(),
@@ -983,15 +973,14 @@ Body.
                 tool_call_id: "c1".to_string(),
                 name: "read".to_string(),
                 ok: true,
-                result: "<skill name=\"grill\">line1</skill>".to_string(),
+                result: "<skill name=\"grill\" location=\"/x/SKILL.md\">line1\n</skill>"
+                    .to_string(),
             })
             .unwrap();
         }
         let out = String::from_utf8(buf).unwrap();
-        assert_eq!(
-            out,
-            "  [skill] grill\n    <skill name=\"grill\">line1</skill>\n"
-        );
+        // pi's collapsed skill block: the name only, no skill content.
+        assert_eq!(out, "  [skill] grill\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

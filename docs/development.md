@@ -238,17 +238,22 @@ provider config seam 见 ADR-0016，hook seam 见 ADR-0015）。折入自 ticket
   `skill_for_read_args` 解析 `read` 工具的路径/JSON 参数，命中 skill 自身 `SKILL.md` 时把这次
   读取当成 skill 激活（payload 文件如 references/scripts 不算）；
 - 显示层（cli `render.rs` / tui `app.rs`）：skill 激活统一显示为专用的 `[skill] <name>`
-  块，而非 read 工具块或普通用户输入。TUI 的 `/skill:name` 触发在提交前先 emit
-  `RenderItem::Skill`（块内容与提交文本一致，record: false）；`run_turn` 经
+  块（pi `SkillInvocationMessageComponent` 样式，`customMessageBg` 背景），而非 read 工具块或
+  普通用户输入。TUI 块默认**折叠**为一行 `[skill] <name> (Ctrl+O to expand)`（不显示 skill
+  正文），全局 Ctrl+O 展开时才显示名称与正文 markdown（与工具块共用展开开关）；
+  `parse_skill_block` 按 pi 的 `ParsedSkillBlock` 把 `<skill>` 块拆成 `(name, inner)`，
+  `RenderItem::Skill.content` 携带 inner（不含 XML 外壳）。TUI 的 `/skill:name` 触发在提交前
+  先 emit `RenderItem::Skill`；`run_turn` 经
   `run_turn_with_hooks`（app `runner.rs` 新增钩子接缝，`run_turn` 薄封装不传钩子）注入
   `before_tool` 钩子：拦截对 skill 自身 `SKILL.md` 的 `read`，以
   `ToolDecision::Skip(Ok(skill_prompt(...)))` 把 `<skill>` 块作为工具结果（已加载时附去重提示），
-  钩子内部用 turn 开始前的历史快照判断 `already_loaded`（避免把本次 prompt 自身的 `<skill>`
-  标记误判为已加载）；`TuiAdapter::with_skills` / `TextRenderer::with_skills` 记住被抑制的
-  skill-read 起止对，把结果渲染成 Skill 块；历史回放
-  `history_to_render_items` 前瞻识别内容以 `<skill name="` 开头的工具结果，同样抑制配对 read
-  的起止并渲染为 Skill 块；one-shot `run_once` 对开头的 `/skill:name` / `/{name}`（命中已安装
-  skill）直接注入 `skill_prompt` 作为用户消息，并接同样的 `before_tool` 钩子；
+  钩子用 turn 开始时的历史快照（**含**本次触发 prompt）判断 `already_loaded`，使 `/skill:name`
+  触发后模型再次 read 同一 skill 得到去重提示而非重复正文；`TuiAdapter::with_skills` /
+  `TextRenderer::with_skills` 记住被抑制的 skill-read 起止对，把结果拆成 Skill 块（TUI）
+  或打印 `[skill] <name>` 单行（one-shot，pi 折叠态）；历史回放
+  `history_to_render_items` 用 `parse_skill_block` 识别 skill 工具结果与 skill 触发用户消息，
+  抑制配对 read 的起止并渲染为 Skill 块；one-shot `run_once` 对开头的 `/skill:name` / `/{name}`
+  （命中已安装 skill）直接注入 `skill_prompt` 作为用户消息，并接同样的 `before_tool` 钩子；
 - `/` 补全（ADR-0005）：`CompletionItem { value, description }` + `complete(input,
   skills) -> Vec<CompletionItem>`——把 `slimcode-commands` 的每个命令拼写（规范名 + 别名）
   与每个已安装 skill 合成候选池，用 `fuzzy::fuzzy_match` 模糊排序（裸 `/` 按注册表顺序列全部，
@@ -378,7 +383,7 @@ CLI 拥有进程与应用生命周期；本 crate 拥有纯 `App` 状态机与�
   最后一项之后不插（复用同一幂等 gap 助手，故不会与下一 block 的 gap 叠加）；折行宽度
   扣除 quote 前缀、缩进与 marker 宽度，所有行不超出 pane。
 - **块感知 transcript（ADR-0006 D2）**：App 持有 `Vec<Entry>`（`Header` /
-  `UserPrompt` / `Assistant` / `Thinking` / `Tool` / `Notice` / `Error`），不再是
+  `UserPrompt` / `Assistant` / `Thinking` / `Tool` / `Skill` / `Notice` / `Error`），不再是
   扁平的逐 kind 行；流式文本/思考相邻片段仍按“同 kind 合并”规则拼进同一条目。
   用户消息是 `userMessageBg` 整块背景的 boxed markdown；assistant 文本/思考按
   pi markdown token 渲染（thinking italic 灰）；工具调用由 start/result 配成单个
@@ -386,7 +391,9 @@ CLI 拥有进程与应用生命周期；本 crate 拥有纯 `App` 状态机与�
   头部是 `toolcall` 模块产出的紧凑调用标题 —— `read <path>:<range>` / `ls <path>` /
   `grep /pattern/ in <scope>` / `$ command` 等，不再显示 JSON 参数区；未知工具保留
   bold 名 + pretty JSON 兜底；标题下方灰色输出，超过 `TOOL_PREVIEW_LINES=10` 折叠为
-  `… (N more lines, Ctrl+O to expand)`，`Ctrl+O` 全局展开）；启动头部是 transcript 顶部的
+  `… (N more lines, Ctrl+O to expand)`，`Ctrl+O` 全局展开）；skill 激活是 `customMessageBg` 背景的
+  `Skill` 条目，默认折叠为一行 `[skill] <name> (Ctrl+O to expand)`（不显示正文），同一 `Ctrl+O`
+  展开为名称 + 正文 markdown；启动头部是 transcript 顶部的
   `Header` 条目（bold accent `slimcode` + dim ` v<version>` + 一行 dim 快捷键提示）；
   错误红字、notice dim；**不**渲染 turn 标记 / `done` 行 / 每轮用量行。`/new`、
   picker 载入会话会清空后重建会话视图（transcript 重插启动 Header、footer 用量归零、

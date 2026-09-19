@@ -296,13 +296,19 @@ impl TuiSession<'_> {
             let already_loaded = skill_loaded_in(&history, skill);
             // The skill active block is shown as its own display unit before
             // the turn starts, like the replay path shows the boxed prompt.
-            let content = skill_prompt(skill, arg, already_loaded);
+            // The display block carries the inner content (name/`location`
+            // split off), matching pi's `ParsedSkillBlock`; the TUI shows only
+            // the name until Ctrl+O expands it.
+            let text = skill_prompt(skill, arg, already_loaded);
+            let content = slimcode_app::skills::parse_skill_block(&text)
+                .map(|(_, inner)| inner.to_string())
+                .unwrap_or_default();
             emit(RenderItem::Skill {
                 name: skill.name.clone(),
-                content: content.clone(),
+                content,
             });
             return ControlFlow::Submit(Prompt {
-                text: content,
+                text,
                 record: false,
             });
         }
@@ -1145,13 +1151,22 @@ mod tests {
         assert!(prompt.text.ends_with("my plan"), "{}", prompt.text);
         assert!(prompt.text.contains("Body."), "{}", prompt.text);
         // The skill active block is shown as its own display unit before the
-        // turn starts (like the replay path shows the boxed prompt).
+        // turn starts (like the replay path shows the boxed prompt). The
+        // display block carries only the inner content, not the XML wrapper.
         assert_eq!(
             items,
             vec![RenderItem::Skill {
                 name: "grill".to_string(),
-                content: prompt.text.clone(),
+                content: slimcode_app::skills::parse_skill_block(&prompt.text)
+                    .unwrap()
+                    .1
+                    .to_string(),
             }]
+        );
+        assert!(
+            items
+                .iter()
+                .all(|i| !format!("{i:?}").contains("<skill name="))
         );
     }
 

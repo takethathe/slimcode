@@ -34,6 +34,11 @@ pub enum Token {
     MdListBullet,
     ToolTitle,
     ToolOutput,
+    /// The `[skill]` label of a skill active block (pi `customMessageLabel`).
+    CustomMessageLabel,
+    /// The skill name / content text of a skill active block (pi
+    /// `customMessageText`, which is pi's `text`).
+    CustomMessageText,
     /// Fullscreen scrollbar/bg variants that only need fg styling.
     BashMode,
 }
@@ -46,6 +51,9 @@ pub enum BgToken {
     ToolPendingBg,
     ToolSuccessBg,
     ToolErrorBg,
+    /// A skill active block's background (pi `customMessageBg`), distinct from
+    /// a user prompt box so an activated skill reads as its own display unit.
+    CustomMessageBg,
 }
 
 impl Token {
@@ -76,6 +84,8 @@ impl Token {
             MdListBullet => Color::Rgb(0x8a, 0xbe, 0xb7),
             ToolTitle => Color::Rgb(0xd4, 0xd4, 0xd4),
             ToolOutput => Color::Rgb(0x80, 0x80, 0x80),
+            CustomMessageLabel => Color::Rgb(0x95, 0x75, 0xcd),
+            CustomMessageText => Color::Rgb(0xd4, 0xd4, 0xd4),
             BashMode => Color::Rgb(0xb5, 0xbd, 0x68),
         }
     }
@@ -91,6 +101,7 @@ impl BgToken {
             ToolPendingBg => Color::Rgb(0x28, 0x28, 0x32),
             ToolSuccessBg => Color::Rgb(0x28, 0x32, 0x28),
             ToolErrorBg => Color::Rgb(0x3c, 0x28, 0x28),
+            CustomMessageBg => Color::Rgb(0x2d, 0x28, 0x38),
         }
     }
 }
@@ -146,6 +157,8 @@ mod tests {
         assert_eq!(MdListBullet.color(), Color::Rgb(0x8a, 0xbe, 0xb7));
         assert_eq!(ToolTitle.color(), Color::Rgb(0xd4, 0xd4, 0xd4));
         assert_eq!(ToolOutput.color(), Color::Rgb(0x80, 0x80, 0x80));
+        assert_eq!(CustomMessageLabel.color(), Color::Rgb(0x95, 0x75, 0xcd));
+        assert_eq!(CustomMessageText.color(), Color::Rgb(0xd4, 0xd4, 0xd4));
         assert_eq!(BashMode.color(), Color::Rgb(0xb5, 0xbd, 0x68));
         // mdCode is defined as pi's accent, mdLinkUrl as pi's dimGray.
         assert_eq!(MdCode.color(), Accent.color());
@@ -161,6 +174,7 @@ mod tests {
         assert_eq!(ToolPendingBg.color(), Color::Rgb(0x28, 0x28, 0x32));
         assert_eq!(ToolSuccessBg.color(), Color::Rgb(0x28, 0x32, 0x28));
         assert_eq!(ToolErrorBg.color(), Color::Rgb(0x3c, 0x28, 0x28));
+        assert_eq!(CustomMessageBg.color(), Color::Rgb(0x2d, 0x28, 0x38));
     }
 
     /// fg/bg produce styles carrying exactly the token color.

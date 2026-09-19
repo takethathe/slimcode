@@ -30,7 +30,11 @@ references it explicitly as `/{name}`. A model `read` of the skill's own
 in the TUI both the `/skill:name` trigger and a skill-reading `read` render as
 a dedicated `[skill] <name>` block rather than a plain prompt or tool block; the
 one-shot CLI injects the block for a leading `/skill:name` or `/{name}` trigger.
-If the
+The TUI block mirrors pi's `SkillInvocationMessageComponent`: collapsed to one
+`[skill] <name> (Ctrl+O to expand)` line by default (the skill content is hidden),
+expanded by the global Ctrl+O flag to the name plus the content. The block's
+content is the inner `<skill>` block (name/`location` split off, pi's
+`ParsedSkillBlock`). If the
 skill was already loaded in an earlier message of the same conversation, its body
 is replaced by an already-loaded notice (the base-dir line is kept, and the notice
 re-states the skill's base directory and where to search its resources —
