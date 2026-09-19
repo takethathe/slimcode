@@ -38,9 +38,11 @@ pub enum DisplayItem {
     },
     /// The run ended.
     Stop(StopReason),
-    /// Token usage after a run. Frontend-owned: never produced by `map_event`;
-    /// the frontend reads its concrete provider's total usage and feeds this
-    /// to its renderer itself (spec §Implementation Decisions).
+    /// Token usage of the request that just produced an assistant message.
+    /// Frontend-owned in the sense that `map_event` never produces it: the
+    /// runner emits one per assistant message that carried usage (ticket 03),
+    /// and the frontend may hand it straight to its renderer for the footer
+    /// (spec §Implementation Decisions).
     Usage(TokenUsage),
 }
 
@@ -81,7 +83,7 @@ pub fn map_event(e: &AgentEvent) -> Option<DisplayItem> {
         // Per-message events are storage seams, not display units: the runner
         // forwards them to the session layer's sink separately (ADR-0009 D5),
         // so the rendered transcript is byte-identical to before.
-        AgentEvent::Message(_) => None,
+        AgentEvent::Message { .. } => None,
         AgentEvent::Stop(reason) => Some(DisplayItem::Stop(reason.clone())),
     }
 }
@@ -327,7 +329,10 @@ mod tests {
         // The per-message event feeds the session layer's sink, never the
         // transcript: it must not map to a DisplayItem.
         use slimcode_core::session::{AgentMessage, Role};
-        let e = AgentEvent::Message(AgentMessage::text(Role::Assistant, "hi"));
+        let e = AgentEvent::Message {
+            message: AgentMessage::text(Role::Assistant, "hi"),
+            usage: None,
+        };
         assert!(map_event(&e).is_none());
     }
 

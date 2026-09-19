@@ -24,7 +24,7 @@ use ratatui::widgets::Paragraph;
 use tui_textarea::{CursorMove, TextArea};
 use unicode_width::UnicodeWidthChar;
 
-use crate::footer::FooterUsage;
+use crate::footer::{ContextUsage, FooterUsage};
 use crate::handler::{CompletionItem, CompletionProvider, Prompt};
 use crate::markdown::render_markdown;
 use crate::render::{RenderItem, SessionRow};
@@ -88,7 +88,7 @@ const PICKER_HINT: &str = "  Esc cancel · ↑/↓ move · PgUp/PgDn page · Ent
 const PICKER_EMPTY_HINT: &str = "  Esc close";
 
 /// Immutable status-line state shown at the bottom of the screen.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct StatusLine {
     /// Working directory the turn runs in.
     pub cwd: String,
@@ -105,6 +105,12 @@ pub struct StatusLine {
     /// feeds the live session's accumulated usage after each turn (ADR-0018
     /// D4); the provider's running total stops at the runtime seam.
     pub usage: FooterUsage,
+    /// The footer's context-window segment (ticket 04): estimated by the CLI
+    /// with the app layer's estimator, fed per assistant message and on
+    /// session changes. `None` only in the brief transition after a
+    /// [`RenderItem::SessionChanged`] before the CLI re-establishes it
+    /// (ticket 05); the footer hides the segment then.
+    pub context: Option<ContextUsage>,
 }
 
 /// Lifecycle state of a paired tool block.
@@ -300,13 +306,15 @@ pub struct App {
 impl App {
     /// Create a fresh app in "ready" state. `version` feeds the startup
     /// header block; `completions` is the CLI's `/`-candidate provider
-    /// (ADR-0014 D3).
+    /// (ADR-0014 D3); `context` seeds the footer's context segment (the
+    /// fresh session's 0%-estimate at startup, ticket 05).
     pub fn new(
         cwd: impl Into<String>,
         session_id: impl Into<String>,
         model: impl Into<String>,
         version: impl Into<String>,
         completions: Box<dyn CompletionProvider>,
+        context: ContextUsage,
     ) -> Self {
         let mut app = App {
             transcript: Vec::new(),
@@ -318,6 +326,7 @@ impl App {
                 running: false,
                 branch: None,
                 usage: FooterUsage::default(),
+                context: Some(context),
             },
             completions,
             history: Vec::new(),
@@ -932,9 +941,10 @@ impl App {
     }
 
     /// Render the pi-style two-line dock footer (ADR-0006 D5): line 1 = dim
-    /// `~/path (branch) • session`, line 2 = dim stats with the model
-    /// right-aligned; both truncated to the pane width. Composed from pure
-    /// footer-formatting functions so the layout is unit-testable.
+    /// `~/path (branch) • session`, line 2 = dim stats + the context segment
+    /// (colored by its level) with the model right-aligned; both truncated to
+    /// the pane width. Composed from pure footer-formatting functions so the
+    /// layout is unit-testable.
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
         if area.is_empty() || area.width < 2 {
             return;
@@ -950,12 +960,31 @@ impl App {
         let line1 = crate::footer::truncate_width_str(&pwd, width);
 
         let stats = crate::footer::stats_parts(&self.status.usage);
-        let line2 = crate::footer::stats_line(&stats, &self.status.model, width);
+        // The context segment (ticket 04): its own text plus the level, so
+        // the renderer can color it. Hidden when the status has no context
+        // yet (the SessionChanged transition, ticket 05).
+        let context = self
+            .status
+            .context
+            .map(|c| crate::footer::context_part(c.percent, c.window));
+        let (stats_text, ctx_segment, model_part) = crate::footer::stats_line_with_context(
+            &stats,
+            context.as_ref().map(|(text, _)| text.as_str()),
+            &self.status.model,
+            width,
+        );
+        let mut spans = vec![Span::styled(stats_text, fg(Token::Dim))];
+        if let (Some(ctx_text), Some((_, level))) = (ctx_segment, &context) {
+            let style = match level {
+                crate::footer::ContextLevel::Critical => fg(Token::Error),
+                crate::footer::ContextLevel::Warn => fg(Token::Warning),
+                crate::footer::ContextLevel::Normal => fg(Token::Dim),
+            };
+            spans.push(Span::styled(ctx_text, style));
+        }
+        spans.push(Span::styled(model_part, fg(Token::Dim)));
 
-        let rows = vec![
-            Line::styled(line1, fg(Token::Dim)),
-            Line::styled(line2, fg(Token::Dim)),
-        ];
+        let rows = vec![Line::styled(line1, fg(Token::Dim)), Line::from(spans)];
         frame.render_widget(Paragraph::new(rows), area);
     }
 
@@ -1111,7 +1140,12 @@ impl App {
             RenderItem::Skill { name, content } => {
                 self.transcript.push(Entry::Skill { name, content })
             }
-            RenderItem::Usage(usage) => self.status.usage = usage,
+            RenderItem::Usage { usage, context } => {
+                self.status.usage = usage;
+                // The context segment tracks the latest estimate; `None` hides
+                // it (the SessionChanged transition).
+                self.status.context = context;
+            }
             RenderItem::Branch(branch) => self.status.branch = branch,
             // The picker takes over the frame; opening it leaves the
             // transcript (and its parked view) untouched.
@@ -1127,11 +1161,15 @@ impl App {
             // state with it. The startup header returns, the footer's usage
             // restarts at zero (usage belongs to the live session, ADR-0018
             // D4) and any open picker closes; the CLI emits the accompanying
-            // notice as its own item.
+            // notice as its own item. The context segment belongs to the
+            // session that just left: it hides until the CLI re-establishes it
+            // with the follow-up Usage item, so a switching session never
+            // shows stale context (ticket 05).
             RenderItem::SessionChanged { id } => {
                 self.transcript.clear();
                 self.transcript.push(Entry::Header);
                 self.status.usage = FooterUsage::default();
+                self.status.context = None;
                 self.status.session_id = id;
                 self.picker = None;
                 self.reset_view();
@@ -2074,6 +2112,7 @@ mod tests {
             "model-x",
             "9.9.9",
             Box::new(FakeCompletions::new()),
+            ContextUsage::new(0.0, 200_000),
         )
     }
 
@@ -3016,7 +3055,10 @@ mod tests {
     #[test]
     fn session_changed_resets_header_usage_and_picker() {
         let mut app = seeded_app();
-        app.apply(RenderItem::Usage(FooterUsage::new(10, 5, 8, 2)));
+        app.apply(RenderItem::Usage {
+            usage: FooterUsage::new(10, 5, 8, 2),
+            context: Some(ContextUsage::new(45.3, 200_000)),
+        });
         app.apply(RenderItem::Text("old content".into()));
         open_picker(&mut app, picker_rows());
 
@@ -3026,12 +3068,17 @@ mod tests {
         assert!(app.picker.is_none());
         assert_eq!(app.status.session_id, "sess-9");
         assert_eq!(app.status.usage, FooterUsage::default());
+        // The context segment belongs to the session that just left: hidden
+        // until the CLI re-establishes it (ticket 05).
+        assert_eq!(app.status.context, None);
         assert_eq!(app.transcript, vec![Entry::Header]);
 
         let buffer = render_buffer(&mut app, 60, 12);
         assert!(buffer_contains(&buffer, "slimcode v9.9.9"));
         assert!(!buffer_contains(&buffer, "old content"));
         assert!(!buffer_contains(&buffer, "Sessions (this project)"));
+        // No stale context segment after the switch.
+        assert!(!buffer_contains(&buffer, "%/"));
     }
 
     #[test]
@@ -3117,7 +3164,10 @@ mod tests {
     #[test]
     fn usage_item_fills_the_footer_stats() {
         let mut app = seeded_app();
-        app.apply(RenderItem::Usage(FooterUsage::new(10, 5, 0, 0)));
+        app.apply(RenderItem::Usage {
+            usage: FooterUsage::new(10, 5, 0, 0),
+            context: Some(ContextUsage::new(0.0, 200_000)),
+        });
         let buffer = render_buffer(&mut app, 60, 12);
         assert!(buffer_contains(&buffer, "↑10"), "{}", line_at(&buffer, 11));
         assert!(buffer_contains(&buffer, "↓5"), "{}", line_at(&buffer, 11));
@@ -3126,7 +3176,10 @@ mod tests {
     #[test]
     fn usage_item_fills_the_cache_counters() {
         let mut app = seeded_app();
-        app.apply(RenderItem::Usage(FooterUsage::new(10, 5, 7, 3)));
+        app.apply(RenderItem::Usage {
+            usage: FooterUsage::new(10, 5, 7, 3),
+            context: Some(ContextUsage::new(0.0, 200_000)),
+        });
         let buffer = render_buffer(&mut app, 80, 12);
         assert!(buffer_contains(&buffer, "R7"), "{}", line_at(&buffer, 11));
         assert!(buffer_contains(&buffer, "W3"), "{}", line_at(&buffer, 11));
@@ -4084,7 +4137,10 @@ mod tests {
     fn footer_renders_two_dim_lines() {
         let mut app = seeded_app();
         app.apply(RenderItem::Branch(Some("main".to_string())));
-        app.apply(RenderItem::Usage(FooterUsage::new(1500, 500, 0, 0)));
+        app.apply(RenderItem::Usage {
+            usage: FooterUsage::new(1500, 500, 0, 0),
+            context: Some(ContextUsage::new(0.0, 200_000)),
+        });
         let h: u16 = 12;
         let buffer = render_buffer(&mut app, 60, h);
         // Footer occupies the bottom two rows.
@@ -4108,6 +4164,95 @@ mod tests {
         // No usage yet: stats line has no stats, just the model right-aligned.
         let line2 = line_at(&buffer, h - 1);
         assert!(line2.trim_end().ends_with("model-x"), "{line2:?}");
+    }
+
+    #[test]
+    fn footer_context_segment_colors_by_level() {
+        let h: u16 = 12;
+        // Normal (<= 70%): dim, sits after the stats with its own separator.
+        let mut app = seeded_app();
+        app.apply(RenderItem::Usage {
+            usage: FooterUsage::new(1500, 500, 0, 0),
+            context: Some(ContextUsage::new(45.3, 200_000)),
+        });
+        let buffer = render_buffer(&mut app, 60, h);
+        let line2 = line_at(&buffer, h - 1);
+        assert!(line2.contains("↑1.5k ↓500 45.3%/200k"), "{line2:?}");
+        let ctx_x = line2.find("45.3%/200k").unwrap() as u16;
+        assert_eq!(
+            cell_style(&buffer, ctx_x, h - 1).fg,
+            Some(Token::Dim.color()),
+            "normal context is dim"
+        );
+
+        // Warn (> 70%): yellow.
+        let mut app = seeded_app();
+        app.apply(RenderItem::Usage {
+            usage: FooterUsage::default(),
+            context: Some(ContextUsage::new(80.0, 200_000)),
+        });
+        let buffer = render_buffer(&mut app, 60, h);
+        let line2 = line_at(&buffer, h - 1);
+        assert!(line2.contains("80%/200k"), "{line2:?}");
+        let ctx_x = line2.find("80%/200k").unwrap() as u16;
+        assert_eq!(
+            cell_style(&buffer, ctx_x, h - 1).fg,
+            Some(Token::Warning.color()),
+            "warn context is yellow"
+        );
+
+        // Critical (> 90%): red.
+        let mut app = seeded_app();
+        app.apply(RenderItem::Usage {
+            usage: FooterUsage::default(),
+            context: Some(ContextUsage::new(95.0, 200_000)),
+        });
+        let buffer = render_buffer(&mut app, 60, h);
+        let line2 = line_at(&buffer, h - 1);
+        assert!(line2.contains("95%/200k"), "{line2:?}");
+        let ctx_x = line2.find("95%/200k").unwrap() as u16;
+        assert_eq!(
+            cell_style(&buffer, ctx_x, h - 1).fg,
+            Some(Token::Error.color()),
+            "critical context is red"
+        );
+    }
+
+    #[test]
+    fn footer_hides_the_context_segment_until_usage_arrives() {
+        // Startup (ticket 05): the seeded context shows `0%/200k`; after a
+        // SessionChanged it hides until the CLI's follow-up Usage item.
+        let h: u16 = 12;
+        let mut app = seeded_app();
+        let buffer = render_buffer(&mut app, 60, h);
+        let line2 = line_at(&buffer, h - 1);
+        assert!(
+            line2.contains("0%/200k"),
+            "startup shows the empty context: {line2:?}"
+        );
+
+        let mut app = seeded_app();
+        app.apply(RenderItem::Usage {
+            usage: FooterUsage::new(10, 5, 0, 0),
+            context: Some(ContextUsage::new(45.3, 200_000)),
+        });
+        app.apply(RenderItem::SessionChanged {
+            id: "sess-9".into(),
+        });
+        let buffer = render_buffer(&mut app, 60, h);
+        let line2 = line_at(&buffer, h - 1);
+        assert!(
+            !line2.contains("45.3%/200k"),
+            "stale context must hide after a session switch: {line2:?}"
+        );
+        // The CLI's follow-up Usage re-establishes it.
+        app.apply(RenderItem::Usage {
+            usage: FooterUsage::default(),
+            context: Some(ContextUsage::new(0.0, 200_000)),
+        });
+        let buffer = render_buffer(&mut app, 60, h);
+        let line2 = line_at(&buffer, h - 1);
+        assert!(line2.contains("0%/200k"), "{line2:?}");
     }
 
     #[test]

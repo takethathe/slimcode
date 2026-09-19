@@ -146,7 +146,7 @@ impl Provider for BailianProvider {
         config: &ProviderConfig,
         cancel: &CancelToken,
         on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
-    ) -> Result<(), String> {
+    ) -> Result<Option<TokenUsage>, String> {
         let req = wire::WireRequest {
             model: &config.model,
             messages: wire::messages_to_wire(messages, config.cache),
@@ -217,7 +217,9 @@ impl Provider for BailianProvider {
             // The deltas that already arrived streamed out live; the torn tail
             // (and any usage the final chunk would have carried) is dropped,
             // and the runner sees the cancel token and ends the turn cancelled.
-            return Ok(());
+            // A cancelled request never earned its tokens: `Ok(None)`, and
+            // nothing is counted into `last_usage` / `total_usage`.
+            return Ok(None);
         }
         // EOF: an event whose blank line never landed still counts, matching
         // the whole-body parser (`SseFramer::finish`).
@@ -228,7 +230,9 @@ impl Provider for BailianProvider {
         if let Some(u) = usage {
             accumulate_usage(&mut self.total_usage, u);
         }
-        Ok(())
+        // Usage rides the return value (spec §Implementation Decisions 1):
+        // the request's own usage, `None` when the response omitted it.
+        Ok(usage)
     }
 }
 
@@ -476,7 +480,7 @@ mod tests {
         let mut provider = BailianProvider::new().unwrap();
         let config = ProviderConfig::new("test-key", base, "test-model");
         let mut texts = String::new();
-        provider
+        let returned = provider
             .chat(
                 &[Message::text(Role::User, "hi")],
                 &[],
@@ -491,9 +495,68 @@ mod tests {
             )
             .expect("chat succeeds");
         assert_eq!(texts, "answer");
+        // The request's usage rides the return value (ticket 01).
+        assert_eq!(
+            returned,
+            Some(TokenUsage {
+                prompt_tokens: 7,
+                completion_tokens: 2,
+                total_tokens: 9,
+                prompt_tokens_details: None,
+            })
+        );
         assert_eq!(provider.last_usage.map(|u| u.total_tokens), Some(9));
         assert_eq!(provider.total_usage().total_tokens, 9);
         assert!(provider.total_usage().cached_tokens() == 0);
+    }
+
+    #[test]
+    fn a_cancelled_chat_returns_none_and_counts_no_usage() {
+        // Esc lands while the response is in flight: `chat` returns
+        // `Ok(None)` — a cancelled request never earned its tokens, even when
+        // its usage chunk had already arrived (the torn tail is dropped) — and
+        // neither `last_usage` nor `total_usage` move (ticket 01).
+        let base = spawn_sse_server(vec![
+            (Duration::ZERO, text_event("half")),
+            (
+                // Usage chunk lands late, after the cancel: it is read in
+                // flight (a blocking read always delivers) but dropped.
+                Duration::from_millis(600),
+                "{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[],\
+             \"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2,\"total_tokens\":9}}"
+                    .to_string(),
+            ),
+        ]);
+        let mut provider = BailianProvider::new().unwrap();
+        let config = ProviderConfig::new("test-key", base, "test-model");
+        let cancel = CancelToken::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel_for_chat = cancel.clone();
+        std::thread::spawn(move || {
+            let mut texts = String::new();
+            let result = provider.chat(
+                &[Message::text(Role::User, "hi")],
+                &[],
+                &config,
+                &cancel_for_chat,
+                &mut |delta| {
+                    if let Delta::Text(t) = delta {
+                        texts.push_str(&t);
+                    }
+                    Ok(())
+                },
+            );
+            let _ = tx.send((provider, texts, result));
+        });
+        std::thread::sleep(Duration::from_millis(150));
+        cancel.cancel();
+        let (provider, texts, result) = rx.recv().unwrap();
+        assert_eq!(result, Ok(None));
+        // Deltas already handed over streamed out live; the tail did not
+        // count as a finished request.
+        assert_eq!(texts, "half");
+        assert_eq!(provider.last_usage, None);
+        assert_eq!(provider.total_usage(), TokenUsage::default());
     }
 
     #[test]

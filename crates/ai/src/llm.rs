@@ -118,6 +118,14 @@ pub trait Provider {
     /// checks it between body chunks and aborts the read as soon as it is
     /// set, keeping the deltas that already streamed out (the caller sees the
     /// token set and ends the turn as cancelled).
+    ///
+    /// Returns the request's token usage on success — it is part of the LLM
+    /// response (the final SSE chunk carries `choices:[]` + usage, see
+    /// `wire::WireChunk`) and flows out with the return value instead of a
+    /// separate callback (spec §Implementation Decisions 1): `Some(usage)`
+    /// when the response completed on its own terms and carried usage,
+    /// `None` when the request was cancelled (an unfinished response never
+    /// earns tokens and never counts anywhere). HTTP errors stay `Err`.
     fn chat(
         &mut self,
         messages: &[Message],
@@ -125,13 +133,13 @@ pub trait Provider {
         config: &ProviderConfig,
         cancel: &CancelToken,
         on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
-    ) -> Result<(), String>;
+    ) -> Result<Option<TokenUsage>, String>;
 
     /// Cumulative usage across every request this provider has run.
     ///
-    /// Frontends read it after a turn for their token-usage display (ADR-0004);
-    /// it is part of the trait so a frontend can hold a boxed provider without
-    /// naming the concrete one (ADR-0013). Providers that do not track usage
+    /// Kept as the provider's own running total (tests read it; the footer
+    /// no longer depends on it — the session's usage is accumulated from the
+    /// per-request returns, ADR-0018 D4). Providers that do not track usage
     /// keep the zero default.
     fn total_usage(&self) -> TokenUsage {
         TokenUsage::default()
@@ -148,7 +156,7 @@ impl<T: Provider + ?Sized> Provider for Box<T> {
         config: &ProviderConfig,
         cancel: &CancelToken,
         on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
-    ) -> Result<(), String> {
+    ) -> Result<Option<TokenUsage>, String> {
         (**self).chat(messages, tools, config, cancel, on_delta)
     }
 

@@ -66,6 +66,12 @@ where the footer used to keep showing the previous session's numbers. A resumed 
 session starts at zero; usage is not persisted, so a restarted session forgets it. This is
 deliberate: pi persists per-entry usage, the owner chose not to.
 
+> **Amended by ADR-0020 D6**: the session still owns the total and the display still reads it,
+> but the accumulation is now event-driven — each assistant message carries its request's usage
+> (`Provider::chat` return value → `AgentEvent::Message`), so the footer updates per assistant
+> reply instead of once per turn, and the turn-end provider diff is gone. `Provider::total_usage`
+> is now read only for the compaction call's own cost.
+
 ### D5 — A row is the title, the record count and the file's mtime
 
 Rows are ordered by modification time, newest first, and read `title ?? id` on the left with

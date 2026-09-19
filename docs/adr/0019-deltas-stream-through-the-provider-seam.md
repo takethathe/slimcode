@@ -82,6 +82,11 @@ The usage sample rides the final chunk. It is captured while streaming but assig
 to `last_usage` / `total_usage` only after a complete read, and skipped on a
 cancelled one — the behaviour the buffered path had by returning early.
 
+> **Extended by ADR-0020 D6**: the same captured sample is now also the `chat`
+> return value (`Ok(Some(usage))`; `Ok(None)` on cancel), so it leaves the
+> provider with the response rather than only through the internal accounting
+> fields. Nothing about *when* it is captured changed.
+
 ## Consequences
 
 - Every provider — the real one and each test fake — must push its deltas through
@@ -90,6 +95,8 @@ cancelled one — the behaviour the buffered path had by returning early.
 - `Provider::chat` takes five arguments; ADR-0016 D3's config seam is unchanged in
   substance (its "four arguments" sentence is superseded here), and this ADR
   supersedes ADR-0006 D6a's description of the cancel-time salvage parse.
+- `Provider::chat` also returns `Result<Option<TokenUsage>, String>` (ADR-0020 D6),
+  so every provider implementation must return its request's usage rather than `()`.
 - A response that dies mid-answer now shows the text that already arrived *plus*
   the error, where it previously showed only the error. Partial output on a torn
   stream is the point of streaming; the assistant message still does not enter

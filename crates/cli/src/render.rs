@@ -19,6 +19,7 @@
 
 use std::io::Write;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -27,7 +28,7 @@ use slimcode_app::render::{DisplayItem, Renderer, usage_summary};
 use slimcode_app::skills::{Skill, parse_skill_block, skill_for_read_args};
 use slimcode_core::agent::StopReason;
 use slimcode_core::session::{AgentMessage, Role};
-use slimcode_tui::footer::FooterUsage;
+use slimcode_tui::footer::{ContextUsage, FooterUsage};
 use slimcode_tui::render::RenderItem;
 
 /// Convert one display item into the TUI's vocabulary (ADR-0014 D1).
@@ -60,7 +61,12 @@ pub fn to_render_item(item: &DisplayItem) -> Option<RenderItem> {
             ok: *ok,
             result: result.clone(),
         },
-        DisplayItem::Usage(u) => RenderItem::Usage(to_footer_usage(u)),
+        DisplayItem::Usage(u) => RenderItem::Usage {
+            usage: to_footer_usage(u),
+            // The adapter overrides this with the live session's estimate; a
+            // direct mapping (tests) has no context yet.
+            context: None,
+        },
         DisplayItem::Turn { .. } | DisplayItem::Stop(_) => return None,
     })
 }
@@ -181,6 +187,42 @@ pub fn to_footer_usage(usage: &TokenUsage) -> FooterUsage {
     )
 }
 
+/// Estimate the live session's context-window usage the way the compaction
+/// trigger does — the same estimator and the same window, so the footer's
+/// percentage and the auto-compact trigger always agree (ticket 04).
+pub fn to_context_usage(messages: &[AgentMessage]) -> ContextUsage {
+    let window = slimcode_app::compaction::estimated_context_window() as u64;
+    let total = slimcode_app::compaction::estimate_total_tokens(messages) as u64;
+    let percent = if window == 0 {
+        0.0
+    } else {
+        total as f64 / window as f64 * 100.0
+    };
+    ContextUsage::new(percent, window)
+}
+
+/// A shared, in-turn view of the live session's usage-relevant state (ticket
+/// 04): the message history (for the context estimate) and the session's
+/// accumulated usage (what the footer shows, ADR-0018 D4). The CLI's
+/// persistence hook keeps it in lockstep with the session; the adapter reads
+/// it when a `DisplayItem::Usage` arrives — after the hook ran, so the view
+/// already includes the just-completed assistant message and its usage.
+pub struct LiveUsageView {
+    pub messages: Vec<AgentMessage>,
+    pub usage: TokenUsage,
+}
+
+impl LiveUsageView {
+    /// A fresh view over an empty history and zero usage (tests).
+    #[cfg(test)]
+    pub fn empty() -> Self {
+        Self {
+            messages: Vec::new(),
+            usage: TokenUsage::default(),
+        }
+    }
+}
+
 /// The CLI's TUI adapter (ADR-0014 D2): a [`Renderer`] that runs on the turn's
 /// worker thread and feeds each item into the library's emit callback. The
 /// library owns the channel and the frame loop; the CLI only decides how a
@@ -199,18 +241,22 @@ pub struct TuiAdapter<'a> {
     /// `tool_call_id` → skill name for suppressed skill-read starts, paired to
     /// their result when it arrives (parallel batches keep several pending).
     pending_skill: HashMap<String, String>,
+    /// The live session view: read to build the footer's usage + context item
+    /// when a `DisplayItem::Usage` arrives (ticket 04).
+    live: &'a RefCell<LiveUsageView>,
 }
 
 impl<'a> TuiAdapter<'a> {
     /// Only the tests build a plain adapter; production always uses
     /// [`TuiAdapter::with_skills`], which carries the CLI's skill context.
     #[cfg(test)]
-    pub fn new(emit: &'a mut dyn FnMut(RenderItem)) -> Self {
+    pub fn new(emit: &'a mut dyn FnMut(RenderItem), live: &'a RefCell<LiveUsageView>) -> Self {
         Self {
             emit,
             skills: Vec::new(),
             cwd: PathBuf::new(),
             pending_skill: HashMap::new(),
+            live,
         }
     }
 
@@ -220,12 +266,14 @@ impl<'a> TuiAdapter<'a> {
         emit: &'a mut dyn FnMut(RenderItem),
         skills: Vec<Skill>,
         cwd: PathBuf,
+        live: &'a RefCell<LiveUsageView>,
     ) -> Self {
         Self {
             emit,
             skills,
             cwd,
             pending_skill: HashMap::new(),
+            live,
         }
     }
 }
@@ -259,6 +307,20 @@ impl Renderer for TuiAdapter<'_> {
                     });
                     return Ok(());
                 }
+            }
+            // The footer's usage + context item (ticket 04): the CLI's
+            // persistence hook ran before this render, so the shared live view
+            // already holds the session's history including the just-completed
+            // assistant message and the accumulated usage. Both numbers come
+            // from the session (ADR-0018 D4), not from the per-request usage
+            // this item carries.
+            DisplayItem::Usage(_) => {
+                let live = self.live.borrow();
+                (self.emit)(RenderItem::Usage {
+                    usage: to_footer_usage(&live.usage),
+                    context: Some(to_context_usage(&live.messages)),
+                });
+                return Ok(());
             }
             _ => {}
         }
@@ -743,7 +805,10 @@ mod tests {
             ),
             (
                 DisplayItem::Usage(usage),
-                Some(RenderItem::Usage(FooterUsage::new(10, 5, 8, 2))),
+                Some(RenderItem::Usage {
+                    usage: FooterUsage::new(10, 5, 8, 2),
+                    context: None,
+                }),
             ),
             (DisplayItem::Turn { turn: 3 }, None),
             (DisplayItem::Stop(StopReason::Completed), None),
@@ -759,7 +824,8 @@ mod tests {
         let mut emitted: Vec<RenderItem> = Vec::new();
         {
             let mut record = |item: RenderItem| emitted.push(item);
-            let mut adapter = TuiAdapter::new(&mut record);
+            let live = RefCell::new(LiveUsageView::empty());
+            let mut adapter = TuiAdapter::new(&mut record, &live);
             adapter
                 .render(&DisplayItem::Text("answer".to_string()))
                 .unwrap();
@@ -769,6 +835,58 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(emitted, vec![RenderItem::Text("answer".to_string())]);
+    }
+
+    #[test]
+    fn tui_adapter_emits_usage_with_a_context_estimate() {
+        // Ticket 04: the adapter turns a DisplayItem::Usage into a
+        // RenderItem::Usage carrying the footer's context segment — the
+        // session's accumulated usage plus an estimate over the live session
+        // history, computed with the app layer's estimator and window (the
+        // same ones the compaction trigger uses).
+        let mut emitted: Vec<RenderItem> = Vec::new();
+        let messages = vec![AgentMessage::text(Role::User, "x".repeat(40_000))];
+        let expected = to_context_usage(&messages);
+        let live = RefCell::new(LiveUsageView {
+            messages: messages.clone(),
+            usage: TokenUsage {
+                prompt_tokens: 12_000,
+                completion_tokens: 500,
+                total_tokens: 12_500,
+                ..Default::default()
+            },
+        });
+        {
+            let mut record = |item: RenderItem| emitted.push(item);
+            let mut adapter = TuiAdapter::new(&mut record, &live);
+            // The DisplayItem's own usage is ignored: the footer reads the
+            // session view (ADR-0018 D4).
+            adapter
+                .render(&DisplayItem::Usage(TokenUsage {
+                    prompt_tokens: 999,
+                    ..Default::default()
+                }))
+                .unwrap();
+        }
+        assert_eq!(
+            emitted,
+            vec![RenderItem::Usage {
+                usage: FooterUsage::new(12_000, 500, 0, 0),
+                context: Some(expected),
+            }]
+        );
+        // The estimate is the compaction estimator's: 40k chars / 4 = 10k
+        // tokens over a 200k window = 5%.
+        assert_eq!(
+            slimcode_app::compaction::estimate_total_tokens(&messages),
+            10_000
+        );
+        assert_eq!(expected, ContextUsage::new(5.0, 200_000));
+        // Sanity: the same window the compaction trigger reads.
+        assert_eq!(
+            slimcode_app::compaction::estimated_context_window(),
+            200_000
+        );
     }
 
     #[test]
@@ -918,7 +1036,8 @@ Body.
         let mut emitted: Vec<RenderItem> = Vec::new();
         {
             let mut record = |item: RenderItem| emitted.push(item);
-            let mut adapter = TuiAdapter::with_skills(&mut record, skills, cwd.clone());
+            let live = RefCell::new(LiveUsageView::empty());
+            let mut adapter = TuiAdapter::with_skills(&mut record, skills, cwd.clone(), &live);
             // A read of the skill's own file: start suppressed, result becomes
             // the skill block.
             adapter

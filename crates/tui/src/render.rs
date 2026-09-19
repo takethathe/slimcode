@@ -7,7 +7,7 @@
 //! the TUI's transcript state machine — the merge and tool-pairing rules in
 //! [`App::apply`](crate::app::App::apply) — is independent of the runtime.
 
-use crate::footer::FooterUsage;
+use crate::footer::{ContextUsage, FooterUsage};
 
 /// One unit of display state the TUI applies.
 ///
@@ -16,7 +16,7 @@ use crate::footer::FooterUsage;
 /// state that is not derived from an event — notices and errors, the tokens
 /// summary, the git branch and a new/loaded session. Both kinds travel the same
 /// channel so the TUI has exactly one way in.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum RenderItem {
     /// A streamed assistant text fragment (no trailing newline implied).
     Text(String),
@@ -46,8 +46,14 @@ pub enum RenderItem {
     /// distinct boxed block with a `[skill] <name>` header instead of a
     /// generic user prompt or a `read` tool block.
     Skill { name: String, content: String },
-    /// The session's accumulated token usage for the footer stats line.
-    Usage(FooterUsage),
+    /// The session's accumulated token usage for the footer stats line, plus
+    /// the context-window segment. `context` is `None` only in the brief
+    /// transition after a [`RenderItem::SessionChanged`], before the CLI
+    /// re-establishes it; the footer hides the segment then (ticket 05).
+    Usage {
+        usage: FooterUsage,
+        context: Option<ContextUsage>,
+    },
     /// The current git branch (`None` outside a repository).
     Branch(Option<String>),
     /// A new or loaded session: clear the transcript and point the status line

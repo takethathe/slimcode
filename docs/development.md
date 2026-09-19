@@ -52,7 +52,8 @@ cargo workspace，六个 crate，唯一二进制 `slimcode`：
   `Provider` trait 是同步 seam，真实阻塞边界收在 provider 内部，不引入 tokio；ticket 02 文档中 `stream` feature
   仅 async 路径需要。响应体按 chunk **增量**读取并**增量**解析（ADR-0019：`read_stream_interruptibly` 每块检查
   `CancelToken`，`wire::SseFramer` 把每个完整 SSE 事件一凑齐就交给 `on_delta`，因此前端在服务端仍在生成时就能
-  渲染半截答案）；读取中途取消则直接丢弃残缺尾巴（已流出的 deltas 保留、不记 usage），不再有整段 body 的 salvage
+  渲染半截答案）；读取中途取消则直接丢弃残缺尾巴（已流出的 deltas 保留），`chat` 返回
+  `Ok(None)` 且不记 `last_usage` / `total_usage`（取消的请求没赚到 token），不再有整段 body 的 salvage
   重解析。阻塞 reqwest 没有 per-read 超时——静默服务器仍由客户端 300s 整体超时兜底；
 - **请求**：`stream: true` + `stream_options.include_usage: true`（ticket 05 实测 usage 只在带 `choices: []` 的最终 chunk 出现）；
   工具用 `role: tool` 消息回传结果；声明了 tools 时额外带 `parallel_tool_calls: true`
@@ -72,7 +73,10 @@ cargo workspace，六个 crate，唯一二进制 `slimcode`：
   （`cached_tokens` / `cache_creation_input_tokens`，缺省视为 0；整块缺省为 None），
   访问器 `cached_tokens()` / `cache_creation_tokens()` 缺省返回 0；`accumulate_usage` 把两个缓存字段
   随 prompt/completion/total 一起并入 `total_usage`；汇总行措辞由
-  `app::render::usage_summary` 共享（cli 与 TUI 各渲染点都消费它，两端不漂移）；
+  `app::render::usage_summary` 共享（cli 与 TUI 各渲染点都消费它，两端不漂移）。
+  `chat` 返回 `Result<Option<TokenUsage>, String>`（ADR-0020 D6）：本次请求自己的用量（端点未带时为
+  `None`，取消时也为 `None`），runner 把它挂在 assistant 的 `AgentEvent::Message` 上；provider 自计的
+  `last_usage` / `total_usage` 仍保留（压缩费用归结与既有测试用），但 footer 不再读它；
 - **serde 容忍清单**（全部不设 `deny_unknown_fields`，未知字段自动忽略）：
   - `reasoning_content`：思考模型每个 chunk 都带，`Option<String>`；
   - `usage`：key 每 chunk 都在但多为 `null`，`Option<TokenUsage>`（解析后进入 `last_usage` / `total_usage`）；
@@ -286,10 +290,11 @@ provider config seam 见 ADR-0016，hook seam 见 ADR-0015）。折入自 ticket
   替代的旧记录由 **load** 边界丢弃（见下节 `compaction`）；
 - `compaction`（spec `.scratch/compact`）：自动压缩的纯逻辑与 LLM 执行。
   - 估算与阈值：`estimate_message_tokens` 用 `字符数 / 4` 向上取整（连同工具调用的 name+arguments），
-    `estimate_total_tokens` 求和，`estimated_context_window()` = 128_000；`should_compact` 在总量超过
-    窗口 92% 且最新一条不是 `CompactSummary` 时为真；
+    `estimate_total_tokens` 求和，`estimated_context_window()` = 200_000；`should_compact` 在总量
+    ≥ 窗口 − `MIN_CONTEXT_REMAINING`（16_000，即剩 ≤16k 空 context）且最新一条不是
+    `CompactSummary` 时为真；
   - `compact_messages(provider, &ProviderConfig, &CancelToken, &[AgentMessage])`：从末尾向前累计
-    token 到 `keep_recent_tokens()`（窗口 8%，且不落在 `tool` 结果上，避免拆散 tool call/result），
+    token 到 `keep_recent_tokens()`（窗口 8% = 16_000，且不落在 `tool` 结果上，避免拆散 tool call/result），
     把边界之前的 span（去掉旧 `CompactSummary`）序列化成 `[User]: …` / `[Assistant]: …` /
     `[Assistant tool calls]: read(path="a.rs")` / `[Tool result]: …`（result 截断到 2000 字符），
     用 pi 的 `SUMMARIZATION_SYSTEM_PROMPT` + `SUMMARIZATION_PROMPT`/`UPDATE_SUMMARIZATION_PROMPT`
@@ -315,15 +320,17 @@ provider config seam 见 ADR-0016，hook seam 见 ADR-0015）。折入自 ticket
 - `tools`：把七工具 factory 绑定到启动 `cwd`。
 - `render`（ADR-0004）：前端无关的显示模型。`DisplayItem` 是渲染单元（turn 标记 /
   流式文本片段 / 思考行 / 工具开始与结果 / 停止标记 / token 用量）；
-  `map_event(AgentEvent) -> Option<DisplayItem>` 是事件→显示单元的共享纯映射；
+  `map_event(AgentEvent) -> Option<DisplayItem>` 是事件→显示单元的共享纯映射
+  （`AgentEvent::Message` 不映射到任何单元，其 usage 由 runner 的 sink 单独播出）；
   `usage_summary(TokenUsage) -> String` 是 token 用量汇总行（含 `({cached} cached, {pct}%)`
   与缓存命中百分比）的共享措辞，cli 汇总与 TUI `/usage` 都消费它；
   `Renderer` trait 消费 `DisplayItem`，每个前端只实现自己的渲染器（cli 的文本行、
   tui 的 widget 状态）。
 - `runner`：共享 turn runner `run_turn(provider, tools, context: Context, &RunConfig, &ProviderConfig,
-  &CancelToken, &mut dyn Renderer, &mut dyn FnMut(&AgentMessage))
+  &CancelToken, &mut dyn Renderer, &mut dyn FnMut(&AgentMessage, Option<&TokenUsage>))
   -> Result<(Vec<AgentMessage>, StopReason), String>`（ADR-0012 D3 改为收 `Context`，ADR-0009 D5 加
-  `on_message` 回调与 `StopReason` 返回值，ADR-0016 加 `&ProviderConfig`）：逐事件流式回调渲染器，每条进历史的消息（assistant 回复、
+  `on_message` 回调与 `StopReason` 返回值，ADR-0016 加 `&ProviderConfig`，ADR-0020 D6 把
+  `AgentEvent::Message` 的 usage 一并交给 sink 并逐条播出 `DisplayItem::Usage`）：逐事件流式回调渲染器，每条进历史的消息（assistant 回复、
   每个工具结果）同步回调一次 sink（TUI 借此实时追加日志），返回更新后的消息历史与
   终止原因（`Completed`/`Cancelled`）。cli 与 tui 共用同一 turn 循环，行为不漂移。
 - `setup`：`setup(cwd) -> (BailianProvider, Vec<Tool>)` 共享 seam，cli 与
@@ -347,14 +354,16 @@ CLI 拥有进程与应用生命周期；本 crate 拥有纯 `App` 状态机与�
 
 - **自有显示词汇（ADR-0014 D1/D2）**：TUI 不消费 `app` 的 `DisplayItem`。`RenderItem`
   载 agent 流输出（`Text` / `Reasoning` / `ToolStart` / `ToolResult`）与 CLI 自有的状态
-  （`Notice` / `Error` / `UserPrompt` / `Usage(FooterUsage)` / `Branch` /
+  （`Notice` / `Error` / `UserPrompt` / `Usage { usage: FooterUsage, context: Option<ContextUsage> }` / `Branch` /
   `SessionChanged`），不含任何 `ai`/`core`/`app` 类型；`App::apply(RenderItem)` 是唯一
   入口，transcript 合并与工具配对规则仍是私有实现。三套词汇两层转换：`AgentEvent`
   （core）→ `DisplayItem`（app，共享 `map_event`）→ `RenderItem`（tui）；中间的适配器
   属于 **cli**（`cli/src/render.rs::TuiAdapter`，`Renderer` 实现），在 turn 的 worker
   线程上把每条 `DisplayItem` 转成 `RenderItem` 交给库的 emit 回调；`Turn` 与 `Stop` 被
-  丢弃（transcript 无 turn 标记、stop 不渲染）。`FooterUsage` 只保留平凡构造函数，token
-  用量换算在 CLI 侧完成，故 TUI 源码不出现 provider 的用量类型。`app` 的显示契约
+  丢弃（transcript 无 turn 标记、stop 不渲染）。`FooterUsage` / `ContextUsage` 只保留平凡构造函数，token
+  用量换算与 context 估算在 CLI 侧完成（估算器与压缩触发同源），故 TUI 源码不出现 provider 的用量类型
+  与消息历史。Usage 的 context 为 `Option`：`SessionChanged` 把上一会话的 context 段置空，等 CLI 的
+  后续 Usage 项重新建立（避免残留）。`app` 的显示契约
   （`DisplayItem` / `map_event` / `Renderer` / `usage_summary` / 共享 runner）保持原样。
 - **运行 seam（ADR-0013 D1/D2）**：库入口是 `tui::run(terminal, app, handler)`——
   terminal 与 app 由 CLI 构造好，`handler` 是 CLI 实现的 `UiHandler`：
@@ -435,7 +444,7 @@ CLI 拥有进程与应用生命周期；本 crate 拥有纯 `App` 状态机与�
   `scrollbar_ticks`（auto 模式滚动条：出现后 ~1s 淡出，与 scroll 位置无关）、
   `content_width` / `view_height`（最近一次 draw 的 transcript 面板宽度/高度，
   行宽折行与滚轮溢出判定都依据它）、
-  `status`（`cwd` / `session_id` / `branch` / `usage: FooterUsage` / `running` /
+  `status`（`cwd` / `session_id` / `branch` / `usage: FooterUsage` / `context: Option<ContextUsage>` / `running` /
   `spinner_frame`）、注入的 `completions` provider、全局 `tool_output_expanded`、
   `version`。`handle_key` / `handle_key_running` / `handle_mouse` / `tick()`（推进 spinner 帧、递减滚动条
   淡出计数）是纯 reducer；`Effect` 只有六个变体——`SubmitPrompt(Prompt)`（打字的 prompt
@@ -469,10 +478,13 @@ CLI 拥有进程与应用生命周期；本 crate 拥有纯 `App` 状态机与�
   （不按指针下区域分派）。
 - **Footer / 状态指示器（ADR-0006 D5/D6）**：两行 dim footer 由纯函数拼装——第一行
   `~/cwd (branch) • session`（`footer::format_cwd_for_footer`：只在词法上位于 `$HOME`
-  内时缩写为 `~` / `~/rel`），第二行 `stats_line`（`↑in ↓out Rcache WcacheWrite
+  内时缩写为 `~` / `~/rel`），第二行 `stats_line_with_context`：dim 统计（`↑in ↓out Rcache WcacheWrite
   CH{pct}%`，零值省略；`format_tokens` 与 pi 同表：<1000 原样、<10k `x.xk`、<1M 取整
-  `xk`、<10M `x.xM`、否则取整 `M`），模型名右对齐，宽度不足时右侧截断。footer 的用量由
-  CLI 每轮以 `RenderItem::Usage` 喂入（换算在 CLI 侧）。运行中把 `⠋ Working...`
+  `xk`、<10M `x.xM`、否则取整 `M`）+ 按等级着色的 context 段（`context_part(percent, window)`
+  → `45.3%/200k`；`ContextLevel`：≤70 dim / >70 黄 / >90 红，仅该段着色）+ 右对齐的模型名，
+  宽度不足时先截模型名、极端情况再连同统计+context 一起截。footer 的用量由
+  CLI 每条 assistant 消息以 `RenderItem::Usage` 喂入（换算与 context 估算都在 CLI 侧），
+  启动/`/new` 为 `0%/200k`、载入会话按恢复历史估算。运行中把 `⠋ Working...`
   （braille 帧、80ms 一帧）嵌入输入框上边框左侧，整行用运行色（borderAccent 青）渲染，
   空闲恢复纯 `─` 上边框（不再占独立状态行）。
 - **worker-thread turn runner（ADR-0006 D6/D6a，ADR-0013 D2）**：`run` 在提交一轮时建
@@ -542,7 +554,7 @@ stdout 是否 TTY）：
   skills、context files、environment，并实现**全部命令语义**（`/help` / `/new` / `/session` /
   `/usage` / `/compact` / `/history` / `/skills` / `/install-skill` / `/exit` / `/!!` /
   `/!N` / skill 触发 / 未知命令 + did-you-mean）、每轮的上下文组装与会话落盘、失败/取消
-  收尾。每轮 `Completed` 后按 `compaction::should_compact` 自动压缩（超 92% 才触发），
+  收尾。每轮 `Completed` 后按 `compaction::should_compact` 自动压缩（剩 ≤16k 空 context 才触发），
   `/compact` 强制压缩；两者都走 `run_compaction`（调 `compaction::compact_messages`、把
   `CompactSummary` 追加到日志、替换 `session.messages`），失败只报错不改历史。`/session` 在 UI 线程同步扫 `store.entries()`，把每个摘要拼成
   `SessionRow { id, title: title ?? id, meta: "N msgs  YYYY-MM-DD HH:MM" }` 后发
@@ -555,9 +567,11 @@ stdout 是否 TTY）：
   `/install-skill` 后就地刷新）。
 - `render`：两个 `Renderer` 实现。`TextRenderer` 把共享 `DisplayItem` 流（流式文本 / 流式思考 / 结构行 / 用量汇总）渲染为终端输出，原始 tool_call delta 与
   `Done` 事件被抑制；流式文本与思考（带 `> ` 前缀）按 delta 拼接、不逐 delta 换行，换行只来自内容本身的 `\n`，结构行（工具开始/结果、停止标记、turn 标记）总是另起一行；事件→DisplayItem 的映射是共享的 `app::render::map_event`。
-  `TuiAdapter`（ADR-0014 D2）持有库给的 emit 回调，在 turn 的 worker 线程上把每条
+  `TuiAdapter`（ADR-0014 D2）持有库给的 emit 回调与一个共享的
+  `LiveUsageView`（session 消息历史 + 累计用量，由 CLI 的 on_message 钩子与 session 同步），在 turn 的 worker 线程上把每条
   `DisplayItem` 转为 `slimcode_tui::render::RenderItem`；`Turn`/`Stop` 丢弃，`Usage` 经
-  `to_footer_usage` 完成 `TokenUsage → FooterUsage` 换算（表驱动单测覆盖每个变体）。
+  `to_footer_usage` 完成 `TokenUsage → FooterUsage` 换算、并以 `to_context_usage`（与压缩触发同一
+  `chars/4` 估算器与 200k 窗口）从 `LiveUsageView` 组装 context 段（表驱动单测覆盖每个变体）。
   `DisplayItem` / `Renderer` / `map_event` / `usage_summary` / `run_turn` 仍全在 `app`
   （ADR-0004 未变）。
 - provider + 工具构造经 `app::setup::setup` 与 TUI 共享，两端不会漂移。

@@ -32,6 +32,7 @@ use std::collections::BTreeMap;
 // here so callers can keep importing them from the runtime module.
 pub use slimcode_ai::config::ProviderConfig;
 pub use slimcode_ai::llm::{CancelToken, Delta, FinishReason, Provider, ToolSpec};
+pub use slimcode_ai::wire::TokenUsage;
 
 /// A registered tool the agent can invoke: the schema the provider sees plus
 /// the closure that executes it.
@@ -135,7 +136,15 @@ pub enum AgentEvent {
     /// every tool result as it is pushed (ADR-0009 D2/D5). The session layer
     /// persists these as they happen; nothing here touches a file. Serial and
     /// parallel tool execution alike emit one event per result.
-    Message(AgentMessage),
+    ///
+    /// `usage` is the provider's `chat` return for the request that produced
+    /// this message: `Some` on the assistant replies (the Stop and ToolCalls
+    /// branches alike), `None` on tool results, which never earn tokens
+    /// (ticket 02).
+    Message {
+        message: AgentMessage,
+        usage: Option<TokenUsage>,
+    },
     Stop(StopReason),
 }
 
@@ -318,8 +327,8 @@ impl<'a> AgentRunner<'a> {
                     Ok(())
                 },
             );
-            match result {
-                Ok(()) => {}
+            let usage = match result {
+                Ok(usage) => usage,
                 // A provider error that landed together with a cancel (its
                 // interruptible read aborted) is a silent cancelled stop, not
                 // an error.
@@ -327,10 +336,12 @@ impl<'a> AgentRunner<'a> {
                     break 'run StopReason::Cancelled;
                 }
                 Err(e) => return Err(e),
-            }
+            };
             // A cancel that landed during the request discards the half
             // message: the streamed deltas stay on the transcript, but no
-            // assistant message enters history.
+            // assistant message enters history. The request's usage is
+            // discarded with it — a cancelled request earned no tokens
+            // (ticket 02).
             if self.cancel.is_cancelled() {
                 break 'run StopReason::Cancelled;
             }
@@ -344,8 +355,15 @@ impl<'a> AgentRunner<'a> {
                 FinishReason::Stop => {
                     // Announce the history entry right after it is pushed, so
                     // the session layer persists the message at the moment it
-                    // exists (ADR-0009 D2).
-                    on_event_call(&mut self.on_event, AgentEvent::Message(asst))?;
+                    // exists (ADR-0009 D2). The request's usage rides along
+                    // (ticket 02).
+                    on_event_call(
+                        &mut self.on_event,
+                        AgentEvent::Message {
+                            message: asst,
+                            usage,
+                        },
+                    )?;
                     break 'run StopReason::Completed;
                 }
                 FinishReason::ToolCalls => {
@@ -353,7 +371,8 @@ impl<'a> AgentRunner<'a> {
                     // `execute_tools`, after the `before_tool` hooks have run:
                     // the session log, the display and the next request all
                     // carry the (possibly rewritten) message (ADR-0015 D3).
-                    let cancelled = self.execute_tools(&mut messages)?;
+                    // The request's usage rides along with it (ticket 02).
+                    let cancelled = self.execute_tools(&mut messages, usage)?;
                     if cancelled {
                         break 'run StopReason::Cancelled;
                     }
@@ -435,7 +454,11 @@ impl<'a> AgentRunner<'a> {
     /// not push its aborted result). Returns `Ok(true)` when a cancel stopped
     /// the batch before it finished (results already pushed stay; the caller
     /// stops with [`StopReason::Cancelled`]).
-    fn execute_tools(&mut self, messages: &mut Vec<AgentMessage>) -> Result<bool, String> {
+    fn execute_tools(
+        &mut self,
+        messages: &mut Vec<AgentMessage>,
+        usage: Option<TokenUsage>,
+    ) -> Result<bool, String> {
         // The assistant message holding this batch is the last element at
         // entry; serial finishes push tool results after it, so its index is
         // captured once and reused for every `before_tool` re-read.
@@ -481,10 +504,14 @@ impl<'a> AgentRunner<'a> {
         }
         // Announce the assistant history entry now that the hooks have run:
         // the session layer and the display see exactly the message that
-        // stays in history (ADR-0015 D3, ADR-0009 D2).
+        // stays in history (ADR-0015 D3, ADR-0009 D2). Its request's usage
+        // rides along (ticket 02).
         on_event_call(
             &mut self.on_event,
-            AgentEvent::Message(messages[asst_index].clone()),
+            AgentEvent::Message {
+                message: messages[asst_index].clone(),
+                usage,
+            },
         )?;
 
         if self.cfg.parallel_tools {
@@ -552,7 +579,13 @@ impl<'a> AgentRunner<'a> {
             for slot in final_msgs.iter_mut() {
                 if let Some(msg) = slot.take() {
                     messages.push(msg.clone());
-                    on_event_call(&mut self.on_event, AgentEvent::Message(msg))?;
+                    on_event_call(
+                        &mut self.on_event,
+                        AgentEvent::Message {
+                            message: msg,
+                            usage: None,
+                        },
+                    )?;
                 }
             }
         } else {
@@ -573,7 +606,13 @@ impl<'a> AgentRunner<'a> {
                 };
                 let msg = self.build_result(&effective[index], res)?;
                 messages.push(msg.clone());
-                on_event_call(&mut self.on_event, AgentEvent::Message(msg))?;
+                on_event_call(
+                    &mut self.on_event,
+                    AgentEvent::Message {
+                        message: msg,
+                        usage: None,
+                    },
+                )?;
             }
         }
         Ok(false)
@@ -634,6 +673,10 @@ mod tests {
         /// batch (1-based), simulating Esc arriving mid-request.
         cancel_on_call: Option<usize>,
         cancel: Option<CancelToken>,
+        /// Per-call usage returned from `chat` (default zero; `with_usage`
+        /// sets it) — the seam that lets tests assert the usage riding on the
+        /// assistant `Message` events (ticket 02).
+        usage: TokenUsage,
     }
 
     impl FakeProvider {
@@ -643,12 +686,18 @@ mod tests {
                 calls: 0,
                 cancel_on_call: None,
                 cancel: None,
+                usage: TokenUsage::default(),
             }
         }
 
         fn cancels_on(mut self, call: usize, token: &CancelToken) -> Self {
             self.cancel_on_call = Some(call);
             self.cancel = Some(token.clone());
+            self
+        }
+
+        fn with_usage(mut self, usage: TokenUsage) -> Self {
+            self.usage = usage;
             self
         }
     }
@@ -661,7 +710,7 @@ mod tests {
             _config: &ProviderConfig,
             _cancel: &CancelToken,
             on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
-        ) -> Result<(), String> {
+        ) -> Result<Option<TokenUsage>, String> {
             self.calls += 1;
             if let (Some(cancel), Some(n)) = (&self.cancel, self.cancel_on_call)
                 && self.calls == n
@@ -674,7 +723,7 @@ mod tests {
             for delta in d {
                 on_delta(delta)?;
             }
-            Ok(())
+            Ok(Some(self.usage))
         }
     }
 
@@ -896,7 +945,7 @@ mod tests {
         let announced: Vec<&AgentMessage> = events
             .iter()
             .filter_map(|e| match e {
-                AgentEvent::Message(m) => Some(m),
+                AgentEvent::Message { message, .. } => Some(message),
                 _ => None,
             })
             .collect();
@@ -905,6 +954,50 @@ mod tests {
             announced.iter().map(|m| (*m).clone()).collect::<Vec<_>>(),
             messages[1..]
         );
+    }
+
+    #[test]
+    fn usage_rides_on_assistant_messages_only() {
+        // Ticket 02: the provider's `chat` usage is attached to the assistant
+        // Message events — the Stop and ToolCalls branches alike — and tool
+        // results never carry one.
+        let usage = TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            prompt_tokens_details: None,
+        };
+        let script = vec![
+            vec![
+                tc_start(0, "call_1", "get_weather"),
+                tc_args(0, "{}"),
+                done_tools(),
+            ],
+            vec![t("25C"), done_stop()],
+        ];
+        let mut p = FakeProvider::new(script).with_usage(usage);
+        let tools = vec![weather_tool()];
+        let system = Message::text(Role::System, "be helpful");
+        let messages = vec![AgentMessage::text(Role::User, "weather in Beijing?")];
+        let (_, _, events) = run_with(
+            &mut p,
+            &tools,
+            RunConfig::default(),
+            &CancelToken::new(),
+            &system,
+            messages,
+        )
+        .unwrap();
+        let pairs: Vec<Option<TokenUsage>> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Message { usage, .. } => Some(*usage),
+                _ => None,
+            })
+            .collect();
+        // The tool-call reply and the final answer carry the request usage; the
+        // tool result in between carries none.
+        assert_eq!(pairs, vec![Some(usage), None, Some(usage)]);
     }
 
     #[test]
@@ -930,8 +1023,8 @@ mod tests {
                 AgentEvent::Stream(_) => "stream",
                 AgentEvent::ToolStart { .. } => "tool-start",
                 AgentEvent::ToolResult { .. } => "tool-result",
-                AgentEvent::Message(m) => {
-                    if m.role() == &Role::Assistant {
+                AgentEvent::Message { message, .. } => {
+                    if message.role() == &Role::Assistant {
                         "message-assistant"
                     } else {
                         "message-tool"
@@ -979,12 +1072,13 @@ mod tests {
                 _cfg: &ProviderConfig,
                 _c: &CancelToken,
                 on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
-            ) -> Result<(), String> {
+            ) -> Result<Option<TokenUsage>, String> {
                 on_delta(t("half "))?;
                 std::thread::sleep(std::time::Duration::from_millis(150));
                 self.returned.store(true, Ordering::SeqCst);
                 on_delta(t("answer"))?;
-                on_delta(done_stop())
+                on_delta(done_stop())?;
+                Ok(Some(TokenUsage::default()))
             }
         }
 
@@ -1296,7 +1390,7 @@ mod tests {
                 _cfg: &ProviderConfig,
                 _c: &CancelToken,
                 _on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
-            ) -> Result<(), String> {
+            ) -> Result<Option<TokenUsage>, String> {
                 Err("provider exploded".to_string())
             }
         }
@@ -1399,7 +1493,7 @@ mod tests {
                 _cfg: &ProviderConfig,
                 _c: &CancelToken,
                 _on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
-            ) -> Result<(), String> {
+            ) -> Result<Option<TokenUsage>, String> {
                 Err("request cancelled".to_string())
             }
         }
@@ -1991,7 +2085,9 @@ mod tests {
         let announced = events
             .iter()
             .find_map(|e| match e {
-                AgentEvent::Message(m) if m.role() == &Role::Assistant => Some(m.clone()),
+                AgentEvent::Message { message, .. } if message.role() == &Role::Assistant => {
+                    Some(message.clone())
+                }
                 _ => None,
             })
             .expect("assistant message event");
@@ -2134,7 +2230,7 @@ mod tests {
                 _cfg: &ProviderConfig,
                 _c: &CancelToken,
                 _on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
-            ) -> Result<(), String> {
+            ) -> Result<Option<TokenUsage>, String> {
                 Err("boom".to_string())
             }
         }

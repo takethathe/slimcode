@@ -4,11 +4,11 @@
 //! loop runs. This is the single turn loop both frontends share, so their
 //! behavior cannot drift.
 //!
-//! Errors stay `String`, matching the existing agent API. Token usage is NOT
-//! rendered here — it stays a frontend concern: after the run the frontend
-//! reads its concrete provider's total usage and feeds a
-//! [`DisplayItem::Usage`] to its renderer itself (spec §Implementation
-//! Decisions).
+//! Errors stay `String`, matching the existing agent API. Token usage flows
+//! through the message events (ticket 02): the runner forwards each request's
+//! usage with the assistant `Message` event, and the sink renders one
+//! [`DisplayItem::Usage`] per assistant message that carried usage (ticket
+//! 03). Tool results never carry usage, so nothing is rendered for them.
 //!
 //! Per-message events (ADR-0009 D5): the loop announces every message that
 //! enters history (assistant replies and each tool result). The runner
@@ -18,16 +18,23 @@
 
 use slimcode_core::agent::{
     AgentEvent, AgentMessage, AgentRunner, CancelToken, Provider, ProviderConfig, RunConfig,
-    RunHooks, StopReason, Tool,
+    RunHooks, StopReason, TokenUsage, Tool,
 };
 
 use crate::context::Context;
-use crate::render::{Renderer, map_event};
+use crate::render::{DisplayItem, Renderer, map_event};
+
+/// The runner's per-message sink: called with each message that enters history
+/// and the request's usage (`Some` on assistant replies, `None` on tool
+/// results). Errors abort the loop like a renderer error does.
+pub type MessageSink<'a> =
+    &'a mut dyn FnMut(&AgentMessage, Option<&TokenUsage>) -> Result<(), String>;
 
 /// Drive one agent turn over a [`Context`] (its system message plus the history
 /// with this turn's prompt), streaming every event to `renderer` live as the
-/// loop runs, forwarding each message that enters history to `on_message`,
-/// and returning the updated message history plus the stop reason.
+/// loop runs, forwarding each message that enters history to `on_message`
+/// (with the request's usage, `None` on tool results), and returning the
+/// updated message history plus the stop reason.
 ///
 /// The context's system message is assembled per request (ADR-0012 D3) and
 /// never enters the history; the runtime prepends it to `filter_map(to_llm)`
@@ -50,7 +57,7 @@ pub fn run_turn<P: Provider>(
     provider_config: &ProviderConfig,
     cancel: &CancelToken,
     renderer: &mut dyn Renderer,
-    on_message: &mut dyn FnMut(&AgentMessage) -> Result<(), String>,
+    on_message: MessageSink<'_>,
 ) -> Result<(Vec<AgentMessage>, StopReason), String> {
     run_turn_with_hooks(
         provider,
@@ -78,13 +85,21 @@ pub fn run_turn_with_hooks<P: Provider>(
     provider_config: &ProviderConfig,
     cancel: &CancelToken,
     renderer: &mut dyn Renderer,
-    on_message: &mut dyn FnMut(&AgentMessage) -> Result<(), String>,
+    on_message: MessageSink<'_>,
     hooks: RunHooks<'_>,
 ) -> Result<(Vec<AgentMessage>, StopReason), String> {
     let Context { system, messages } = context;
     let mut sink = |e: AgentEvent| {
         match &e {
-            AgentEvent::Message(m) => on_message(m)?,
+            AgentEvent::Message { message, usage } => {
+                on_message(message, usage.as_ref())?;
+                // One Usage display item per assistant message that carried
+                // usage; tool results carry none, so nothing renders for them
+                // (ticket 03).
+                if let Some(u) = usage {
+                    renderer.render(&DisplayItem::Usage(*u))?;
+                }
+            }
             _ => {
                 if let Some(item) = map_event(&e) {
                     renderer.render(&item)?;
@@ -154,15 +169,27 @@ mod tests {
     }
 
     /// Scripted provider: pops the next delta sequence per call (agent prior
-    /// art).
+    /// art). By default `chat` returns `Ok(None)` (no usage); `with_usage`
+    /// makes every call carry one, the seam that lets tests assert the
+    /// usage-forwarding sink behavior (ticket 03).
     struct FakeProvider {
         script: Vec<Vec<Delta>>,
         calls: usize,
+        usage: Option<TokenUsage>,
     }
 
     impl FakeProvider {
         fn new(script: Vec<Vec<Delta>>) -> Self {
-            Self { script, calls: 0 }
+            Self {
+                script,
+                calls: 0,
+                usage: None,
+            }
+        }
+
+        fn with_usage(mut self, usage: TokenUsage) -> Self {
+            self.usage = Some(usage);
+            self
         }
     }
 
@@ -174,7 +201,7 @@ mod tests {
             _config: &ProviderConfig,
             _cancel: &CancelToken,
             on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
-        ) -> Result<(), String> {
+        ) -> Result<Option<TokenUsage>, String> {
             let d = self.script.get(self.calls).cloned().unwrap_or_default();
             self.calls += 1;
             // A scripted provider mirrors the live one (ADR-0019): deltas go
@@ -182,7 +209,7 @@ mod tests {
             for delta in d {
                 on_delta(delta)?;
             }
-            Ok(())
+            Ok(self.usage)
         }
     }
 
@@ -226,8 +253,8 @@ mod tests {
     }
 
     /// A sink that accepts every message (no persistence in these tests).
-    fn noop_sink() -> impl FnMut(&AgentMessage) -> Result<(), String> {
-        |_| Ok(())
+    fn noop_sink() -> impl FnMut(&AgentMessage, Option<&TokenUsage>) -> Result<(), String> {
+        |_, _| Ok(())
     }
 
     /// Drive the agent loop directly (the runner the shared `run_turn` uses),
@@ -354,7 +381,9 @@ mod tests {
                 .iter()
                 .any(|i| matches!(i, DisplayItem::Stop(StopReason::Completed)))
         );
-        // No usage item: token usage is a frontend concern.
+        // No usage item: the default scripted provider returns no usage, so
+        // nothing renders (ticket 03 — usage rides the message events only
+        // when the provider reports it).
         assert!(
             renderer
                 .items
@@ -368,6 +397,110 @@ mod tests {
         assert!(updated.iter().any(|m| m.role() == &Role::Tool));
         assert_eq!(updated.last().unwrap().role(), &Role::Assistant);
         assert!(updated.last().unwrap().text_content().contains("25C"));
+    }
+
+    #[test]
+    fn usage_flows_through_the_message_events() {
+        // Ticket 03: a provider that returns per-request usage — the sink
+        // sees it with each assistant Message event and renders one Usage
+        // display item per assistant message (tool results carry none, so
+        // nothing renders for them).
+        let usage = TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            prompt_tokens_details: None,
+        };
+        let script = vec![
+            vec![
+                text("checking "),
+                tc_start(0, "call_1", "get_weather"),
+                tc_args(0, "{}"),
+                done_tools(),
+            ],
+            vec![text("25C"), done_stop()],
+        ];
+        let mut provider = FakeProvider::new(script).with_usage(usage);
+        let mut renderer = RecordingRenderer::new();
+        let cancel = CancelToken::new();
+        let mut usages: Vec<TokenUsage> = Vec::new();
+        let (_, stop) = run_turn(
+            &mut provider,
+            &[weather_tool()],
+            context(vec![user("weather?")]),
+            &RunConfig::default(),
+            &test_config(),
+            &cancel,
+            &mut renderer,
+            &mut |_, u| {
+                if let Some(u) = u {
+                    usages.push(*u);
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(stop, StopReason::Completed);
+        // The sink saw one usage per assistant message (the tool-call reply
+        // and the final answer); the tool result carried none.
+        assert_eq!(usages, vec![usage, usage]);
+        // One Usage display item per assistant message.
+        let rendered_usages = renderer
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                DisplayItem::Usage(u) => Some(*u),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rendered_usages, vec![usage, usage]);
+    }
+
+    #[test]
+    fn usage_is_discarded_on_a_cancelled_request() {
+        // A cancel that lands mid-request discards the request's usage: no
+        // assistant message enters history, so the sink sees nothing and no
+        // Usage item renders (ticket 02).
+        let usage = TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            prompt_tokens_details: None,
+        };
+        let cancel = CancelToken::new();
+        let mut provider =
+            FakeProvider::new(vec![vec![text("partial"), done_stop()]]).with_usage(usage);
+        let mut wrapped = CancelFirstProvider {
+            inner: &mut provider,
+            calls: 0,
+            cancel: cancel.clone(),
+        };
+        let mut renderer = RecordingRenderer::new();
+        let mut seen: usize = 0;
+        let (_, stop) = run_turn(
+            &mut wrapped,
+            &[],
+            context(vec![user("hi")]),
+            &RunConfig::default(),
+            &test_config(),
+            &cancel,
+            &mut renderer,
+            &mut |_, u| {
+                if u.is_some() {
+                    seen += 1;
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(stop, StopReason::Cancelled);
+        assert_eq!(seen, 0);
+        assert!(
+            !renderer
+                .items
+                .iter()
+                .any(|i| matches!(i, DisplayItem::Usage(_)))
+        );
     }
 
     #[test]
@@ -549,7 +682,7 @@ mod tests {
             &test_config(),
             &cancel,
             &mut renderer,
-            &mut |m| {
+            &mut |m, _| {
                 if m.role() == &Role::Tool {
                     seen.push(m.tool_call_id().unwrap_or_default().to_string());
                 }
@@ -594,10 +727,11 @@ mod tests {
                 config: &ProviderConfig,
                 _c: &CancelToken,
                 on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
-            ) -> Result<(), String> {
+            ) -> Result<Option<TokenUsage>, String> {
                 self.seen = Some((config.model.clone(), config.base_url.clone(), config.cache));
                 on_delta(text("ok"))?;
-                on_delta(done_stop())
+                on_delta(done_stop())?;
+                Ok(None)
             }
         }
         let mut provider = CapturingProvider { seen: None };
@@ -637,7 +771,7 @@ mod tests {
                 _cfg: &ProviderConfig,
                 _c: &CancelToken,
                 _on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
-            ) -> Result<(), String> {
+            ) -> Result<Option<TokenUsage>, String> {
                 Err("provider exploded".to_string())
             }
         }
@@ -765,7 +899,7 @@ mod tests {
             &test_config(),
             &cancel,
             &mut renderer,
-            &mut |m| {
+            &mut |m, _| {
                 seen.push(m.clone());
                 Ok(())
             },
@@ -797,7 +931,7 @@ mod tests {
             &test_config(),
             &cancel,
             &mut renderer,
-            &mut |_| Err("sink exploded".to_string()),
+            &mut |_, _| Err("sink exploded".to_string()),
         )
         .unwrap_err();
         assert!(err.contains("sink exploded"), "err: {err}");
@@ -818,7 +952,7 @@ mod tests {
             config: &ProviderConfig,
             _c: &CancelToken,
             on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
-        ) -> Result<(), String> {
+        ) -> Result<Option<TokenUsage>, String> {
             self.calls += 1;
             if self.calls == 1 {
                 self.cancel.cancel();

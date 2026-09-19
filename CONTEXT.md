@@ -160,7 +160,7 @@ A message in a Session's message history, owned by `slimcode-core`: the user/ass
 _Avoid_: session message (ambiguous with a session-log record), stored message
 
 **Compaction**:
-Replacing an older span of a Session's message history with one CompactSummary so a long conversation keeps fitting the context window. Compaction triggers after a completed turn once the estimated history exceeds 92% of the assumed window, or on demand with `/compact`; it keeps the most recent ~8% of history and asks the provider for a structured summary (merging any previous summary). A failed compaction leaves the history untouched.
+Replacing an older span of a Session's message history with one CompactSummary so a long conversation keeps fitting the context window. Compaction triggers after a completed turn once the estimated history leaves at most 16k tokens of the assumed 200k window (`estimate >= window − 16_000`), or on demand with `/compact`; it keeps the most recent 16k tokens (~8% of the window) and asks the provider for a structured summary (merging any previous summary). A failed compaction leaves the history untouched.
 _Avoid_: summarization (the LLM step inside compaction), truncation, pruning
 
 **CompactSummary**:
@@ -279,8 +279,12 @@ The fixed bottom region of the TUI (completion popup, editor, footer) that never
 _Avoid_: footer bar, bottom bar
 
 **Footer**:
-The bottom two lines: a dim cwd/branch/session line plus a dim token-stats line with the model name right-aligned. Distinct from the runner status embedded in the editor's top border.
+The bottom two lines: a dim cwd/branch/session line plus a dim token-stats line with the model name right-aligned and, after the stats, the ContextUsage segment (`45.3%/200k`) colored by its level (dim ≤ 70%, yellow > 70%, red > 90%). Distinct from the runner status embedded in the editor's top border.
 _Avoid_: status bar, statusline, status line
+
+**ContextUsage**:
+The footer's estimated share of the assumed context window: a `percent` (0–100) and the `window` size in tokens, owned by `slimcode-tui`. The CLI computes it with the app layer's compaction estimator and window (so the footer percentage and the auto-compact trigger always agree) and feeds it to the TUI with each assistant message's accumulated usage; the TUI renders it as the footer's context segment. Fully determined — slimcode uses a constant window and estimates it itself, so there is no pi-style unknown state. A SessionChanged hides it until the CLI re-establishes it.
+_Avoid_: context bar, token gauge, window usage
 
 **Status indicator**:
 The runner status embedded in the editor's top border while a turn runs: a braille spinner + "Working..." drawn left-aligned on the top `─` line, in the running border color (`borderAccent` cyan); idle is a plain `─` border line. Replaces the old separate spinner row above the editor (ADR-0007 D2).

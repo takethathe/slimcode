@@ -20,7 +20,7 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use slimcode_ai::ProviderConfig;
+use slimcode_ai::{ProviderConfig, TokenUsage};
 use slimcode_app::compaction;
 use slimcode_app::context::{ContextBuilder, Environment, skill_loaded_in};
 use slimcode_app::context_files::ContextFile;
@@ -42,7 +42,7 @@ use slimcode_tui::handler::{
 };
 use slimcode_tui::render::{RenderItem, SessionRow};
 
-use crate::render::{TuiAdapter, history_to_render_items};
+use crate::render::{LiveUsageView, TuiAdapter, history_to_render_items};
 
 /// Enter the TUI: build the runtime, take over the terminal, run the frame
 /// loop, and restore the terminal on every exit path.
@@ -73,6 +73,7 @@ pub fn run(
         model,
         slimcode_tui::VERSION,
         Box::new(completions.clone()),
+        crate::render::to_context_usage(&session.messages),
     );
     app.set_history(history.load().unwrap_or_default());
     app.apply(RenderItem::Branch(current_branch(cwd)));
@@ -355,12 +356,18 @@ impl TuiSession<'_> {
     }
 
     /// Start a fresh session: a new id, a cleared transcript, and a fresh
-    /// branch/title.
+    /// branch/title. The footer's usage + context restart: the Usage item
+    /// right after the SessionChanged re-establishes the context segment
+    /// (hidden by the change, ticket 05) at the fresh session's 0%-estimate.
     fn new_session(&self, emit: &mut dyn FnMut(RenderItem)) -> ControlFlow {
         let session = self.store.new_session();
         let id = session.id.clone();
         self.inner.lock().expect("session lock").session = session;
         emit(RenderItem::SessionChanged { id: id.clone() });
+        emit(RenderItem::Usage {
+            usage: crate::render::to_footer_usage(&TokenUsage::default()),
+            context: Some(crate::render::to_context_usage(&[])),
+        });
         emit(RenderItem::Notice(format!("new session: {id}")));
         emit(RenderItem::Branch(current_branch(&self.cwd)));
         set_title(&id, &self.cwd);
@@ -398,8 +405,19 @@ impl TuiSession<'_> {
         // Replay the loaded conversation into the transcript (before the
         // session moves into `self.inner`).
         let history_items = history_to_render_items(&session.messages);
+        // Usage is never persisted (ADR-0018 D4: it is a live-session
+        // concern), so a loaded session starts at zero; its context estimate
+        // comes from the restored history. Both feed the Usage item that
+        // re-establishes the footer's context segment after the change
+        // (hidden by SessionChanged, ticket 05).
+        let usage = session.usage;
+        let messages = session.messages.clone();
         self.inner.lock().expect("session lock").session = session;
         emit(RenderItem::SessionChanged { id: id.clone() });
+        emit(RenderItem::Usage {
+            usage: crate::render::to_footer_usage(&usage),
+            context: Some(crate::render::to_context_usage(&messages)),
+        });
         if let Some(title) = &title {
             emit(RenderItem::Notice(format!("  title: {title}")));
         }
@@ -654,9 +672,12 @@ impl TuiSession<'_> {
         session.usage = session
             .usage
             .saturating_add(&provider.total_usage().saturating_sub(&usage_before));
-        emit(RenderItem::Usage(crate::render::to_footer_usage(
-            &session.usage,
-        )));
+        // The footer updates with the compaction's own cost and the context
+        // segment re-estimates from the compacted history (ticket 04).
+        emit(RenderItem::Usage {
+            usage: crate::render::to_footer_usage(&session.usage),
+            context: Some(crate::render::to_context_usage(&session.messages)),
+        });
         let after = compaction::estimate_total_tokens(&session.messages);
         emit(RenderItem::Notice(format!(
             "context compacted: {before} → {after} tokens"
@@ -728,12 +749,20 @@ impl TuiSession<'_> {
             .session_path(&state.session.id)
             .map(|path| path.exists())
             .unwrap_or(false);
-        // Usage belongs to the live session (ADR-0018 D4): snapshot the
-        // provider's running total before the turn, then add the diff after
-        // it. A turn can issue several requests (the tool loop), so the diff
-        // — not one request's numbers — is what the session earned, and the
-        // snapshot keeps earlier turns (and earlier sessions) out of it.
-        let usage_before = state.provider.total_usage();
+        // Usage belongs to the live session (ADR-0018 D4): the hook below
+        // accumulates each request's usage into it as the assistant messages
+        // arrive (ticket 03), replacing the old turn-end provider diff.
+        //
+        // The TUI adapter reads a shared view of the session to build the
+        // footer's usage + context item (ticket 04): seeded with the session
+        // as it enters the turn (including this turn's prompt), the hook
+        // keeps it in lockstep before each render, so the estimate always
+        // includes the just-completed assistant message.
+        let live = std::cell::RefCell::new(LiveUsageView {
+            messages: state.session.messages.clone(),
+            usage: state.session.usage,
+        });
+        let live = &live;
         // Skill dedup history: the messages in play when the turn starts,
         // including this turn's prompt. A `/skill:name` trigger prompt already
         // carries the skill block, so a redundant `read` of the same skill in
@@ -753,16 +782,28 @@ impl TuiSession<'_> {
             &cfg,
             &self.config,
             cancel,
-            &mut TuiAdapter::with_skills(emit, skills.to_vec(), self.cwd.clone()),
-            &mut |msg: &AgentMessage| -> Result<(), String> {
+            &mut TuiAdapter::with_skills(emit, skills.to_vec(), self.cwd.clone(), live),
+            &mut |msg: &AgentMessage, usage: Option<&TokenUsage>| -> Result<(), String> {
                 // The message entered history: mirror it into the session and
                 // append it to the log. Persistence is best-effort — a storage
                 // hiccup must not abort the turn.
                 session.messages.push(msg.clone());
                 appended += 1;
+                // The request's usage (None on tool results) accumulates into
+                // the session (ticket 03); a cancelled request never produces
+                // an assistant message, so it never lands here.
+                if let Some(u) = usage {
+                    session.usage = session.usage.saturating_add(u);
+                }
                 if let Err(e) = self.store.append(session, msg) {
                     append_errors.push(e);
                 }
+                // Mirror into the adapter's live view *before* the sink
+                // renders the Usage item for this message, so the footer's
+                // estimate already includes it.
+                let mut live_view = live.borrow_mut();
+                live_view.messages.push(msg.clone());
+                live_view.usage = session.usage;
                 Ok(())
             },
             RunHooks {
@@ -794,14 +835,8 @@ impl TuiSession<'_> {
         for e in &append_errors {
             emit(RenderItem::Notice(format!("session log: {e}")));
         }
-        // Footer totals: the session's own accumulated usage, converted by the
-        // CLI (ADR-0014 D1).
-        session.usage = session
-            .usage
-            .saturating_add(&provider.total_usage().saturating_sub(&usage_before));
-        emit(RenderItem::Usage(crate::render::to_footer_usage(
-            &session.usage,
-        )));
+        // The footer's usage + context already flowed per assistant message
+        // through the adapter (ticket 03): no turn-end Usage emit.
         match result {
             Ok((_, StopReason::Completed)) => {
                 // Auto-compaction (spec `.scratch/compact`): only a completed
@@ -910,7 +945,7 @@ fn parse_replay_index(text: &str) -> Option<usize> {
 mod tests {
     use super::*;
 
-    use slimcode_tui::footer::FooterUsage;
+    use slimcode_tui::footer::{ContextUsage, FooterUsage};
     use std::fs;
 
     use slimcode_ai::wire::TokenUsage;
@@ -955,6 +990,9 @@ mod tests {
         /// Added to `usage` on every successful `chat`, the way the real
         /// provider's running total grows with each request of a turn.
         per_call: TokenUsage,
+        /// Cancel the shared token before returning the Nth call's batch
+        /// (1-based), simulating Esc arriving mid-request.
+        cancel_on_call: Option<usize>,
     }
 
     impl FakeProvider {
@@ -965,6 +1003,7 @@ mod tests {
                 fail_at: None,
                 usage: TokenUsage::default(),
                 per_call: TokenUsage::default(),
+                cancel_on_call: None,
             }
         }
 
@@ -977,6 +1016,7 @@ mod tests {
                 fail_at: Some(0),
                 usage: TokenUsage::default(),
                 per_call: TokenUsage::default(),
+                cancel_on_call: None,
             }
         }
 
@@ -987,12 +1027,19 @@ mod tests {
                 fail_at: None,
                 usage,
                 per_call: TokenUsage::default(),
+                cancel_on_call: None,
             }
         }
 
         /// Accumulate `usage` on every successful call.
         fn with_per_call(mut self, usage: TokenUsage) -> Self {
             self.per_call = usage;
+            self
+        }
+
+        /// Cancel the shared token as the Nth call (1-based) returns.
+        fn cancels_on(mut self, call: usize) -> Self {
+            self.cancel_on_call = Some(call);
             self
         }
     }
@@ -1003,11 +1050,14 @@ mod tests {
             _messages: &[Message],
             _tools: &[slimcode_core::agent::ToolSpec],
             _config: &ProviderConfig,
-            _cancel: &CancelToken,
+            cancel: &CancelToken,
             on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
-        ) -> Result<(), String> {
+        ) -> Result<Option<TokenUsage>, String> {
             if self.fail_at == Some(self.calls) {
                 return Err("boom".to_string());
+            }
+            if self.cancel_on_call == Some(self.calls + 1) {
+                cancel.cancel();
             }
             let batch = self.script.get(self.calls).cloned().unwrap_or_default();
             self.calls += 1;
@@ -1017,7 +1067,10 @@ mod tests {
             for delta in batch {
                 on_delta(delta)?;
             }
-            Ok(())
+            // The request's usage rides the return value (ticket 01): what
+            // the runner attaches to the assistant message event. The runner
+            // discards it when the cancel above won the race.
+            Ok(Some(self.per_call))
         }
 
         fn total_usage(&self) -> TokenUsage {
@@ -1592,12 +1645,24 @@ mod tests {
                 ..Default::default()
             }
         );
-        assert_eq!(
-            items.iter().rev().find_map(|item| match item {
-                RenderItem::Usage(usage) => Some(*usage),
+        // The footer updates per assistant message (ticket 03): one Usage
+        // item per assistant reply, each carrying the session usage
+        // accumulated so far (ADR-0018 D4 — the footer reads session.usage)
+        // plus a context estimate (ticket 04). The tool result in between
+        // carries none, so it emits no Usage item.
+        let usages: Vec<(FooterUsage, bool)> = items
+            .iter()
+            .filter_map(|item| match item {
+                RenderItem::Usage { usage, context } => Some((*usage, context.is_some())),
                 _ => None,
-            }),
-            Some(FooterUsage::new(20, 10, 0, 0))
+            })
+            .collect();
+        assert_eq!(
+            usages,
+            vec![
+                (FooterUsage::new(10, 5, 0, 0), true),
+                (FooterUsage::new(20, 10, 0, 0), true),
+            ]
         );
         assert_eq!(
             lines(&command(&mut handler, "/usage")),
@@ -1641,6 +1706,38 @@ mod tests {
     }
 
     #[test]
+    fn a_cancelled_request_contributes_no_usage() {
+        // Esc lands mid-request (ticket 02/03): the request earned no tokens,
+        // so the session's usage stays zero and no Usage item is emitted for
+        // it — the half message never enters history.
+        let fx = Fixture::new("cancel-usage");
+        let provider = FakeProvider::new(vec![vec![
+            Delta::Text("half".to_string()),
+            Delta::Done(FinishReason::Stop),
+        ]])
+        .with_per_call(TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            ..Default::default()
+        })
+        .cancels_on(1);
+        let handler = fx.handler(Box::new(provider), Vec::new());
+        let mut items = Vec::new();
+        handler
+            .submit(user_message("go"), &mut |item| items.push(item))
+            .expect("a cancelled turn is not an error");
+        assert_eq!(
+            handler.inner.lock().unwrap().session.usage,
+            TokenUsage::default()
+        );
+        assert!(
+            !items.iter().any(|i| matches!(i, RenderItem::Usage { .. })),
+            "no usage for a cancelled request: {items:?}"
+        );
+    }
+
+    #[test]
     fn new_session_resets_the_usage_to_zero() {
         let fx = Fixture::new("usage-new");
         let provider = FakeProvider::new(vec![vec![
@@ -1666,6 +1763,67 @@ mod tests {
             lines(&command(&mut handler, "/usage")),
             ["tokens: 0 prompt (0 cached, 0%) + 0 completion = 0 total"]
         );
+    }
+
+    #[test]
+    fn new_session_re_establishes_the_footer_context() {
+        // Ticket 05: the app hides the context segment on SessionChanged, so
+        // the CLI must emit a follow-up Usage item right after it — here the
+        // fresh session's `0%/200k`.
+        let fx = Fixture::new("ctx-new");
+        let mut handler = fx.handler(Box::new(FakeProvider::new(Vec::new())), Vec::new());
+        let items = command(&mut handler, "/new");
+        let changed = items
+            .iter()
+            .position(|i| matches!(i, RenderItem::SessionChanged { .. }))
+            .expect("SessionChanged");
+        let usage_at = items
+            .iter()
+            .position(|i| matches!(i, RenderItem::Usage { .. }))
+            .expect("follow-up Usage");
+        assert!(
+            changed < usage_at,
+            "context re-established after the change: {items:?}"
+        );
+        assert_eq!(
+            items[usage_at],
+            RenderItem::Usage {
+                usage: FooterUsage::default(),
+                context: Some(ContextUsage::new(0.0, 200_000)),
+            }
+        );
+    }
+
+    #[test]
+    fn load_session_re_establishes_the_footer_context_from_its_history() {
+        // Ticket 05: a loaded session starts at zero usage, and its context
+        // segment is the estimate over the restored history — the same
+        // estimator the compaction trigger uses.
+        let fx = Fixture::new("ctx-load");
+        let saved = saved_session(&fx.store, "old prompt", "old reply");
+        let expected =
+            crate::render::to_context_usage(&fx.store.load(&saved).unwrap().session.messages);
+        let mut handler = fx.handler(Box::new(FakeProvider::new(Vec::new())), Vec::new());
+        let (_, items) = drive(&mut handler, Effect::LoadSession { id: saved });
+        let changed = items
+            .iter()
+            .position(|i| matches!(i, RenderItem::SessionChanged { .. }))
+            .expect("SessionChanged");
+        let usage_at = items
+            .iter()
+            .position(|i| matches!(i, RenderItem::Usage { .. }))
+            .expect("follow-up Usage");
+        assert!(
+            changed < usage_at,
+            "context re-established after the change: {items:?}"
+        );
+        match &items[usage_at] {
+            RenderItem::Usage { usage, context } => {
+                assert_eq!(*usage, FooterUsage::default());
+                assert_eq!(*context, Some(expected));
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1806,6 +1964,7 @@ mod tests {
             fail_at: Some(1),
             usage: TokenUsage::default(),
             per_call: TokenUsage::default(),
+            cancel_on_call: None,
         };
         let tool = Tool::new("probe", "a probe", serde_json::json!({}), |_args| {
             Ok("probed".to_string())
@@ -1844,6 +2003,7 @@ mod tests {
             fail_at: Some(1),
             usage: TokenUsage::default(),
             per_call: TokenUsage::default(),
+            cancel_on_call: None,
         };
         let handler = fx.handler(Box::new(provider), Vec::new());
         let id = handler.session_id();
@@ -2027,7 +2187,7 @@ mod tests {
         let items = command(&mut handler, "/compact");
         // The usage footer refresh rides the same batch.
         assert!(
-            items.iter().any(|i| matches!(i, RenderItem::Usage(_))),
+            items.iter().any(|i| matches!(i, RenderItem::Usage { .. })),
             "{items:?}"
         );
         let lines: Vec<&str> = items

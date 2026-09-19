@@ -28,7 +28,6 @@ use slimcode_app::config::{self, Overrides};
 use slimcode_app::context::{ContextBuilder, Environment};
 use slimcode_app::context_files::{ContextFile, load_context_files, resolve_project_home};
 use slimcode_app::history::HistoryStore;
-use slimcode_app::render::{DisplayItem, Renderer};
 use slimcode_app::session::{SessionStore, project_key};
 use slimcode_app::skills::{
     Skill, SkillStore, find_skill, leading_skill_ref, normalize_skill_trigger, skill_for_read_args,
@@ -118,7 +117,7 @@ fn run_once(
         &config,
         &cancel,
         &mut renderer,
-        &mut |_| Ok(()),
+        &mut |_, _| Ok(()),
         slimcode_core::agent::RunHooks {
             before_tool: Some(Box::new(&mut |msg: &mut AgentMessage, index: usize| {
                 let Some(call) = msg.tool_calls().get(index) else {
@@ -141,8 +140,9 @@ fn run_once(
             ..Default::default()
         },
     )?;
-    let usage = provider.total_usage;
-    renderer.render(&DisplayItem::Usage(usage))?;
+    // Per-request usage already streamed into the renderer with each assistant
+    // message (ticket 03): no final total line, so a single-request turn does
+    // not print its usage twice.
     Ok(0)
 }
 

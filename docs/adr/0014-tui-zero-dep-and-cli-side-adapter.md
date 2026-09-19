@@ -15,7 +15,8 @@ Two frontends, three vocabularies: `AgentEvent` (core) → `DisplayItem` (app, s
 ### D1 — `RenderItem` is the TUI's display vocabulary
 
 `RenderItem` carries only what the TUI renders: `Text`, `Reasoning`, `ToolStart`, `ToolResult`,
-`Notice`, `Error`, `UserPrompt`, `Usage(FooterUsage)`, `Branch(Option<String>)`,
+`Notice`, `Error`, `UserPrompt`, `Usage { usage: FooterUsage, context: Option<ContextUsage> }`,
+`Branch(Option<String>)`,
 `SessionChanged { id }`.
 > **Amended by ticket 05**: the `Skills(Vec<SkillInfo>)` variant (and `SkillInfo` /
 > `SkillScope`) was dropped. With the completion pool injected at construction (D3) and `/skills`
@@ -23,12 +24,16 @@ Two frontends, three vocabularies: `AgentEvent` (core) → `DisplayItem` (app, s
 > would produce or consume had no reason to exist. CLI-owned state that is not derived from an
 `AgentEvent` (notices, an installed-skills refresh, a branch change, a loaded session, token usage)
 is emitted as `RenderItem`s too, so there is exactly one channel the TUI applies.
+> **Amended by the footer-context effort**: `Usage` widened from a bare `FooterUsage` to a struct
+> variant carrying the footer's context segment (`Option<ContextUsage>`; `None` only in the brief
+> transition after a `SessionChanged`, before the CLI re-establishes it).
 `DisplayItem::Turn` and `DisplayItem::Stop` are dropped by the adapter — the TUI already ignores
 them (the pi-aligned transcript has no turn markers and renders nothing for a stop).
 
-`Usage` carries `slimcode_tui::FooterUsage`, not `ai::TokenUsage`: the TUI's own footer type is
-already the one it draws, and keeping the AI type out of it is what makes the zero-dependency claim
-true. The CLI does the conversion.
+`Usage` carries `slimcode_tui::FooterUsage` (+ a `ContextUsage`), not `ai::TokenUsage`: the TUI's
+own footer types are
+already the ones it draws, and keeping the AI type out of it is what makes the zero-dependency claim
+true. The CLI does the conversion and the context estimate.
 
 ### D2 — The TUI's channel carries `RenderItem`; `App::apply` replaces `impl Renderer`
 
@@ -39,6 +44,12 @@ sends `RenderItem`s over the TUI's mpsc channel; the UI thread drains them into
 `Session`. The transcript merge/pairing rules (streaming text and reasoning merged into the last
 entry, tool start/result pairing on `tool_call_id`, status colours) stay private to `App`, with
 their `TestBackend` tests.
+
+> **Amended by the footer-context effort**: the adapter is no longer a pure mapper. It holds a
+> shared, CLI-maintained view of the live session (message history + accumulated usage) so that
+> when a usage item arrives it can estimate the footer's context segment from the session history
+> with the app layer's estimator. The TUI still sees none of that: the adapter emits a
+> `RenderItem::Usage` carrying plain `FooterUsage` + `ContextUsage` values.
 
 ### D3 — Command prediction is injected, not imported
 

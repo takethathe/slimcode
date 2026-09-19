@@ -25,11 +25,15 @@ use slimcode_core::session::{AgentMessage, Message, Role};
 
 /// Estimated context window (tokens) driving the compaction threshold. A
 /// single constant covers the mainstream models slimcode targets; the spec
-/// deliberately makes it non-configurable for v1.
-pub const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
+/// deliberately makes it non-configurable for v1. Raised from 128k to 200k
+/// (ticket 06): the models slimcode targets today advertise 200k contexts.
+pub const DEFAULT_CONTEXT_WINDOW: usize = 200_000;
 
-/// Compact once the estimated history exceeds this percentage of the window.
-const COMPACT_THRESHOLD_PERCENT: usize = 92;
+/// Compact once the estimated history leaves fewer than this many tokens of
+/// context headroom (`estimate >= window - MIN_CONTEXT_REMAINING`): a fixed
+/// 16k margin (ticket 06), so the trigger does not creep with the window
+/// size.
+const MIN_CONTEXT_REMAINING: usize = 16_000;
 
 /// Share of the window kept as recent history after a compaction.
 const KEEP_RECENT_PERCENT: usize = 8;
@@ -77,7 +81,11 @@ pub fn should_compact(messages: &[AgentMessage]) -> bool {
     {
         return false;
     }
-    estimate_total_tokens(messages) > estimated_context_window() * COMPACT_THRESHOLD_PERCENT / 100
+    // Compact once the estimate leaves at most MIN_CONTEXT_REMAINING tokens
+    // of headroom (ticket 06): `>= window - 16_000`, replacing the old
+    // percentage threshold.
+    estimate_total_tokens(messages)
+        >= estimated_context_window().saturating_sub(MIN_CONTEXT_REMAINING)
 }
 
 /// The recent-history token budget kept after a compaction.
@@ -385,7 +393,7 @@ fn truncate_for_summary(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use slimcode_core::agent::{FinishReason, ToolSpec};
+    use slimcode_core::agent::{FinishReason, TokenUsage, ToolSpec};
     use slimcode_core::session::ToolCall;
 
     /// A message carrying `chars` characters of text; `chars` is a multiple of
@@ -437,23 +445,26 @@ mod tests {
     }
 
     #[test]
-    fn context_window_is_the_128k_constant() {
-        assert_eq!(estimated_context_window(), 128_000);
-        // 92% threshold, 8% kept tail.
-        assert_eq!(keep_recent_tokens(), 10_240);
+    fn context_window_is_the_200k_constant() {
+        assert_eq!(estimated_context_window(), 200_000);
+        // 16k headroom trigger, 16k kept tail (ticket 06).
+        assert_eq!(keep_recent_tokens(), 16_000);
     }
 
     #[test]
-    fn should_compact_at_the_threshold_boundary() {
-        let threshold = estimated_context_window() * 92 / 100; // 117_760
-        // 91%: below.
-        let below = vec![text_message((threshold * 91 / 100) * 4)];
+    fn should_compact_when_remaining_context_drops_below_16k() {
+        // Ticket 06: compact once the estimate leaves at most 16k headroom,
+        // i.e. `estimate >= window - 16_000` (184k).
+        let threshold = estimated_context_window() - 16_000; // 184_000
+        // A hair under: not compacting.
+        let below = vec![text_message((threshold - 1) * 4)];
+        assert_eq!(estimate_total_tokens(&below), threshold - 1);
         assert!(!should_compact(&below));
-        // Exactly 92%: `>` is strict, so still not compacting.
+        // Exactly at the boundary (`>=` is inclusive): compacting.
         let exact = vec![text_message(threshold * 4)];
         assert_eq!(estimate_total_tokens(&exact), threshold);
-        assert!(!should_compact(&exact));
-        // 100% of the window: compacting.
+        assert!(should_compact(&exact));
+        // The full window: compacting.
         let full = vec![text_message(estimated_context_window() * 4)];
         assert!(should_compact(&full));
     }
@@ -522,14 +533,15 @@ mod tests {
             config: &ProviderConfig,
             _cancel: &CancelToken,
             on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
-        ) -> Result<(), String> {
+        ) -> Result<Option<TokenUsage>, String> {
             if self.fail {
                 return Err("provider exploded".to_string());
             }
             self.seen = Some(messages.to_vec());
             self.seen_config = Some(config.clone());
             on_delta(Delta::Text(self.reply.clone()))?;
-            on_delta(Delta::Done(FinishReason::Stop))
+            on_delta(Delta::Done(FinishReason::Stop))?;
+            Ok(Some(TokenUsage::default()))
         }
     }
 
@@ -700,7 +712,7 @@ mod tests {
         // The newest messages are a tool result whose assistant tool call is
         // too big to keep: the boundary must skip the orphaned result (so it
         // is summarized instead of kept without its call).
-        let huge = 10_250usize * 4; // > the 10_240-token keep budget
+        let huge = 16_100usize * 4; // > the 16_000-token keep budget
         let mut assistant = Message::text(Role::Assistant, "y".repeat(huge));
         assistant.tool_calls.push(ToolCall {
             id: "call_1".to_string(),

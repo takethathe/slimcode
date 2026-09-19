@@ -144,6 +144,113 @@ pub fn stats_line(stats: &[String], model: &str, width: usize) -> String {
     }
 }
 
+/// The context-window usage the footer's context segment shows: the
+/// estimated token share of the assumed window (`percent`, 0–100) and the
+/// window size. Always fully determined — slimcode uses a constant window and
+/// estimates it itself, so there is no pi `?` unknown state (ticket 04).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ContextUsage {
+    pub percent: f64,
+    pub window: u64,
+}
+
+impl ContextUsage {
+    /// Plain constructor (ADR-0014 D1): the CLI computes the percentage with
+    /// the app layer's estimator and window, so this crate never names an
+    /// estimator type.
+    pub fn new(percent: f64, window: u64) -> Self {
+        Self { percent, window }
+    }
+}
+
+/// How the footer colors the context segment (pi's thresholds, ticket 04).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextLevel {
+    /// <= 70%: dim, nothing to worry about.
+    Normal,
+    /// > 70%: warn color — the window is filling up.
+    Warn,
+    /// > 90%: error color — auto-compaction is close.
+    Critical,
+}
+
+/// Compose the context segment text + level for footer line 2: `45.3%/200k`.
+/// The percentage is rounded to one decimal and trimmed of a trailing `.0`
+/// (`0%`, `45.3%`); the window uses [`format_tokens`] (`200_000` → `200k`).
+pub fn context_part(percent: f64, window: u64) -> (String, ContextLevel) {
+    let level = if percent > 90.0 {
+        ContextLevel::Critical
+    } else if percent > 70.0 {
+        ContextLevel::Warn
+    } else {
+        ContextLevel::Normal
+    };
+    let tenths = (percent * 10.0).round() as u64;
+    let whole = tenths / 10;
+    let frac = tenths % 10;
+    let pct = if frac == 0 {
+        format!("{whole}")
+    } else {
+        format!("{whole}.{frac}")
+    };
+    (format!("{pct}%/{}", format_tokens(window)), level)
+}
+
+/// Compose footer line 2 as its three display parts (ticket 04): the dim
+/// stats block, the context segment (own text, styled by level at render
+/// time), and the dim right-aligned model (with its left padding, possibly
+/// truncated). The context segment rides with the stats on the left; on a
+/// narrow terminal the model truncates first, then the stats+context block
+/// truncates (pi truncates the stats side last). Returns `(stats, context,
+/// model)`.
+///
+/// `context` is the segment's own text (as produced by [`context_part`])
+/// including the leading separator it carries when the stats block is
+/// non-empty. `None` hides the segment entirely (the SessionChanged→first-
+/// Usage transition, ticket 05). When the stats+context block fills the line
+/// the context segment is folded into the dim stats and returned as `None`,
+/// losing its separate color in that extreme case.
+pub fn stats_line_with_context(
+    stats: &[String],
+    context: Option<&str>,
+    model: &str,
+    width: usize,
+) -> (String, Option<String>, String) {
+    let stats_text = stats.join(" ");
+    // The segment's own text (with its leading separator when the stats block
+    // is non-empty), so the renderer can style it by level.
+    let ctx_segment = context.map(|ctx| {
+        if stats_text.is_empty() {
+            ctx.to_string()
+        } else {
+            format!(" {ctx}")
+        }
+    });
+    let ctx_width = ctx_segment.as_deref().map(display_width).unwrap_or(0);
+    let left_width = display_width(&stats_text) + ctx_width;
+    if left_width >= width {
+        // The stats+context block fills the line: drop the model and truncate
+        // the block. The context segment loses its separate color in this
+        // extreme case (it is part of the dim truncated stats).
+        let left = format!("{stats_text}{}", ctx_segment.as_deref().unwrap_or(""));
+        return (truncate_width_str(&left, width), None, String::new());
+    }
+    let min_padding = 2;
+    let total_needed = left_width + min_padding + display_width(model);
+    if total_needed <= width {
+        let padding = " ".repeat(width - left_width - display_width(model));
+        return (stats_text, ctx_segment, format!("{padding}{model}"));
+    }
+    let available = width - left_width - min_padding;
+    if available > 0 {
+        let truncated = truncate_width_str(model, available);
+        let pad = " ".repeat(width - left_width - display_width(&truncated));
+        (stats_text, ctx_segment, format!("{pad}{truncated}"))
+    } else {
+        (stats_text, ctx_segment, String::new())
+    }
+}
+
 /// Truncate `text` to `width` display columns, cutting at a char boundary so
 /// wide (CJK) chars never split in half. Exposed so the `App` can truncate
 /// footer line 1 (the dim pwd line) the same way the stats line is truncated.
@@ -319,5 +426,67 @@ mod tests {
         assert_eq!(f.output, 5);
         assert_eq!(f.cache_read, 8);
         assert_eq!(f.cache_write, 2);
+    }
+
+    #[test]
+    fn context_part_formats_percent_and_window() {
+        // `45.3%/200k` — one decimal, trailing `.0` trimmed.
+        assert_eq!(
+            context_part(45.3, 200_000),
+            ("45.3%/200k".to_string(), ContextLevel::Normal)
+        );
+        assert_eq!(
+            context_part(0.0, 200_000),
+            ("0%/200k".to_string(), ContextLevel::Normal)
+        );
+        // Levels: >70 warn, >90 critical.
+        assert_eq!(context_part(70.0, 200_000).1, ContextLevel::Normal);
+        assert_eq!(context_part(70.1, 200_000).1, ContextLevel::Warn);
+        assert_eq!(context_part(90.0, 200_000).1, ContextLevel::Warn);
+        assert_eq!(context_part(90.1, 200_000).1, ContextLevel::Critical);
+        assert_eq!(context_part(99.9, 200_000).1, ContextLevel::Critical);
+        // Rounding trims `.0` (45.04 → 45.0 → "45%", 45.05 → 45.1).
+        assert_eq!(context_part(45.04, 200_000).0, "45%/200k");
+        assert_eq!(context_part(45.05, 200_000).0, "45.1%/200k");
+        // Window formatting reuses format_tokens.
+        assert_eq!(context_part(1.5, 128_000).0, "1.5%/128k");
+    }
+
+    #[test]
+    fn stats_line_with_context_places_the_segment_after_stats() {
+        let stats = vec!["↑1.5k".to_string()];
+        let ctx = "45.3%/200k";
+        // `↑1.5k` (5) + ` 45.3%/200k` (11) = 16; width 40 → model right-aligned.
+        let (s, c, m) = stats_line_with_context(&stats, Some(ctx), "model-x", 40);
+        assert_eq!(s, "↑1.5k");
+        assert_eq!(c.as_deref(), Some(" 45.3%/200k"));
+        assert_eq!(m, "                 model-x");
+        // No stats: the segment leads without a separator.
+        let (s, c, _) = stats_line_with_context(&[], Some(ctx), "model-x", 40);
+        assert_eq!(s, "");
+        assert_eq!(c.as_deref(), Some("45.3%/200k"));
+        // No context: the segment is absent (SessionChanged transition).
+        let (s, c, m) = stats_line_with_context(&stats, None, "model-x", 40);
+        assert_eq!(s, "↑1.5k");
+        assert_eq!(c, None);
+        assert!(m.trim_end().ends_with("model-x"));
+    }
+
+    #[test]
+    fn stats_line_with_context_truncates_model_then_stats_block() {
+        let stats = vec!["↑1.5k".to_string()];
+        let ctx = "45.3%/200k";
+        // Tight: model truncates first (available = 24 - 16 - 2 = 6).
+        let (s, c, m) = stats_line_with_context(&stats, Some(ctx), "model-very-long", 24);
+        assert_eq!(s, "↑1.5k");
+        assert_eq!(c.as_deref(), Some(" 45.3%/200k"));
+        assert!(m.starts_with(" "));
+        assert_eq!(m.trim_start(), "model-");
+        // Narrower than the block: block truncates, model dropped, and the
+        // segment loses its separate color (None).
+        let (s, c, m) = stats_line_with_context(&stats, Some(ctx), "m", 12);
+        assert_eq!(s, "↑1.5k 45.3%/");
+        assert_eq!(c, None);
+        assert_eq!(m, "");
     }
 }
