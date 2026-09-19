@@ -218,8 +218,10 @@ pub fn suggest_skills<'a, S: SkillView>(skills: &'a [S], input: &str) -> Vec<&'a
 /// the skill's name, its `SKILL.md` location, and a base-dir reference line,
 /// followed by the skill body — or, when `already_loaded` is true (the skill
 /// was already injected into an earlier message of this conversation), a short
-/// notice pointing at that earlier message instead of repeating the body — and
-/// then an optional task argument. Mirrors pi's `/skill:name` expansion.
+/// notice pointing at that earlier message instead of repeating the body, plus
+/// the two basic hints a reloaded skill still needs: its base directory and
+/// where to search its resources (references, scripts, …) — and then an
+/// optional task argument. Mirrors pi's `/skill:name` expansion.
 pub fn skill_prompt(skill: &Skill, arg: Option<&str>, already_loaded: bool) -> String {
     let mut prompt = format!(
         "<skill name=\"{}\" location=\"{}\">\nReferences are relative to {}.\n",
@@ -230,9 +232,12 @@ pub fn skill_prompt(skill: &Skill, arg: Option<&str>, already_loaded: bool) -> S
     if already_loaded {
         prompt.push_str(&format!(
             "\nThis skill's instructions were already loaded in a previous message \
-             (search the conversation for `<skill name=\"{}\">`). They are not repeated here; \
-             refer to the earlier message.\n",
+             (search the conversation for `<skill name=\"{}\">`); they are not repeated here; \
+             refer to the earlier message.\n\
+             Skill base directory: {}.\n\
+             Skill resources (references, scripts, …) are searched starting from the base directory.\n",
             escape_xml(&skill.name),
+            escape_xml(&skill.dir.display().to_string()),
         ));
     } else {
         prompt.push_str(&format!("\n{}\n", skill.body.trim()));
@@ -852,6 +857,20 @@ mod tests {
         assert!(!p.contains("Do the demo."), "got: {p}");
         assert!(p.contains("already loaded"), "got: {p}");
         assert!(p.contains("previous message"), "got: {p}");
+        // The two basic hints are attached: the skill's base directory, and
+        // where to search its resources.
+        assert!(
+            p.contains("Skill base directory: /home/u/skills/demo"),
+            "got: {p}"
+        );
+        assert!(
+            p.contains("Skill resources (references, scripts, …)"),
+            "got: {p}"
+        );
+        assert!(
+            p.contains("searched starting from the base directory"),
+            "got: {p}"
+        );
         assert!(p.ends_with("</skill>"));
     }
 

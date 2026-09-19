@@ -27,8 +27,10 @@ markdown index, one bullet per skill (`- name: description [Read from
 model applies a skill when its name/description matches the task or when the user
 references it explicitly as `/{name}`. If the
 skill was already loaded in an earlier message of the same conversation, its body
-is replaced by an already-loaded notice (the base-dir line is kept) so the model
-finds the instructions in the earlier message instead of reloading.
+is replaced by an already-loaded notice (the base-dir line is kept, and the notice
+re-states the skill's base directory and where to search its resources —
+references, scripts, …) so the model finds the instructions in the earlier message
+instead of reloading.
 _Avoid_: plugin, extension
 
 **Session**:

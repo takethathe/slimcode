@@ -227,7 +227,9 @@ provider config seam 见 ADR-0016，hook seam 见 ADR-0015）。折入自 ticket
   skill 不进系统提示词，只通过显式 `/skill:name` 触发；`Skill` 携带 `dir`（发现/安装时
   确定）与 `file`（`SKILL.md` 文件路径，用于 `<location>`）；`skill_prompt` 以 pi 风格
   `<skill name location>` XML 块把正文注入触发消息并附 `References are relative to
-  <dir>.` 行，`already_loaded` 时正文换成去重提示；`format_skills_for_prompt` 产出
+  <dir>.` 行，`already_loaded` 时正文换成去重提示（保留 base-dir 行，并附两个基本
+  提示：skill 的 base directory，以及 references / scripts 等资源从 base directory
+  开始搜索）；`format_skills_for_prompt` 产出
   `## Skills` markdown 广告索引（每 skill 一行 `- name: description [Read from
   <file>]`，含“按名字/描述匹配即用，或显式 `/{name}` 引用”的说明）；
   `normalize_skill_trigger` 把裸 prompt 开头的 `/skill:name` 改写为 `/{name}`（one-shot CLI
