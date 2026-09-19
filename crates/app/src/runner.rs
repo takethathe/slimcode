@@ -18,7 +18,7 @@
 
 use slimcode_core::agent::{
     AgentEvent, AgentMessage, AgentRunner, CancelToken, Provider, ProviderConfig, RunConfig,
-    StopReason, Tool,
+    RunHooks, StopReason, Tool,
 };
 
 use crate::context::Context;
@@ -52,6 +52,35 @@ pub fn run_turn<P: Provider>(
     renderer: &mut dyn Renderer,
     on_message: &mut dyn FnMut(&AgentMessage) -> Result<(), String>,
 ) -> Result<(Vec<AgentMessage>, StopReason), String> {
+    run_turn_with_hooks(
+        provider,
+        tools,
+        context,
+        cfg,
+        provider_config,
+        cancel,
+        renderer,
+        on_message,
+        RunHooks::default(),
+    )
+}
+
+/// [`run_turn`] with the ADR-0015 hook seam wired in: the caller supplies the
+/// hooks (e.g. a skill-aware `read` interception), the runner owns them for
+/// the run. [`run_turn`] is a thin wrapper passing no hooks, so existing
+/// callers and tests keep working unchanged.
+#[allow(clippy::too_many_arguments)] // the turn's full run context crosses this seam
+pub fn run_turn_with_hooks<P: Provider>(
+    provider: &mut P,
+    tools: &[Tool],
+    context: Context,
+    cfg: &RunConfig,
+    provider_config: &ProviderConfig,
+    cancel: &CancelToken,
+    renderer: &mut dyn Renderer,
+    on_message: &mut dyn FnMut(&AgentMessage) -> Result<(), String>,
+    hooks: RunHooks<'_>,
+) -> Result<(Vec<AgentMessage>, StopReason), String> {
     let Context { system, messages } = context;
     let mut sink = |e: AgentEvent| {
         match &e {
@@ -65,6 +94,7 @@ pub fn run_turn<P: Provider>(
         Ok(())
     };
     let mut runner = AgentRunner::new(tools, cfg.clone(), provider_config, cancel, &mut sink);
+    runner.hooks = hooks;
     runner.run(provider, &system, messages)
 }
 
@@ -73,7 +103,7 @@ mod tests {
     use super::*;
     use crate::render::DisplayItem;
     use serde_json::Value;
-    use slimcode_core::agent::{Delta, FinishReason, StopReason, ToolSpec};
+    use slimcode_core::agent::{Delta, FinishReason, StopReason, ToolDecision, ToolSpec};
     use slimcode_core::session::{AgentMessage, Message, Role};
 
     /// A fixed provider config for the turn-runner tests: these tests exercise
@@ -412,6 +442,51 @@ mod tests {
                 .all(|i| !matches!(i, DisplayItem::Text(t) if t.contains("call"))),
             "no raw tool deltas leaked: {:?}",
             renderer.items
+        );
+    }
+
+    #[test]
+    fn before_tool_hook_can_skip_a_call_and_supply_its_result() {
+        // A `before_tool` hook may return `Skip`, replacing what the model
+        // sees (and what enters history) without running the tool. The hook
+        // signature is the run_turn_with_hooks seam; run_turn passes none.
+        let script = vec![vec![
+            tc_start(0, "call_1", "get_weather"),
+            tc_args(0, "{}"),
+            done_tools(),
+        ]];
+        let mut provider = FakeProvider::new(script);
+        let mut renderer = RecordingRenderer::new();
+        let messages = vec![user("weather?")];
+        let cancel = CancelToken::new();
+        let mut hook = |msg: &mut AgentMessage, index: usize| {
+            let call_name = msg.tool_calls()[index].name.clone();
+            assert_eq!(call_name, "get_weather");
+            Ok(ToolDecision::Skip(Ok("SKIPPED_WEATHER".to_string())))
+        };
+        let hooks = RunHooks {
+            before_tool: Some(Box::new(&mut hook)),
+            ..Default::default()
+        };
+        let (updated, stop) = run_turn_with_hooks(
+            &mut provider,
+            &[weather_tool()],
+            context(messages),
+            &RunConfig::default(),
+            &test_config(),
+            &cancel,
+            &mut renderer,
+            &mut noop_sink(),
+            hooks,
+        )
+        .unwrap();
+        assert_eq!(stop, StopReason::Completed);
+        // The skipped call's result entered history in place of the tool's
+        // real output; the tool never ran.
+        assert!(
+            updated
+                .iter()
+                .any(|m| m.text_content() == "SKIPPED_WEATHER")
         );
     }
 

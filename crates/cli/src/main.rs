@@ -30,7 +30,11 @@ use slimcode_app::context_files::{ContextFile, load_context_files, resolve_proje
 use slimcode_app::history::HistoryStore;
 use slimcode_app::render::{DisplayItem, Renderer};
 use slimcode_app::session::{SessionStore, project_key};
-use slimcode_app::skills::{Skill, SkillStore, normalize_skill_trigger};
+use slimcode_app::skills::{
+    Skill, SkillStore, find_skill, leading_skill_ref, normalize_skill_trigger, skill_for_read_args,
+    skill_prompt,
+};
+use slimcode_core::session::AgentMessage;
 
 fn usage() -> String {
     format!(
@@ -79,10 +83,19 @@ fn run_once(
     out: &mut dyn Write,
 ) -> Result<i32, String> {
     let (mut provider, tools) = slimcode_app::setup::setup(cwd)?;
-    // The CLI one-shot path has no command parser, so a leading `/skill:{name}`
-    // trigger is normalized to the `/{name}` form the model understands before
-    // it becomes a user message (the TUI already embeds the skill content).
-    let prompt = normalize_skill_trigger(prompt);
+    // The CLI one-shot path has no command parser, so a leading skill trigger
+    // (`/skill:{name}` or `/{name}` for an installed skill) injects the skill
+    // active block as the user prompt — the same content the TUI's `/`-command
+    // path embeds, so the model sees the skill instructions either way. Any
+    // other leading `/`-form is normalized to the `/{name}` text form.
+    let prompt = if let Some((name, arg)) = leading_skill_ref(prompt) {
+        match find_skill(skills, name) {
+            Some(skill) => skill_prompt(skill, (!arg.is_empty()).then_some(arg), false),
+            None => normalize_skill_trigger(prompt),
+        }
+    } else {
+        normalize_skill_trigger(prompt)
+    };
     let context = ContextBuilder::new()
         .with_environment(environment)
         .with_context_files(context_files)
@@ -91,9 +104,13 @@ fn run_once(
         .build()?;
     let cfg = slimcode_core::agent::RunConfig::default();
     let cancel = slimcode_core::agent::CancelToken::new();
-    let mut renderer = render::TextRenderer::new(out);
+    let mut renderer = render::TextRenderer::with_skills(out, skills.to_vec(), cwd.to_path_buf());
     // One-shot: no session persistence, so the per-message sink is a no-op.
-    let (_updated, _stop) = slimcode_app::runner::run_turn(
+    // Skill dedup history is the turn's own messages: when the prompt already
+    // carries a skill block (a `/skill:name` trigger), a later `read` of the
+    // same skill yields the already-loaded notice instead of the body again.
+    let skill_dedup_history: Vec<AgentMessage> = context.messages.clone();
+    let (_updated, _stop) = slimcode_app::runner::run_turn_with_hooks(
         &mut provider,
         &tools,
         context,
@@ -102,6 +119,27 @@ fn run_once(
         &cancel,
         &mut renderer,
         &mut |_| Ok(()),
+        slimcode_core::agent::RunHooks {
+            before_tool: Some(Box::new(&mut |msg: &mut AgentMessage, index: usize| {
+                let Some(call) = msg.tool_calls().get(index) else {
+                    return Ok(slimcode_core::agent::ToolDecision::Run);
+                };
+                if call.name != "read" {
+                    return Ok(slimcode_core::agent::ToolDecision::Run);
+                }
+                let Some(skill) = skill_for_read_args(skills, cwd, &call.arguments) else {
+                    return Ok(slimcode_core::agent::ToolDecision::Run);
+                };
+                let already_loaded =
+                    slimcode_app::context::skill_loaded_in(&skill_dedup_history, skill);
+                Ok(slimcode_core::agent::ToolDecision::Skip(Ok(skill_prompt(
+                    skill,
+                    None,
+                    already_loaded,
+                ))))
+            })),
+            ..Default::default()
+        },
     )?;
     let usage = provider.total_usage;
     renderer.render(&DisplayItem::Usage(usage))?;

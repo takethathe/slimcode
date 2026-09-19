@@ -234,7 +234,21 @@ provider config seam 见 ADR-0016，hook seam 见 ADR-0015）。折入自 ticket
   <file>]`，含“按名字/描述匹配即用，或显式 `/{name}` 引用”的说明）；
   `normalize_skill_trigger` 把裸 prompt 开头的 `/skill:name` 改写为 `/{name}`（one-shot CLI
   无命令解析，避免 `/skill:` 前缀原样进 LLM）；`find_skill` / `suggest_skills` 兼容 `/skill:name`
-  与裸 `/name` 两种拼写，补全池统一用 `/skill:name`；
+  与裸 `/name` 两种拼写，补全池统一用 `/skill:name`；`skill_for_read_path` /
+  `skill_for_read_args` 解析 `read` 工具的路径/JSON 参数，命中 skill 自身 `SKILL.md` 时把这次
+  读取当成 skill 激活（payload 文件如 references/scripts 不算）；
+- 显示层（cli `render.rs` / tui `app.rs`）：skill 激活统一显示为专用的 `[skill] <name>`
+  块，而非 read 工具块或普通用户输入。TUI 的 `/skill:name` 触发在提交前先 emit
+  `RenderItem::Skill`（块内容与提交文本一致，record: false）；`run_turn` 经
+  `run_turn_with_hooks`（app `runner.rs` 新增钩子接缝，`run_turn` 薄封装不传钩子）注入
+  `before_tool` 钩子：拦截对 skill 自身 `SKILL.md` 的 `read`，以
+  `ToolDecision::Skip(Ok(skill_prompt(...)))` 把 `<skill>` 块作为工具结果（已加载时附去重提示），
+  钩子内部用 turn 开始前的历史快照判断 `already_loaded`（避免把本次 prompt 自身的 `<skill>`
+  标记误判为已加载）；`TuiAdapter::with_skills` / `TextRenderer::with_skills` 记住被抑制的
+  skill-read 起止对，把结果渲染成 Skill 块；历史回放
+  `history_to_render_items` 前瞻识别内容以 `<skill name="` 开头的工具结果，同样抑制配对 read
+  的起止并渲染为 Skill 块；one-shot `run_once` 对开头的 `/skill:name` / `/{name}`（命中已安装
+  skill）直接注入 `skill_prompt` 作为用户消息，并接同样的 `before_tool` 钩子；
 - `/` 补全（ADR-0005）：`CompletionItem { value, description }` + `complete(input,
   skills) -> Vec<CompletionItem>`——把 `slimcode-commands` 的每个命令拼写（规范名 + 别名）
   与每个已安装 skill 合成候选池，用 `fuzzy::fuzzy_match` 模糊排序（裸 `/` 按注册表顺序列全部，

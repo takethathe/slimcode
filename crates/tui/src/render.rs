@@ -41,6 +41,11 @@ pub enum RenderItem {
     Error(String),
     /// A boxed user prompt block (typed, recalled or replayed).
     UserPrompt(String),
+    /// A skill active block: the full `<skill>` block of an activated skill
+    /// (a `/skill:name` trigger or a `read` of a `SKILL.md`), rendered as a
+    /// distinct boxed block with a `[skill] <name>` header instead of a
+    /// generic user prompt or a `read` tool block.
+    Skill { name: String, content: String },
     /// The session's accumulated token usage for the footer stats line.
     Usage(FooterUsage),
     /// The current git branch (`None` outside a repository).

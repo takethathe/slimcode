@@ -259,6 +259,60 @@ pub fn escape_xml(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+/// Find the installed skill a `read` tool path refers to, if any. The path is
+/// resolved against `cwd` (an absolute path is used as-is) and must name the
+/// skill's own `SKILL.md` (or its single-file skill) for a match; reads of
+/// skill payload files (references, scripts, assets) are ordinary reads and
+/// return `None`. Used to turn a `read` of a skill file into the skill active
+/// block instead of raw file content.
+pub fn skill_for_read_path<'s>(skills: &'s [Skill], cwd: &Path, path: &str) -> Option<&'s Skill> {
+    if path.is_empty() {
+        return None;
+    }
+    let resolved = fs::canonicalize(cwd.join(path)).ok()?;
+    skills
+        .iter()
+        .find(|s| fs::canonicalize(&s.file).ok().as_deref() == Some(resolved.as_path()))
+}
+
+/// Resolve a `read` tool's raw JSON arguments to the skill they name, if any:
+/// parses `path` out of the arguments object and hands it to
+/// [`skill_for_read_path`]. Returns `None` for unparseable arguments, a
+/// missing `path`, or any non-skill file.
+pub fn skill_for_read_args<'s>(
+    skills: &'s [Skill],
+    cwd: &Path,
+    arguments: &str,
+) -> Option<&'s Skill> {
+    let args: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let path = args.get("path")?.as_str()?;
+    skill_for_read_path(skills, cwd, path)
+}
+
+/// Split a leading skill reference off a prompt: `(name, arg)` for a leading
+/// `/skill:name` or bare `/name` (with an optional trailing task argument), or
+/// `None` when the prompt does not start with a skill reference. Mirrors the
+/// spellings [`find_skill`] accepts, so the one-shot CLI can inject the skill
+/// active block the same way the TUI trigger does. A bare `/` (no name), a
+/// `/skill:` with nothing after it, and `/name` with a name followed by
+/// whitespace-only are not references.
+pub fn leading_skill_ref(prompt: &str) -> Option<(&str, &str)> {
+    let trimmed = prompt.trim_start();
+    let rest = trimmed
+        .strip_prefix("/skill:")
+        .or_else(|| trimmed.strip_prefix('/'))?;
+    if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let (name, arg) = rest
+        .split_once(char::is_whitespace)
+        .map_or((rest, ""), |(n, a)| (n, a.trim_start()));
+    if name.is_empty() {
+        return None;
+    }
+    Some((name, arg))
+}
+
 /// Format auto-invokable skills (those without `disable-model-invocation:
 /// true`) for the system prompt, as a markdown skill index: a short "when to
 /// use" header plus one bullet per skill (`- name: description [Read from
@@ -880,6 +934,81 @@ mod tests {
             escape_xml("a&b<c>d\"e'f"),
             "a&amp;b&lt;c&gt;d&quot;e&apos;f"
         );
+    }
+
+    #[test]
+    fn skill_for_read_path_matches_only_the_skills_own_file() {
+        let dir = unique_temp_dir("slimcode-skill-read");
+        let cwd = dir.join("proj");
+        let skill_dir = cwd.join(".slimcode").join("skills").join("demo");
+        fs::create_dir_all(skill_dir.join("references")).unwrap();
+        fs::write(skill_dir.join("SKILL.md"), skill_md("")).unwrap();
+        fs::write(skill_dir.join("references").join("REF.md"), "payload").unwrap();
+        let skill = parse_skill(&skill_md(""), SkillScope::Project)
+            .unwrap()
+            .at(skill_dir.clone(), skill_dir.join("SKILL.md"));
+        let skills = [skill.clone()];
+
+        // The skill's own SKILL.md matches, relative or absolute.
+        let got = skill_for_read_path(&skills, &cwd, ".slimcode/skills/demo/SKILL.md").unwrap();
+        assert_eq!(got.name, "demo");
+        let got = skill_for_read_path(&skills, &cwd, skill_dir.join("SKILL.md").to_str().unwrap())
+            .unwrap();
+        assert_eq!(got.name, "demo");
+        // Payload files (references, scripts) are ordinary reads.
+        assert!(
+            skill_for_read_path(&skills, &cwd, ".slimcode/skills/demo/references/REF.md").is_none()
+        );
+        assert!(skill_for_read_path(&skills, &cwd, "other.md").is_none());
+        assert!(skill_for_read_path(&skills, &cwd, "").is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn skill_for_read_args_parses_the_read_path_out_of_json() {
+        let dir = unique_temp_dir("slimcode-skill-read-args");
+        let cwd = dir.join("proj");
+        let skill_dir = cwd.join(".slimcode").join("skills").join("demo");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(skill_dir.join("SKILL.md"), skill_md("")).unwrap();
+        let skill = parse_skill(&skill_md(""), SkillScope::Project)
+            .unwrap()
+            .at(skill_dir.clone(), skill_dir.join("SKILL.md"));
+        let skills = [skill.clone()];
+
+        // A read of the skill's own file matches, whatever the JSON shape.
+        let got = skill_for_read_args(
+            &skills,
+            &cwd,
+            r#"{"path": ".slimcode/skills/demo/SKILL.md"}"#,
+        )
+        .unwrap();
+        assert_eq!(got.name, "demo");
+        // Other files, missing path, or garbage JSON never match.
+        assert!(skill_for_read_args(&skills, &cwd, r#"{"path": "main.rs"}"#).is_none());
+        assert!(skill_for_read_args(&skills, &cwd, r#"{}"#).is_none());
+        assert!(skill_for_read_args(&skills, &cwd, "not json").is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn leading_skill_ref_parses_both_spellings_and_keeps_the_arg() {
+        assert_eq!(leading_skill_ref("/skill:grill"), Some(("grill", "")));
+        assert_eq!(
+            leading_skill_ref("/skill:grill my plan"),
+            Some(("grill", "my plan"))
+        );
+        assert_eq!(leading_skill_ref("/grill"), Some(("grill", "")));
+        assert_eq!(leading_skill_ref("/grill do it"), Some(("grill", "do it")));
+        // Leading whitespace is preserved by the caller, not the parse.
+        assert_eq!(leading_skill_ref("  /grill hi"), Some(("grill", "hi")));
+        // Bare `/`, `/skill:` with nothing after it, and non-`/` text are not
+        // skill references.
+        assert_eq!(leading_skill_ref("/"), None);
+        assert_eq!(leading_skill_ref("/skill:"), None);
+        assert_eq!(leading_skill_ref("review this diff"), None);
+        // A reference in the middle of a prompt is ordinary text.
+        assert_eq!(leading_skill_ref("run /grill now"), None);
     }
 
     #[test]

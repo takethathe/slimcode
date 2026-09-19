@@ -27,9 +27,12 @@ use slimcode_app::history::{HISTORY_DISPLAY, HistoryStore, render_history, resol
 use slimcode_app::render::usage_summary;
 use slimcode_app::session::{SessionStore, format_minute, infer_title, unix_secs};
 use slimcode_app::skills::{
-    Skill, SkillScope, SkillStore, find_skill, is_builtin_command, parse_install_args, skill_prompt,
+    Skill, SkillScope, SkillStore, find_skill, is_builtin_command, parse_install_args,
+    skill_for_read_args, skill_prompt,
 };
-use slimcode_core::agent::{CancelToken, Provider, RunConfig, StopReason, Tool};
+use slimcode_core::agent::{
+    CancelToken, Provider, RunConfig, RunHooks, StopReason, Tool, ToolDecision,
+};
 use slimcode_core::session::{AgentMessage, MessageStopReason, Role, Session};
 use slimcode_tui::app::{App, Effect};
 use slimcode_tui::git::{current_branch, terminal_title};
@@ -291,8 +294,15 @@ impl TuiSession<'_> {
                 .messages
                 .clone();
             let already_loaded = skill_loaded_in(&history, skill);
+            // The skill active block is shown as its own display unit before
+            // the turn starts, like the replay path shows the boxed prompt.
+            let content = skill_prompt(skill, arg, already_loaded);
+            emit(RenderItem::Skill {
+                name: skill.name.clone(),
+                content: content.clone(),
+            });
             return ControlFlow::Submit(Prompt {
-                text: skill_prompt(skill, arg, already_loaded),
+                text: content,
                 record: false,
             });
         }
@@ -643,20 +653,26 @@ impl TuiSession<'_> {
         // — not one request's numbers — is what the session earned, and the
         // snapshot keeps earlier turns (and earlier sessions) out of it.
         let usage_before = state.provider.total_usage();
+        // Skill dedup history: the messages in play when the turn starts,
+        // including this turn's prompt. A `/skill:name` trigger prompt already
+        // carries the skill block, so a redundant `read` of the same skill in
+        // the same turn gives the already-loaded notice instead of the body a
+        // second time.
+        let history_for_skill_dedup = state.session.messages.clone();
         let TurnState {
             provider,
             tools,
             session,
             cancel,
         } = state;
-        let result = slimcode_app::runner::run_turn(
+        let result = slimcode_app::runner::run_turn_with_hooks(
             provider,
             tools,
             context,
             &cfg,
             &self.config,
             cancel,
-            &mut TuiAdapter::new(emit),
+            &mut TuiAdapter::with_skills(emit, skills.to_vec(), self.cwd.clone()),
             &mut |msg: &AgentMessage| -> Result<(), String> {
                 // The message entered history: mirror it into the session and
                 // append it to the log. Persistence is best-effort — a storage
@@ -667,6 +683,31 @@ impl TuiSession<'_> {
                     append_errors.push(e);
                 }
                 Ok(())
+            },
+            RunHooks {
+                before_tool: Some(Box::new(&mut |msg: &mut AgentMessage, index: usize| {
+                    let Some(call) = msg.tool_calls().get(index) else {
+                        return Ok(ToolDecision::Run);
+                    };
+                    if call.name != "read" {
+                        return Ok(ToolDecision::Run);
+                    }
+                    let Some(skill) = skill_for_read_args(skills, &self.cwd, &call.arguments)
+                    else {
+                        return Ok(ToolDecision::Run);
+                    };
+                    // A read of a skill's own file is served as the skill
+                    // active block — the full block on first load, the
+                    // already-loaded notice plus the base-dir and resource
+                    // hints when the skill is already in the message list.
+                    let already_loaded = skill_loaded_in(&history_for_skill_dedup, skill);
+                    Ok(ToolDecision::Skip(Ok(skill_prompt(
+                        skill,
+                        None,
+                        already_loaded,
+                    ))))
+                })),
+                ..Default::default()
             },
         );
         for e in &append_errors {
@@ -1103,7 +1144,15 @@ mod tests {
         );
         assert!(prompt.text.ends_with("my plan"), "{}", prompt.text);
         assert!(prompt.text.contains("Body."), "{}", prompt.text);
-        assert!(items.is_empty());
+        // The skill active block is shown as its own display unit before the
+        // turn starts (like the replay path shows the boxed prompt).
+        assert_eq!(
+            items,
+            vec![RenderItem::Skill {
+                name: "grill".to_string(),
+                content: prompt.text.clone(),
+            }]
+        );
     }
 
     #[test]

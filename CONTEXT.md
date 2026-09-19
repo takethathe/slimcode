@@ -25,7 +25,12 @@ turn's user message, wrapped in a `<skill>` XML block (pi-style). Skills without
 markdown index, one bullet per skill (`- name: description [Read from
 <file>]`), and the
 model applies a skill when its name/description matches the task or when the user
-references it explicitly as `/{name}`. If the
+references it explicitly as `/{name}`. A model `read` of the skill's own
+`SKILL.md` is served as the same `<skill>` active block (not the raw file), and
+in the TUI both the `/skill:name` trigger and a skill-reading `read` render as
+a dedicated `[skill] <name>` block rather than a plain prompt or tool block; the
+one-shot CLI injects the block for a leading `/skill:name` or `/{name}` trigger.
+If the
 skill was already loaded in an earlier message of the same conversation, its body
 is replaced by an already-loaded notice (the base-dir line is kept, and the notice
 re-states the skill's base directory and where to search its resources —

@@ -147,6 +147,10 @@ pub enum Entry {
         output: String,
         status: ToolStatus,
     },
+    /// A skill active block: the full `<skill>` block of an activated skill,
+    /// shown as one unit (header + content) instead of a `read` tool block or
+    /// a plain user prompt.
+    Skill { name: String, content: String },
     /// Frontend-owned output (command results, notices): dim.
     Notice(String),
     /// An inline error (failed turn, failed command, abnormal stop): red.
@@ -1104,6 +1108,9 @@ impl App {
             RenderItem::Notice(text) => self.transcript.push(Entry::Notice(text)),
             RenderItem::Error(text) => self.transcript.push(Entry::Error(text)),
             RenderItem::UserPrompt(text) => self.transcript.push(Entry::UserPrompt { text }),
+            RenderItem::Skill { name, content } => {
+                self.transcript.push(Entry::Skill { name, content })
+            }
             RenderItem::Usage(usage) => self.status.usage = usage,
             RenderItem::Branch(branch) => self.status.branch = branch,
             // The picker takes over the frame; opening it leaves the
@@ -1504,6 +1511,7 @@ fn entry_rows(
     match entry {
         Entry::Header => header_rows(version),
         Entry::UserPrompt { text } => user_box_rows(text, width),
+        Entry::Skill { name, content } => skill_box_rows(name, content, width),
         Entry::Assistant { text } => render_markdown(text, width),
         Entry::Thinking { text } => render_markdown(text, width)
             .into_iter()
@@ -1566,10 +1574,48 @@ fn user_box_rows(text: &str, width: usize) -> Vec<Line<'static>> {
     rows
 }
 
-/// A tool block: state-colored full-width background, compact per-tool call
-/// title for built-ins (pi `format*Call`; ticket 06), gray output collapsed to
-/// [`TOOL_PREVIEW_LINES`] with an expand hint unless the global Ctrl+O
-/// expansion flag is on.
+/// A skill active block: a boxed block like a user prompt, with a bold
+/// `[skill] <name>` header row and the full skill content (the `<skill>` XML
+/// block) rendered as plain wrapped text below it. The content is deliberately
+/// NOT markdown-rendered: a `<skill name=…>` opening tag would otherwise be
+/// eaten as an HTML block by the markdown renderer. Distinct from the user
+/// prompt box so an activated skill reads as its own display unit.
+fn skill_box_rows(name: &str, content: &str, width: usize) -> Vec<Line<'static>> {
+    let inner = width.saturating_sub(2).max(1);
+    let bg = BgToken::UserMessageBg.color();
+    let bg_style = Style::default().bg(bg);
+    let mut rows = vec![Line::styled(" ".repeat(width), bg_style)];
+    // `[skill] <name>` header (bold accent), padded like the content rows.
+    let header = Span::styled(
+        format!("[skill] {name}"),
+        bg_style
+            .fg(Token::Accent.color())
+            .add_modifier(Modifier::BOLD),
+    );
+    let header_w = display_width(&header.content);
+    let header_pad = inner.saturating_sub(header_w);
+    rows.push(Line::from(vec![
+        Span::styled(" ", bg_style),
+        header,
+        Span::styled(" ".repeat(header_pad + 1), bg_style),
+    ]));
+    // The content: the full `<skill>` block, wrapped to the inner width as
+    // plain text so the XML renders literally.
+    for line in content.lines() {
+        for piece in wrap_to_width(line, inner) {
+            let content_w = display_width(&piece);
+            let pad = inner.saturating_sub(content_w);
+            rows.push(Line::from(vec![
+                Span::styled(" ", bg_style),
+                Span::styled(piece, bg_style),
+                Span::styled(" ".repeat(pad + 1), bg_style),
+            ]));
+        }
+    }
+    rows.push(Line::styled(" ".repeat(width), bg_style));
+    rows
+}
+
 ///
 /// Every non-spacer row is padded to the pane width so the state background
 /// reads as one solid full-width band (ticket 05; pi Box paints the whole
@@ -3494,6 +3540,39 @@ mod tests {
             Some(BgToken::UserMessageBg.color())
         );
         assert!(!buffer_contains(&buffer, "> explain"));
+    }
+
+    #[test]
+    fn skill_block_renders_with_header_and_bg() {
+        let mut app = seeded_app();
+        app.apply(RenderItem::Skill {
+            name: "grill".to_string(),
+            content: "<skill name=\"grill\">\nBody.\n</skill>".to_string(),
+        });
+        let buffer = render_buffer(&mut app, 60, 30);
+        // The `[skill] <name>` header is a distinct row.
+        assert!(buffer_contains(&buffer, "[skill] grill"));
+        let y = row_containing(&buffer, "[skill] grill").unwrap();
+        let x = line_at(&buffer, y).find("[skill] grill").unwrap() as u16;
+        let style = cell_style(&buffer, x, y);
+        assert_eq!(style.fg, Some(Token::Accent.color()));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+        // The block's rows carry the same bg as a user prompt box.
+        assert!(row_bg_equals(&buffer, y, BgToken::UserMessageBg.color()));
+        // The content renders inside the box, XML shown literally (not eaten
+        // as an HTML block by markdown).
+        let content_y = row_containing(&buffer, "<skill name=\"grill\">").unwrap();
+        assert!(row_bg_equals(
+            &buffer,
+            content_y,
+            BgToken::UserMessageBg.color()
+        ));
+        let body_y = row_containing(&buffer, "Body.").unwrap();
+        assert!(row_bg_equals(
+            &buffer,
+            body_y,
+            BgToken::UserMessageBg.color()
+        ));
     }
 
     #[test]
