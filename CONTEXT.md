@@ -160,7 +160,7 @@ A message in a Session's message history, owned by `slimcode-core`: the user/ass
 _Avoid_: session message (ambiguous with a session-log record), stored message
 
 **Compaction**:
-Replacing an older span of a Session's message history with one CompactSummary so a long conversation keeps fitting the context window. Compaction triggers after a completed turn once the estimated history leaves at most 16k tokens of the assumed 200k window (`estimate >= window − 16_000`), or on demand with `/compact`; it keeps the most recent 16k tokens (~8% of the window) and asks the provider for a structured summary (merging any previous summary). A failed compaction leaves the history untouched.
+Replacing an older span of a Session's message history with one CompactSummary so a long conversation keeps fitting the context window. Compaction triggers after a completed turn once the estimated history leaves at most 16k tokens of the assumed 200k window (`estimate >= window − 16_000`), or on demand (`/compact` in the TUI, `compact_now` on the SDK); it keeps the most recent 16k tokens (~8% of the window) and asks the provider for a structured summary (merging any previous summary). A failed compaction leaves the history untouched.
 _Avoid_: summarization (the LLM step inside compaction), truncation, pruning
 
 **CompactSummary**:
@@ -231,7 +231,7 @@ The user-facing entry surface of slimcode: the `slimcode` CLI, and the presentat
 _Avoid_: UI, client
 
 **CLI**:
-The `slimcode` binary — the sole entry point. Owns argv, mode selection, config resolution, service construction, command semantics, session persistence, and the display adapters for both modes.
+The `slimcode` binary — the sole entry point, and a thin shell over the SDK (ADR-0022). Owns argv, mode selection, the terminal, `/` command semantics, input history, the session picker list, the display adapters (TextRenderer / TUI adapter), and the session objects (creating, switching, disposing an AgentSession); everything a turn does comes from `slimcode-sdk`, with config resolved once at startup and pinned into the session.
 _Avoid_: binary, main, entrypoint
 
 **TUI**:
@@ -319,8 +319,11 @@ The `slimcode-sdk` crate — a programmatic, session-centric API that embeds sli
 Rust process (pi's `pi-coding-agent` SDK is the model). It wraps the app layer (`run_turn_with_hooks`,
 `ContextBuilder`, `SessionStore`, skills, context files, config, the seven tools) behind a
 `create_agent_session` factory and an `AgentSession` object, without the terminal binary. It does
-not interpret `/` commands (a frontend concern) and stays synchronous (no async runtime). A future
-`FFI 模块` (cdylib + C ABI) and a CLI-thin-shell refactor are follow-up work (ADR-0021).
+not interpret `/` commands (a frontend concern) and stays synchronous (no async runtime).
+`AgentSessionOptions` pins the home (`with_home`) and resumes an existing conversation by id
+(`with_session_id`); `AgentSession::compact_now` forces a compaction outside a turn. The CLI runs
+as a thin shell over it (ADR-0022). A future `FFI 模块` (cdylib + C ABI) remains follow-up work
+(ADR-0021).
 _Avoid_: library, embedding API
 
 **AgentSession**:
@@ -331,8 +334,25 @@ the shared `CancelToken`, never waiting on the session lock), `dispose` (rejects
 "session is disposed", cancels an in-flight turn, and clears every listener), and read-only
 accessors (`messages` / `session_id` / `title` / `usage`). It reuses the same `Session` data
 structure the CLI/TUI use; `persist: false` keeps it purely in memory. Distinct from `Session` (the
-CLI/TUI's conversation unit) — an `AgentSession` is the programmatic equivalent on the SDK side.
+CLI/TUI's conversation unit) — an `AgentSession` is the programmatic equivalent on the SDK side, and
+in the thin-shell CLI it *is* the current conversation object (created, switched and disposed by
+the CLI, ADR-0022 D2).
 _Avoid_: session object, session handle
+
+**compact_now**:
+The SDK's on-demand Compaction (`AgentSession::compact_now`): forces a compaction outside a turn,
+ignoring the threshold, single-flight with `prompt` (a turn in progress is rejected), and returns
+the before/after token counts or the provider error. Succeeds by emitting `SdkEvent::Compacted` —
+the same event the automatic path emits — so both paths render identically; the CLI's `/compact` is
+its frontend spelling (ADR-0022 D3).
+_Avoid_: manual compaction, force compact
+
+**with_session_id**:
+The SDK option that resumes an existing Session by id from the internal store when the
+`AgentSession` is created: a lenient replay of messages and title (usage starts from zero, since it
+is not persisted). Errors when combined with `persist: false`, because a load without a store would
+be a silent lie. The CLI's `/session` picker loads through it (ADR-0022 D3).
+_Avoid_: load session, open session, resume flag
 
 **SdkEvent**:
 The SDK's event payload a subscriber receives from `AgentSession::subscribe`: `Display(DisplayItem)`
@@ -340,7 +360,10 @@ The SDK's event payload a subscriber receives from `AgentSession::subscribe`: `D
 message as it enters history — the user prompt and tool results carry `usage: None`, assistant
 replies carry the request's usage), `TurnFinished { stop_reason }` (the authoritative end of one `prompt`, roughly
 pi's `agent_settled`), and `Compacted { before, after }` (an auto-compaction just replaced an old
-history span). Delivered synchronously on the turn's calling thread, in subscription order.
+history span). Delivered synchronously on the turn's calling thread, in subscription order. The
+turn-end pair (`TurnFinished`, then an optional `Compacted`) is delivered after the turn's taken
+provider / tools / session state is put back, so a listener reading the session there
+(`messages()` / `usage()`) sees the finished turn, never the pre-turn snapshot.
 _Avoid_: event, session event
 
 **事件订阅 (event subscription)**:

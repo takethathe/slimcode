@@ -96,11 +96,12 @@ fn tui_depends_on_no_other_crate() {
     assert_deps("tui", &[]);
 }
 
-/// `cli_depends_on_every_crate_except_sdk`: the CLI takes every other crate
-/// (it is the only binary), but deliberately not the SDK — the CLI thin-shell
-/// refactor that makes it a SDK consumer is follow-up work (ADR-0021 D1).
+/// `cli_depends_on_every_crate`: the CLI takes every other crate (it is the
+/// only binary), including the SDK it now consumes for the one-shot turn
+/// orchestration (the cli-thin-shell spec: cli → {ai, core, app, commands,
+/// tui, sdk}).
 #[test]
-fn cli_depends_on_every_crate_except_sdk() {
+fn cli_depends_on_every_crate() {
     assert_deps(
         "cli",
         &[
@@ -109,6 +110,7 @@ fn cli_depends_on_every_crate_except_sdk() {
             "slimcode-app",
             "slimcode-commands",
             "slimcode-tui",
+            "slimcode-sdk",
         ],
     );
 }

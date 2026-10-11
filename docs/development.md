@@ -33,15 +33,15 @@ cargo workspace，七个 crate，唯一二进制 `slimcode`：
 | --- | --- | --- | --- |
 | `crates/ai` | `slimcode-ai` | LLM 层：`Message`（wire 消息）/ `Provider` / `ToolSpec` / `Delta` / `FinishReason` / `CancelToken` / `TokenUsage` / wire 模型 | 无 slimcode 依赖 |
 | `crates/core` | `slimcode-core` | agent 运行时：`AgentEvent` / `AgentRunner`（借用式 per-run 值：tools/cfg/`&ProviderConfig`/cancel/事件订阅，`run(provider, system, messages)`，ADR-0015 加可选 hook 字段）/ `AgentMessage`(+`to_llm`) / `convert` / `Tool{spec,run}` / `RunConfig` / `StopReason` | → ai |
-| `crates/app` | `slimcode-app` | 前端无关应用层：`DisplayItem` / `map_event` / `Renderer` / `usage_summary` / `ContextBuilder`→`Context{system,messages}` / compaction（token 估算 + 阈值 + 摘要执行）/ 会话与输入历史持久化 / skills / context_files / 七工具 / setup / `run_turn` | → ai, core, commands |
+| `crates/app` | `slimcode-app` | 前端无关应用层：`DisplayItem` / `map_event` / `Renderer` / `usage_summary` / `ContextBuilder`→`Context{system,messages}` / compaction（token 估算 + 阈值 + 摘要执行）/ 会话与输入历史持久化 / skills / context_files / 七工具 / `run_turn` | → ai, core, commands |
 | `crates/commands` | `slimcode-commands` | `/` 命令注册表 + fuzzy 预测（纯数据 + 纯函数，无 I/O） | 无 |
 | `crates/tui` | `slimcode-tui` | 终端图形库：`RenderItem` / `Effect` / `App`(new/apply/draw/handle_key) / `run(terminal, app, handler)` / `UiHandler` / 组件（theme/markdown/toolcall/footer/text/git） | **无 slimcode 依赖** |
-| `crates/cli` | `slimcode` | 唯一二进制 = 总入口：argv / 模式选择（one-shot 文本 vs 交互 TUI）/ 配置解析 / 服务构建 / 命令语义 / 会话落盘 / `TextRenderer` / `TuiAdapter` / 补全与文案 | → 全部 |
-| `crates/sdk` | `slimcode-sdk` | 可嵌入 SDK：`create_agent_session(AgentSessionOptions)` → `AgentSession`（`prompt` 同步单飞回合 / `subscribe`→Unsubscribe / `abort` 跨线程取消且不等会话锁 / `dispose` 拒绝后续 prompt、取消在途回合并清空监听器 / `messages` / `session_id` / `title` / `usage`）+ `SdkEvent`（Display / Message / TurnFinished / Compacted）；持久化单回合 prompt 复用共享 `run_turn_with_hooks`，会话落为现有 JSONL 日志（ADR-0021） | → app |
+| `crates/cli` | `slimcode` | 唯一二进制 = 总入口，SDK 之上的薄壳（ADR-0022）：argv / 模式选择（one-shot 文本 vs 交互 TUI）/ 终端生命周期 / 配置解析（启动时冻结）/ `/` 命令语义 / 输入历史 / 会话 picker 列表 / 显示适配（`TextRenderer` / `TuiAdapter`）/ 会话对象管理（创建、切换、dispose `AgentSession`）/ 补全与文案 | → 全部（含 sdk） |
+| `crates/sdk` | `slimcode-sdk` | 可嵌入 SDK：`create_agent_session(AgentSessionOptions)` → `AgentSession`（`prompt` 同步单飞回合 / `compact_now` 回合外强制压缩 / `subscribe`→Unsubscribe / `abort` 跨线程取消且不等会话锁 / `dispose` 拒绝后续 prompt、取消在途回合并清空监听器 / `messages` / `session_id` / `title` / `usage`）+ `SdkEvent`（Display / Message / TurnFinished / Compacted，回合结束事件在会话状态回填后送达，监听器读到的是本回合结果）；选项可 pin home（`with_home`）、按 id 续会（`with_session_id`），默认七工具绑定会话自己的 `CancelToken`（可取消）；持久化单回合 prompt 复用共享 `run_turn_with_hooks`，会话落为现有 JSONL 日志；CLI 两端都消费它（ADR-0021 / ADR-0022） | → app |
 
 重命名（ticket 01）：`crates/agent` → `crates/core`、`crates/common` → `crates/app`。关键依赖反转（ticket 02）：`Provider` trait 与 LLM `Message` 由 `ai` 拥有，`ai` 不再反向依赖运行时。
 
-依赖方向由测试断言（ticket 06，`crates/cli/tests/architecture.rs`）：`ai` 无 slimcode 依赖；`core` → 仅 `ai`；`app` → `ai`/`core`/`commands`；`tui` 无 slimcode 依赖；`cli` → 除 `sdk` 外全部（薄壳化是后续工作，ADR-0021）；`sdk` → 仅 `app`（ADR-0021）；`tui` 源码不得出现 `SessionStore`/`SkillStore`/`Config`。
+依赖方向由测试断言（ticket 06，`crates/cli/tests/architecture.rs`）：`ai` 无 slimcode 依赖；`core` → 仅 `ai`；`app` → `ai`/`core`/`commands`；`tui` 无 slimcode 依赖；`cli` → 全部（含 `sdk`：薄壳化后 CLI 消费 SDK 的 `AgentSession`，ADR-0022）；`sdk` → 仅 `app`（ADR-0021）；`tui` 源码不得出现 `SessionStore`/`SkillStore`/`Config`。
 
 ### crates/ai Bailian provider 与 LLM seam
 
@@ -318,7 +318,9 @@ provider config seam 见 ADR-0016，hook seam 见 ADR-0015）。折入自 ticket
   同模块的 `resolve_project_home(cwd, user_home)` 供环境信息复用同一套 git 根
   发现：取最近含 `.git` 的祖先，无则回退到 OS 用户主目录（`$HOME`），再无则回退
   到 cwd 自身。
-- `tools`：把七工具 factory 绑定到启动 `cwd`。
+- `tools`：把七工具 factory 绑定到启动 `cwd`；默认七工具由 SDK 在
+  `create_agent_session` 时构建并绑定会话自己的 `CancelToken`，所以 `abort()` / `dispose()`
+  连 `bash` 子进程一起杀（ADR-0022 D3）。
 - `render`（ADR-0004）：前端无关的显示模型。`DisplayItem` 是渲染单元（turn 标记 /
   流式文本片段 / 思考行 / 工具开始与结果 / 停止标记 / token 用量）；
   `map_event(AgentEvent) -> Option<DisplayItem>` 是事件→显示单元的共享纯映射
@@ -332,11 +334,8 @@ provider config seam 见 ADR-0016，hook seam 见 ADR-0015）。折入自 ticket
   -> Result<(Vec<AgentMessage>, StopReason), String>`（ADR-0012 D3 改为收 `Context`，ADR-0009 D5 加
   `on_message` 回调与 `StopReason` 返回值，ADR-0016 加 `&ProviderConfig`，ADR-0020 D6 把
   `AgentEvent::Message` 的 usage 一并交给 sink 并逐条播出 `DisplayItem::Usage`）：逐事件流式回调渲染器，每条进历史的消息（assistant 回复、
-  每个工具结果）同步回调一次 sink（TUI 借此实时追加日志），返回更新后的消息历史与
+  每个工具结果）同步回调一次 sink（SDK 借此实时追加日志），返回更新后的消息历史与
   终止原因（`Completed`/`Cancelled`）。cli 与 tui 共用同一 turn 循环，行为不漂移。
-- `setup`：`setup(cwd) -> (BailianProvider, Vec<Tool>)` 共享 seam，cli 与
-  tui 用同一套 provider + 工具构造，两端不会各自实现而漂移；provider 无状态（ADR-0016），
-  故构造不再收 config，`&ProviderConfig` 由各前端在每轮 turn 传入。
 
 ### crates/tui 终端库（`slimcode-tui`）
 
@@ -493,19 +492,20 @@ CLI 拥有进程与应用生命周期；本 crate 拥有纯 `App` 状态机与�
   `handler.submit(prompt, &mut emit)`（`emit` 就是往通道 send 的闭包）；UI 线程留帧循环
   `event::poll(80ms)` 当帧定时器，poll 事件 + 排空通道（`app.apply`）+ `draw` +
   `app.tick()`，spinner 因此边 HTTP 等待边动画。运行中：裸 `Esc` → `handler.cancel()`
-  （CLI 持有每轮 `CancelToken`，`submit` 开头 `reset()`；worker 在下一 runner 边界 /
+  （CLI 持有 `Arc<AgentSession>`，`submit` 开头由 SDK 重置 cancel；`TuiSession::cancel` 只调
+  `abort()`，worker 在下一 runner 边界 /
   下个 socket chunk 中止在途请求，并杀掉 bash 子进程组；以 `StopReason::Cancelled` 静默
   结束、已流式内容保留、不进历史）；Ctrl+C / Ctrl+D → `Effect::QuitAfterTurn`，其它按键
   忽略。**鼠标事件在两条路径上都转发给 `app.handle_mouse`**（空闲态主循环 + 运行中轮询
   循环），所以运行中照常滚 transcript（3 行/格、滚动条淡出、上滚停跟随且新流式内容
   不把视口拽回底部），而滚轮既不会取消这一轮也不会成为输入（不产生 Effect）；运行中 `Esc` 取消、Ctrl+C/Ctrl+D
-  标记退出后仍不变（ADR-0017 D1/D4/D6）。`handle.is_finished()` 门控 join，任何路径都先 join 再让 CLI 归还 provider/工具
-  （不变量：provider 总被归还）。turn 的收尾全在 CLI：会话持久化为**每条消息实时追加**
-  （ADR-0009 D5），`on_message` sink 把进入历史的每条消息同时推进 session 并
-  `store.append`（追加失败收集为 notice、不打断 turn）；失败/取消且本轮已产出过消息时
+  标记退出后仍不变（ADR-0017 D1/D4/D6）。`handle.is_finished()` 门控 join，任何路径都先 join 再让 worker 归还会话
+  （不变量：会话总被归还）。turn 的收尾由 SDK 完成（ADR-0022 D2）：会话持久化为**每条消息实时追加**
+  （ADR-0009 D5），`run_turn_with_hooks` 的 sink 把进入历史的每条消息同时推进 session 并
+  `store.append`（追加失败不打断 turn）；失败/取消且本轮已产出过消息时
   用 `append_closing` 追加一条带 `stop_reason`（`error`/`aborted`，写在记录信封）与短文本
   的 assistant 消息收尾，保证日志不悬在工具批次上；一轮在首个 assistant 前失败则不产生
-  任何文件。`submit` 返回 `Err` 时库把它渲染成一行错误（CLI 已先关好日志）。
+  任何文件。`submit` 返回 `Err` 时库把它渲染成一行错误（SDK 已先关好日志）。
 - **测试 seam**：决定逻辑都在 `app` 纯 core 与 `footer`/`git` 纯函数里（帧缓冲测试、
   纯单测）；`run` 只有原始 I/O + 通道搬移。CLI 侧有 handler 测试（脚本化 provider +
   记录 emit 的闭包：命令语义、skill 解析、重跑、会话落盘、失败收尾、并发拒绝、cancel
@@ -515,12 +515,15 @@ CLI 拥有进程与应用生命周期；本 crate 拥有纯 `App` 状态机与�
   上边框）/footer 两行/补全弹框/滚动/改尺寸 dock 固定/OSC 0 标题/Ctrl+C 退出/Esc 中途取消
   （spinner 消失、已流式 partial 文本保留、无错误文本、下一 prompt 正常运行）。
 - **one-shot 与 TUI 不漂移**：两端的 `DisplayItem` 映射、`usage_summary` 措辞与
-  `ContextBuilder` 上下文组装仍来自 `app`；one-shot 从一开始就不经 TUI crate。
+  `ContextBuilder` 上下文组装仍来自 `app`；回合编排两端共用 SDK 的 `AgentSession::prompt`
+  （ADR-0022）；one-shot 从一开始就不经 TUI crate。
 
 ### crates/cli 唯一二进制 = 总入口（`slimcode`）
 
-唯一的二进制入口（ADR-0011 D3）：argv / 模式选择 / 配置解析 / 服务构建 / 命令语义 /
-会话落盘 / 两个显示适配器（one-shot 文本与 TUI）全在这里；TUI 只是它进入的一个库。I/O 与
+唯一的二进制入口（ADR-0011 D3），SDK 之上的薄壳（ADR-0022）：argv / 模式选择 /
+终端 / 配置解析（启动时冻结）/ `/` 命令语义 / 输入历史 / 会话 picker 列表 /
+两个显示适配器（one-shot 文本与 TUI）/ 会话对象管理（创建、切换、dispose `AgentSession`）
+全在这里；TUI 只是它进入的一个库，回合编排由 `slimcode-sdk` 统一提供。I/O 与
 逻辑分离（`run(args, out, tty)` 便于测试），按启动规则分派（`std::io::IsTerminal` 判定
 stdout 是否 TTY）：
 
@@ -531,16 +534,18 @@ stdout 是否 TTY）：
   `app::config::merge_config_toml` 纯函数，写回后（Unix）若含 api_key 则
   chmod 600 并打印文件路径；非 TTY / 多余参数报错；不处理 cache（保持手动编辑）；
 - **one-shot**：`slimcode "<prompt>"`（可 `--cwd <dir>`、`--model <model>`、
-  `--base-url <url>`、`--api-key <key>`）经共享 `ContextBuilder` 组装 `Context`（system 单独
-  返回、每轮现组并广告可自动调用 skill；开头的 `/skill:name` 会先被 `normalize_skill_trigger`
-  改写为 `/{name}`，因为 one-shot 没有命令解析器），经共享 `run_turn` 跑一轮七工具循环、流式渲染事件、
-  打印 token 用量；**不落盘会话**（ADR-0009 D5：无交互式会话工作流（picker），与 TUI
+  `--base-url <url>`、`--api-key <key>`）建 `persist: false` 的 `AgentSession`（冻结配置 + skills
+  快照，`with_home` pin 住 home；开头的 `/skill:name` 先被 `normalize_skill_trigger` 改写为
+  `/{name}`，因为 one-shot 没有命令解析器），订阅 `Display` 事件流式渲染（`TextRenderer`），
+  跑一轮 `prompt`；上下文组装（skill 广告 / 环境 / context files）与七工具循环都在 SDK 内
+  （ADR-0022）；**不落盘会话**（ADR-0009 D5：无交互式会话工作流（picker），与 TUI
   「首个 assistant 前失败不建文件」规则一致；`main` 里的启动 `cleanup_empty` 仍执行）；
 - **chmod 提示**：`load_app_config` 之后，若 `ApiKeySource::File` 且（Unix）
   `config.toml` 权限 `mode & 0o077 != 0`，stderr 打印 `chmod 600 <path>` 提示（one-shot
   与 TUI 共用此打印点，TUI 进 alternate screen 前已打过）；非 Unix 跳过；
 - **无 prompt + TTY**：交给 `tui::run`（`cli/src/tui.rs`）启动全屏 TUI（见上节）：
-  构造 provider + 工具、建 `App` 与 `TuiSession` handler、进 raw mode/alternate screen、
+  经 SDK 建首个 `AgentSession`（`with_home` + 冻结配置 + skills 快照）、建 `App` 与
+  `TuiSession` handler、进 raw mode/alternate screen、
   设标题、跑 `slimcode_tui::run`、退出前恢复终端；
 - **无 prompt + 非 TTY**：在配置解析前就以明确错误退出（非零退出码）。
 
@@ -550,17 +555,21 @@ stdout 是否 TTY）：
   screen / 鼠标订阅 / 终端标题 / panic hook / 退出码）：进入 TUI 时发最小鼠标订阅
   `?1000h`+`?1006h`（DECSET press/release + SGR 坐标，**不**订阅 motion、不发
   `XTSHIFTESCAPE`），`restore_terminal()` 发其逆向 `?1006l`+`?1000l`，panic hook 复用
-  同一恢复函数，所以异常退出也不会把鼠标留在 app 手里（ADR-0017 D2/D8）；`TuiSession` 实现 `UiHandler`，拥有 provider
-  与工具（`Mutex` 里，turn 期间 take 出来跑、结束后归还）、session store、input history、
-  skills、context files、environment，并实现**全部命令语义**（`/help` / `/new` / `/session` /
+  同一恢复函数，所以异常退出也不会把鼠标留在 app 手里（ADR-0017 D2/D8）；`TuiSession` 实现 `UiHandler`，持有
+  `Inner { session: Arc<AgentSession>, adapter: Arc<Mutex<TuiAdapter>> }`（ADR-0022 D2）：`submit` 短暂
+  取锁克隆 `Arc` 后调 `prompt`（锁不跨回合），`cancel` 只调 `abort()`（永不等待会话锁），`/new` 与
+  加载只在 worker 空闲时替换并 dispose 旧会话；session store（picker 列表）、input history、skills、home
+  由 CLI 持有并传入，回合编排（prompt 记录、标题推断、落盘、失败/取消收尾、自动压缩、skill read 拦截）
+  全在 SDK。命令语义仍在 CLI（**全部命令语义**（`/help` / `/new` / `/session` /
   `/usage` / `/compact` / `/history` / `/skills` / `/install-skill` / `/exit` / `/!!` /
-  `/!N` / skill 触发 / 未知命令 + did-you-mean）、每轮的上下文组装与会话落盘、失败/取消
-  收尾。每轮 `Completed` 后按 `compaction::should_compact` 自动压缩（剩 ≤16k 空 context 才触发），
-  `/compact` 强制压缩；两者都走 `run_compaction`（调 `compaction::compact_messages`、把
-  `CompactSummary` 追加到日志、替换 `session.messages`），失败只报错不改历史。`/session` 在 UI 线程同步扫 `store.entries()`，把每个摘要拼成
+  `/!N` / skill 触发 / 未知命令 + did-you-mean））。每轮 `Completed` 后 SDK 按
+  `compaction::should_compact` 自动压缩（剩 ≤16k 空 context 才触发），从回填后的会话状态渲染
+  `usage + "context compacted: X → Y tokens"`；`/compact` 走 `compact_now()`（强制压缩、单飞），
+  成功按返回值渲染同一组行、失败渲染错误行；两条路径渲染一致。`/session` 在 UI 线程同步扫 `store.entries()`，把每个摘要拼成
   `SessionRow { id, title: title ?? id, meta: "N msgs  YYYY-MM-DD HH:MM" }` 后发
-  `RenderItem::SessionPicker { rows }`；`Effect::LoadSession { id }` 走与旧 `/load` 同一路径，
-  但先发 `SessionChanged` 再发 title/skipped/repaired/`loaded session` notice（否则清屏会
+  `RenderItem::SessionPicker { rows }`；`Effect::LoadSession { id }` 经 `with_session_id` 建续会（SDK 内部
+  宽容回放，repair 计数提示已移除，ADR-0022 D5），先发 `SessionChanged` 再发 title/`loaded session`
+  notice（否则清屏会
   吃掉提示），**随后把该会话的历史消息重放为 transcript 条目**（`history_to_render_items`：
   user prompt 框 / assistant 文本 / 成对的工具 start-result 块 / `CompactSummary` 压缩边界
   notice），屏幕恢复这段对话而非停在
@@ -568,14 +577,16 @@ stdout 是否 TTY）：
   `/install-skill` 后就地刷新）。
 - `render`：两个 `Renderer` 实现。`TextRenderer` 把共享 `DisplayItem` 流（流式文本 / 流式思考 / 结构行 / 用量汇总）渲染为终端输出，原始 tool_call delta 与
   `Done` 事件被抑制；流式文本与思考（带 `> ` 前缀）按 delta 拼接、不逐 delta 换行，换行只来自内容本身的 `\n`，结构行（工具开始/结果、停止标记、turn 标记）总是另起一行；事件→DisplayItem 的映射是共享的 `app::render::map_event`。
-  `TuiAdapter`（ADR-0014 D2）持有库给的 emit 回调与一个共享的
-  `LiveUsageView`（session 消息历史 + 累计用量，由 CLI 的 on_message 钩子与 session 同步），在 turn 的 worker 线程上把每条
+  `TuiAdapter`（ADR-0014 D2）是 Send + Sync 的状态对象：持有自己的
+  `Mutex<LiveUsageView>`（session 消息历史 + 累计用量，由 SDK 的 `SdkEvent::Message` 更新），
+  `render(item, emit)` 按调用传入 emit，在 turn 的 worker 线程上把每条
   `DisplayItem` 转为 `slimcode_tui::render::RenderItem`；`Turn`/`Stop` 丢弃，`Usage` 经
   `to_footer_usage` 完成 `TokenUsage → FooterUsage` 换算、并以 `to_context_usage`（与压缩触发同一
   `chars/4` 估算器与 200k 窗口）从 `LiveUsageView` 组装 context 段（表驱动单测覆盖每个变体）。
   `DisplayItem` / `Renderer` / `map_event` / `usage_summary` / `run_turn` 仍全在 `app`
   （ADR-0004 未变）。
-- provider + 工具构造经 `app::setup::setup` 与 TUI 共享，两端不会漂移。
+- provider + 工具构造（默认七工具绑定会话自己的 `CancelToken`）由 `create_agent_session` 统一完成
+  （ADR-0022 D3），one-shot 与 TUI 都消费 SDK 的 `AgentSession`，两端不各自实现。
 
 交互能力（历史 recall、`/` 命令、skills、`/new`、`/session`、`/exit`）已整体移入
 TUI（`slimcode-tui`，见上节），行式 REPL 已移除（见 ADR-0003）。

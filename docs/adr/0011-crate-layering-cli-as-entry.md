@@ -35,9 +35,10 @@ with execution behaviour.
 ### D2 — `app` stays the frontend-agnostic application layer
 
 `ContextBuilder`/`Context`, the project-scoped session store, input history, skills,
-`context_files`, the seven coding tools, `setup`, and the display contract (`DisplayItem`,
+`context_files`, the seven coding tools, and the display contract (`DisplayItem`,
 `map_event`, `Renderer`, `usage_summary`, `run_turn`) remain in the
-frontend-agnostic layer. Dissolving this into the CLI (pi's shape, where `pi-coding-agent` owns all
+frontend-agnostic layer. (This layer also held `setup` / `setup_with_cancel` until ADR-0022 deleted
+them as a dead seam.) Dissolving this into the CLI (pi's shape, where `pi-coding-agent` owns all
 of it) was rejected: ADR-0004's investment in shared, non-drifting frontend behaviour is what makes
 a second frontend (or a future web/RPC one) cheap, and a "graphics library" TUI needs a
 non-terminal place for its services to live.

@@ -2,16 +2,18 @@
 //! terminal title, the exit code) and the application handler the terminal
 //! library drives (ADR-0013).
 //!
-//! Everything that decides what should happen lives here: provider and tool
-//! construction, the session store, input history, skills, context files, the
-//! environment, command semantics, the per-turn session writes and the
-//! cancelled/errored turn closing. The library keeps only what exists to keep
-//! the frame loop responsive and knows the app through two vocabularies:
-//! [`Effect`]s out, [`RenderItem`]s in.
+//! The turn orchestration lives in the SDK: this module owns what is genuinely
+//! frontend work — argv-side terminal setup, the session object (create,
+//! switch, dispose), `/` command semantics, input history, the session picker
+//! list, the display adapter — and consumes `slimcode-sdk` for everything a
+//! turn does. The library keeps only what exists to keep the frame loop
+//! responsive and knows the app through two vocabularies: [`Effect`]s out,
+//! [`RenderItem`]s in.
 
+use std::cell::Cell;
 use std::io::{Write, stdout};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crossterm::execute;
 use crossterm::terminal::{
@@ -21,20 +23,16 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use slimcode_ai::{ProviderConfig, TokenUsage};
-use slimcode_app::compaction;
-use slimcode_app::context::{ContextBuilder, Environment, skill_loaded_in};
-use slimcode_app::context_files::ContextFile;
+use slimcode_app::context::skill_loaded_in;
 use slimcode_app::history::{HISTORY_DISPLAY, HistoryStore, render_history, resolve_replay_index};
 use slimcode_app::render::usage_summary;
-use slimcode_app::session::{SessionStore, format_minute, infer_title, unix_secs};
+use slimcode_app::session::{SessionStore, format_minute, unix_secs};
 use slimcode_app::skills::{
-    Skill, SkillScope, SkillStore, find_skill, is_builtin_command, parse_install_args,
-    skill_for_read_args, skill_prompt,
+    Skill, SkillScope, SkillStore, find_skill, is_builtin_command, parse_install_args, skill_prompt,
 };
-use slimcode_core::agent::{
-    CancelToken, Provider, RunConfig, RunHooks, StopReason, Tool, ToolDecision,
+use slimcode_sdk::{
+    AgentSession, AgentSessionOptions, Provider, SdkEvent, Tool, create_agent_session,
 };
-use slimcode_core::session::{AgentMessage, MessageStopReason, Role, Session};
 use slimcode_tui::app::{App, Effect};
 use slimcode_tui::git::{current_branch, terminal_title};
 use slimcode_tui::handler::{
@@ -42,58 +40,47 @@ use slimcode_tui::handler::{
 };
 use slimcode_tui::render::{RenderItem, SessionRow};
 
-use crate::render::{LiveUsageView, TuiAdapter, history_to_render_items};
+use crate::render::{TuiAdapter, history_to_render_items, to_context_usage, to_footer_usage};
 
-/// Enter the TUI: build the runtime, take over the terminal, run the frame
-/// loop, and restore the terminal on every exit path.
-#[allow(clippy::too_many_arguments)]
+/// Enter the TUI: open the session (the SDK owns the store, skills, context
+/// files, provider and tools), take over the terminal, run the frame loop, and
+/// restore the terminal on every exit path.
 pub fn run(
     cwd: &Path,
+    home: &Path,
     config: ProviderConfig,
     store: &SessionStore,
     history: &HistoryStore,
     skills: &SkillStore,
-    context_files: &[ContextFile],
-    environment: Environment,
 ) -> Result<i32, String> {
     let model = config.model.clone();
-    // One token shared by the cancellable tool set and every turn: Esc cancels
-    // whichever phase the run is in.
-    let cancel = CancelToken::new();
-    let (provider, tools) = slimcode_app::setup::setup_with_cancel(cwd, &cancel)?;
-    let session = store.new_session();
+    // The CLI keeps the session object and the display state around it; the
+    // SDK assembled everything else. A config / API-key failure surfaces here,
+    // on the normal terminal, before the alternate screen opens.
+    let mut handler = TuiSession::new(
+        home.to_path_buf(),
+        cwd.to_path_buf(),
+        config,
+        store,
+        history,
+        skills,
+        None,
+    )?;
+    let session = handler.session();
 
     // The `/`-candidate pool (ADR-0014 D3): the command registry plus the
     // skills snapshot, shared with the handler so `/install-skill` refreshes
     // it without a restart.
-    let completions = CliCompletions::new(skills.list().unwrap_or_default());
     let mut app = App::new(
         cwd.display().to_string(),
-        session.id.clone(),
+        session.session_id().to_string(),
         model,
         slimcode_tui::VERSION,
-        Box::new(completions.clone()),
-        crate::render::to_context_usage(&session.messages),
+        Box::new(handler.completions.clone()),
+        to_context_usage(&session.messages()),
     );
     app.set_history(history.load().unwrap_or_default());
     app.apply(RenderItem::Branch(current_branch(cwd)));
-
-    let mut handler = TuiSession {
-        cwd: cwd.to_path_buf(),
-        store,
-        history,
-        skills,
-        context_files: context_files.to_vec(),
-        environment,
-        config,
-        completions,
-        inner: Mutex::new(Inner {
-            session,
-            provider: Some(Box::new(provider)),
-            tools,
-            cancel,
-        }),
-    };
 
     // The terminal belongs to the CLI: raw mode, the alternate screen, the
     // mouse subscription and the title are all set up here, and the panic hook
@@ -120,6 +107,9 @@ pub fn run(
 
     let result = slimcode_tui::run(&mut terminal, app, &mut handler);
     restore_terminal();
+    // Dispose the session on the way out: its listener (and the adapter it
+    // holds) is dropped and an in-flight turn is cancelled.
+    handler.session().dispose();
     result.map(|()| 0)
 }
 
@@ -202,44 +192,260 @@ impl CompletionProvider for CliCompletions {
     }
 }
 
-/// The state a running turn owns: taken out of the handler's mutex for the
-/// duration of the turn so `cancel` never waits behind the provider.
-struct TurnState {
-    provider: Box<dyn Provider + Send>,
-    tools: Vec<Tool>,
-    session: Session,
-    cancel: CancelToken,
+// The emit channel of whichever thread is driving a turn.
+//
+// The SDK delivers its events synchronously on the thread that called
+// `prompt` / `compact_now`, and the session's listener has no other way to
+// reach the library's `emit` callback (which is only valid for the duration
+// of that call). `submit` (the worker thread) and `/compact` (the frame
+// thread) therefore bind their own `emit` here for the call, and the listener
+// reads the slot on the same thread: a thread-local, so there is no locking
+// and no cross-thread access.
+thread_local! {
+    static EMIT_SLOT: Cell<Option<*mut ErasedEmit>> = const { Cell::new(None) };
 }
 
-/// The mutable state the worker thread touches: the live session, the provider
-/// and tools (moved in and out per turn) and the cancel token.
+/// `dyn FnMut(RenderItem)` with the (scoped) borrow's lifetime erased, so a
+/// thread-local can hold a pointer to the caller's closure. The erasure is
+/// only sound inside [`with_emit_slot`]'s scope; nothing else may build one.
+type ErasedEmit = dyn FnMut(RenderItem) + 'static;
+
+/// Bind `emit` as this thread's channel for the duration of `f`, clearing the
+/// slot afterwards even on unwind.
+fn with_emit_slot<R>(emit: &mut dyn FnMut(RenderItem), f: impl FnOnce() -> R) -> R {
+    /// Clears the slot on every exit path.
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            EMIT_SLOT.with(|slot| slot.set(None));
+        }
+    }
+    let pointer: *mut (dyn FnMut(RenderItem) + '_) = emit;
+    // SAFETY: `pointer` is derived from `emit`, which stays borrowed for the
+    // whole call, and the slot is cleared by the guard below before that
+    // borrow ends — so the erased lifetime is never observed outside the
+    // scope the pointer is valid in.
+    let erased = unsafe {
+        std::mem::transmute_copy::<*mut (dyn FnMut(RenderItem) + '_), *mut ErasedEmit>(&pointer)
+    };
+    EMIT_SLOT.with(|slot| slot.set(Some(erased)));
+    let _clear = Clear;
+    f()
+}
+
+/// Forward one render item to this thread's bound channel. An item arriving
+/// with no channel bound is dropped: events only arrive on a thread driving a
+/// turn, which always binds one.
+fn emit_render_item(item: RenderItem) {
+    let emit = EMIT_SLOT.with(|slot| slot.get());
+    if let Some(emit) = emit {
+        // SAFETY: the slot holds a pointer derived from the `&mut` that
+        // `with_emit_slot` still borrows for the whole call, and it is set and
+        // read on that thread only (the slot is thread-local) and cleared
+        // before the borrow ends, so the reference cannot outlive it or race
+        // another access.
+        let emit = unsafe { &mut *emit };
+        emit(item);
+    }
+}
+
+/// The closure form of [`emit_render_item`], for the `emit` parameters.
+fn slot_emitter() -> impl FnMut(RenderItem) {
+    emit_render_item
+}
+
+/// Rebuilds one session's provider and tools.
+///
+/// An `AgentSession` owns the provider and tools it runs, so a `/new` or a load
+/// needs fresh ones: this is the CLI's host / test seam, while production
+/// passes `None` and every session gets the SDK's `BailianProvider` and the
+/// seven default tools bound to `cwd`.
+type SessionDeps = Arc<dyn Fn() -> (Box<dyn Provider + Send>, Vec<Tool>) + Send + Sync>;
+
+/// The session the handler currently drives and the adapter its events render
+/// through. Both are `Arc`-shared: a turn runs on the worker thread with a
+/// clone of the session, and the session's listener holds the adapter.
 struct Inner {
-    session: Session,
-    provider: Option<Box<dyn Provider + Send>>,
-    tools: Vec<Tool>,
-    cancel: CancelToken,
+    session: Arc<AgentSession>,
+    adapter: Arc<Mutex<TuiAdapter>>,
+}
+
+/// Open a session and the adapter its events render through.
+///
+/// The SDK assembles everything else: the session store under the pinned home,
+/// the provider and tools (`deps` for a host / test seam, the SDK defaults
+/// otherwise), skill discovery (from the explicit `skills` snapshot) and
+/// context-file discovery. The frozen startup config rides along as overrides,
+/// which win in the SDK's four-layer resolution — so a new session reproduces
+/// the values the CLI resolved at startup instead of re-reading `config.toml`
+/// (ADR-0016). `session_id` resumes a persisted session (`/session`) instead of
+/// starting fresh.
+fn open_session(
+    cwd: &Path,
+    home: &Path,
+    config: &ProviderConfig,
+    skills: Vec<Skill>,
+    deps: Option<&SessionDeps>,
+    session_id: Option<String>,
+) -> Result<Inner, String> {
+    let mut options = AgentSessionOptions::new(Some(cwd.to_path_buf()))
+        .with_home(home.to_path_buf())
+        .with_base_url(config.base_url.clone())
+        .with_model(config.model.clone())
+        .with_api_key(config.api_key.clone())
+        .with_cache(config.cache)
+        .with_skills(skills.clone());
+    if let Some(id) = session_id {
+        options = options.with_session_id(id);
+    }
+    if let Some(deps) = deps {
+        let (provider, tools) = deps();
+        options = options.with_provider(provider).with_tools(tools);
+    }
+    let session = Arc::new(create_agent_session(options)?);
+    let adapter = TuiAdapter::new(skills, cwd.to_path_buf());
+    // The live view starts in lockstep with the session: a fresh session is
+    // empty, a resumed one already has a history whose footer estimate the
+    // first usage render must report.
+    adapter.reseed(session.messages(), session.usage());
+    let adapter = Arc::new(Mutex::new(adapter));
+    // The returned unsubscribe handle is dropped on purpose: the listener
+    // lives for the session's whole life, and `dispose` clears it.
+    let _unsubscribe = session.subscribe({
+        let adapter = Arc::clone(&adapter);
+        // A weak handle, not a clone: the listener lives inside the session's
+        // listener list, so holding the session strongly here would leak it.
+        let session = Arc::downgrade(&session);
+        move |event| route_event(&adapter, session.upgrade().as_deref(), event)
+    });
+    Ok(Inner { session, adapter })
+}
+
+/// Route one SDK event: display items render through the adapter, messages
+/// feed its live view (the streamed display already shows them, so nothing is
+/// rendered), the turn end needs nothing, and a compaction re-reads the
+/// session into the live view, refreshes the footer and reports the token
+/// change — the same rendering `/compact` gets, because both paths end in the
+/// same `Compacted` event.
+///
+/// `session` is `None` only when the session is already gone (the listener
+/// cannot outlive it for long).
+fn route_event(adapter: &Arc<Mutex<TuiAdapter>>, session: Option<&AgentSession>, event: SdkEvent) {
+    let mut emit = slot_emitter();
+    let adapter = adapter.lock().unwrap_or_else(|e| e.into_inner());
+    match event {
+        SdkEvent::Display(item) => adapter.render(&item, &mut emit),
+        SdkEvent::Message { message, usage } => adapter.note_message(&message, usage.as_ref()),
+        SdkEvent::TurnFinished { .. } => {}
+        SdkEvent::Compacted { before, after } => {
+            // The event carries only the token counts: the compacted history
+            // itself comes from the session, so the footer's context segment
+            // is the post-compaction estimate.
+            if let Some(session) = session {
+                adapter.reseed(session.messages(), session.usage());
+            }
+            adapter.note_compacted(before, after, &mut emit);
+        }
+    }
 }
 
 /// The CLI's application handler: everything the TUI needs from a frontend
 /// that knows about sessions, skills and the model (ADR-0013 D1).
 struct TuiSession<'a> {
+    /// The pinned slimcode home: the session store root, and where the SDK
+    /// discovers skills and context files (ADR-0009).
+    home: PathBuf,
     cwd: PathBuf,
     store: &'a SessionStore,
     history: &'a HistoryStore,
     skills: &'a SkillStore,
-    context_files: Vec<ContextFile>,
-    environment: Environment,
-    /// The resolved provider config (ADR-0016). Held here for the whole
-    /// session and threaded into every turn's `run_turn` call; the provider
-    /// instance stays stateless.
+    /// The provider config resolved once at startup (ADR-0016). Frozen: it is
+    /// passed to every session as overrides, so `/new` and a load never drift
+    /// from the model the footer shows (spec decision 4).
     config: ProviderConfig,
+    /// The provider / tool seam (a host or a test builds sessions with its own
+    /// provider); `None` = the SDK defaults.
+    deps: Option<SessionDeps>,
     completions: CliCompletions,
     inner: Mutex<Inner>,
 }
 
-impl TuiSession<'_> {
+impl<'a> TuiSession<'a> {
+    /// Wire the handler around its first session. The session itself is built
+    /// by the SDK (`open_session`), so a provider / config error surfaces here
+    /// before the terminal is taken over.
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        home: PathBuf,
+        cwd: PathBuf,
+        config: ProviderConfig,
+        store: &'a SessionStore,
+        history: &'a HistoryStore,
+        skills: &'a SkillStore,
+        deps: Option<SessionDeps>,
+    ) -> Result<TuiSession<'a>, String> {
+        let inner = open_session(
+            &cwd,
+            &home,
+            &config,
+            skills.list().unwrap_or_default(),
+            deps.as_ref(),
+            None,
+        )?;
+        Ok(TuiSession {
+            home,
+            cwd,
+            store,
+            history,
+            skills,
+            config,
+            deps,
+            completions: CliCompletions::new(skills.list().unwrap_or_default()),
+            inner: Mutex::new(inner),
+        })
+    }
+
+    /// The session the handler currently drives, cloned out under a short
+    /// lock: nothing is held across a turn, and `cancel` never waits for one.
+    fn session(&self) -> Arc<AgentSession> {
+        Arc::clone(&self.inner.lock().unwrap_or_else(|e| e.into_inner()).session)
+    }
+
+    /// The session and the adapter its events render through, cloned out the
+    /// same way.
+    fn current(&self) -> (Arc<AgentSession>, Arc<Mutex<TuiAdapter>>) {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        (Arc::clone(&inner.session), Arc::clone(&inner.adapter))
+    }
+
     fn session_id(&self) -> String {
-        self.inner.lock().expect("session lock").session.id.clone()
+        self.session().session_id().to_string()
+    }
+
+    /// Build a replacement session: `/new` (`None`) or a load (`Some(id)`).
+    fn open(&self, session_id: Option<String>) -> Result<Inner, String> {
+        open_session(
+            &self.cwd,
+            &self.home,
+            &self.config,
+            self.skills_snapshot(),
+            self.deps.as_ref(),
+            session_id,
+        )
+    }
+
+    /// Install a freshly built session as the current one, disposing the old
+    /// one (which also drops its listener). Only the frame thread reaches this,
+    /// and only while the worker is idle — the library ignores ordinary keys
+    /// during a turn (ADR-0013 D2) — so no turn can race the swap.
+    fn replace_session(&self, opened: Inner) {
+        let old = {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let old = std::mem::replace(&mut inner.session, opened.session);
+            inner.adapter = opened.adapter;
+            old
+        };
+        old.dispose();
     }
 
     fn skills_snapshot(&self) -> Vec<Skill> {
@@ -289,14 +495,7 @@ impl TuiSession<'_> {
         // Skill trigger: `/skill-name` or the canonical `/skill:name`.
         let skills = self.skills_snapshot();
         if let Some(skill) = find_skill(&skills, name) {
-            let history = self
-                .inner
-                .lock()
-                .expect("session lock")
-                .session
-                .messages
-                .clone();
-            let already_loaded = skill_loaded_in(&history, skill);
+            let already_loaded = skill_loaded_in(&self.session().messages(), skill);
             // The skill active block is shown as its own display unit before
             // the turn starts, like the replay path shows the boxed prompt.
             // The display block carries the inner content (name/`location`
@@ -359,14 +558,23 @@ impl TuiSession<'_> {
     /// branch/title. The footer's usage + context restart: the Usage item
     /// right after the SessionChanged re-establishes the context segment
     /// (hidden by the change, ticket 05) at the fresh session's 0%-estimate.
+    ///
+    /// The session is built by the SDK from the same frozen startup config, so
+    /// `/new` cannot drift to another model or provider.
     fn new_session(&self, emit: &mut dyn FnMut(RenderItem)) -> ControlFlow {
-        let session = self.store.new_session();
-        let id = session.id.clone();
-        self.inner.lock().expect("session lock").session = session;
+        let opened = match self.open(None) {
+            Ok(opened) => opened,
+            Err(e) => {
+                emit(RenderItem::Error(e));
+                return ControlFlow::Continue;
+            }
+        };
+        let id = opened.session.session_id().to_string();
+        self.replace_session(opened);
         emit(RenderItem::SessionChanged { id: id.clone() });
         emit(RenderItem::Usage {
-            usage: crate::render::to_footer_usage(&TokenUsage::default()),
-            context: Some(crate::render::to_context_usage(&[])),
+            usage: to_footer_usage(&TokenUsage::default()),
+            context: Some(to_context_usage(&[])),
         });
         emit(RenderItem::Notice(format!("new session: {id}")));
         emit(RenderItem::Branch(current_branch(&self.cwd)));
@@ -374,7 +582,10 @@ impl TuiSession<'_> {
         ControlFlow::Continue
     }
 
-    /// Load a saved session, reporting the lenient-replay repair counters.
+    /// Load a saved session: the SDK replays the id's log (title, messages,
+    /// the newest compaction checkpoint as the boundary), the transcript shows
+    /// the restored conversation again and the footer restarts from zero usage
+    /// with the restored history's context estimate.
     ///
     /// Picking the session that is already current is a no-op (ADR-0018 D3):
     /// reloading would re-read the log, drop the in-memory history that is
@@ -390,46 +601,31 @@ impl TuiSession<'_> {
         if id == self.session_id() {
             return ControlFlow::Continue;
         }
-        let outcome = match self.store.load(id) {
-            Ok(outcome) => outcome,
+        let opened = match self.open(Some(id.to_string())) {
+            Ok(opened) => opened,
             Err(e) => {
                 emit(RenderItem::Error(e));
                 return ControlFlow::Continue;
             }
         };
-        let title = outcome.session.title.clone();
-        let skipped_records = outcome.skipped_records;
-        let repaired_tool_calls = outcome.repaired_tool_calls;
-        let session = outcome.session;
-        let id = session.id.clone();
-        // Replay the loaded conversation into the transcript (before the
-        // session moves into `self.inner`).
-        let history_items = history_to_render_items(&session.messages);
+        let session = Arc::clone(&opened.session);
+        let id = session.session_id().to_string();
+        let title = session.title();
         // Usage is never persisted (ADR-0018 D4: it is a live-session
         // concern), so a loaded session starts at zero; its context estimate
         // comes from the restored history. Both feed the Usage item that
         // re-establishes the footer's context segment after the change
         // (hidden by SessionChanged, ticket 05).
-        let usage = session.usage;
-        let messages = session.messages.clone();
-        self.inner.lock().expect("session lock").session = session;
+        let messages = session.messages();
+        let history_items = history_to_render_items(&messages);
+        self.replace_session(opened);
         emit(RenderItem::SessionChanged { id: id.clone() });
         emit(RenderItem::Usage {
-            usage: crate::render::to_footer_usage(&usage),
-            context: Some(crate::render::to_context_usage(&messages)),
+            usage: to_footer_usage(&session.usage()),
+            context: Some(to_context_usage(&messages)),
         });
         if let Some(title) = &title {
             emit(RenderItem::Notice(format!("  title: {title}")));
-        }
-        if skipped_records > 0 {
-            emit(RenderItem::Notice(format!(
-                "  skipped {skipped_records} unreadable record(s)"
-            )));
-        }
-        if repaired_tool_calls > 0 {
-            emit(RenderItem::Notice(format!(
-                "  repaired {repaired_tool_calls} interrupted tool call(s)"
-            )));
         }
         emit(RenderItem::Notice(format!("loaded session: {id}")));
         for item in history_items {
@@ -467,10 +663,10 @@ impl TuiSession<'_> {
     }
 
     /// The live session's own cumulative token usage, worded by the app layer
-    /// (`usage_summary`, ADR-0014 D4). The provider's running total is the
-    /// runtime's counter, not the display's source (ADR-0018 D4).
+    /// (`usage_summary`, ADR-0014 D4). The session is the display's source
+    /// (ADR-0018 D4).
     fn show_usage(&self, emit: &mut dyn FnMut(RenderItem)) -> ControlFlow {
-        let usage = self.inner.lock().expect("session lock").session.usage;
+        let usage = self.session().usage();
         emit(RenderItem::Notice(usage_summary(&usage)));
         ControlFlow::Continue
     }
@@ -559,314 +755,23 @@ impl TuiSession<'_> {
         })
     }
 
-    /// Take the turn state out of the mutex, so the turn can run without
-    /// holding the lock (Esc has to reach the cancel token while it does).
-    fn take_turn(&self) -> Result<TurnState, String> {
-        let mut inner = self.inner.lock().expect("session lock");
-        let Some(provider) = inner.provider.take() else {
-            return Err("a turn is already running".to_string());
-        };
-        // Esc cancels the turn in flight; a fresh turn starts uncancelled.
-        inner.cancel.reset();
-        Ok(TurnState {
-            provider,
-            tools: std::mem::take(&mut inner.tools),
-            session: inner.session.clone(),
-            cancel: inner.cancel.clone(),
-        })
-    }
-
-    /// Put the provider, tools and the turn's resulting session back.
-    fn put_turn(&self, state: TurnState) {
-        let mut inner = self.inner.lock().expect("session lock");
-        inner.provider = Some(state.provider);
-        inner.tools = state.tools;
-        inner.session = state.session;
-    }
-
-    /// Close the session log after a failed/cancelled turn: an assistant
-    /// message with a short, non-empty text enters memory and is appended, so
-    /// the live session adopts the partial turn and the log ends on an
-    /// assistant boundary (ADR-0009 D3). The turn's reason rides the record
-    /// envelope (ADR-0012 D4), never the message payload.
-    fn close_turn(
-        &self,
-        state: &mut TurnState,
-        reason: MessageStopReason,
-        error: Option<String>,
-        emit: &mut dyn FnMut(RenderItem),
-    ) {
-        let text = match &error {
-            Some(e) => format!("The turn ended with an error: {e}"),
-            None => "The turn was cancelled.".to_string(),
-        };
-        let message = AgentMessage::text(Role::Assistant, text);
-        state.session.messages.push(message.clone());
-        if let Err(e) =
-            self.store
-                .append_closing(&state.session, &message, &reason, error.as_deref())
-        {
-            emit(RenderItem::Notice(format!("session log: {e}")));
-        }
-    }
-
     /// `/compact`: summarize the live session's older history on demand,
     /// regardless of the threshold (spec `.scratch/compact`).
+    ///
+    /// The frame thread drives the compaction, so it binds its own emit channel
+    /// for the call: the session's listener renders the result through it —
+    /// the footer's usage + context and the token change — exactly like the
+    /// automatic path, which reaches the same `Compacted` event. Only a failure
+    /// is reported here, from the return value (the automatic path stays silent
+    /// for failures).
     fn compact_now(&self, emit: &mut dyn FnMut(RenderItem)) -> ControlFlow {
-        let mut state = match self.take_turn() {
-            Ok(state) => state,
-            Err(e) => {
-                emit(RenderItem::Error(e));
-                return ControlFlow::Continue;
-            }
-        };
-        self.run_compaction(
-            &mut state.session,
-            &mut state.provider,
-            &state.cancel,
-            true,
-            emit,
-        );
-        self.put_turn(state);
-        ControlFlow::Continue
-    }
-
-    /// Compact `session`'s history when it crossed the threshold (or when the
-    /// user forced it with `/compact`), persist the checkpoint, and report the
-    /// token change. A failure leaves the history untouched (the turn's result
-    /// survives) and surfaces an error line.
-    fn run_compaction(
-        &self,
-        session: &mut Session,
-        provider: &mut Box<dyn Provider + Send>,
-        cancel: &CancelToken,
-        force: bool,
-        emit: &mut dyn FnMut(RenderItem),
-    ) {
-        if !force && !compaction::should_compact(&session.messages) {
-            return;
-        }
-        let before = compaction::estimate_total_tokens(&session.messages);
+        let session = self.session();
         emit(RenderItem::Notice("compressing context…".to_string()));
-        // The summary request spends tokens too (ADR-0018 D4): snapshot the
-        // provider total so the compaction's own cost lands in `session.usage`.
-        let usage_before = provider.total_usage();
-        let compacted =
-            match compaction::compact_messages(provider, &self.config, cancel, &session.messages) {
-                Ok(compacted) => compacted,
-                Err(e) => {
-                    emit(RenderItem::Error(format!("compaction failed: {e}")));
-                    return;
-                }
-            };
-        session.messages = compacted;
-        // Persist the checkpoint as the boundary it is. The log is
-        // append-only: the records it replaces stay on disk, and the load path
-        // drops everything before the newest checkpoint, so a reload feeds the
-        // model the same compacted view (ADR-0020 D2).
-        if let Some(checkpoint) = session.messages.first()
-            && let Err(e) = self.store.append(session, checkpoint)
-        {
-            emit(RenderItem::Notice(format!("session log: {e}")));
+        let result = with_emit_slot(emit, || session.compact_now());
+        if let Err(e) = result {
+            emit(RenderItem::Error(format!("compaction failed: {e}")));
         }
-        session.usage = session
-            .usage
-            .saturating_add(&provider.total_usage().saturating_sub(&usage_before));
-        // The footer updates with the compaction's own cost and the context
-        // segment re-estimates from the compacted history (ticket 04).
-        emit(RenderItem::Usage {
-            usage: crate::render::to_footer_usage(&session.usage),
-            context: Some(crate::render::to_context_usage(&session.messages)),
-        });
-        let after = compaction::estimate_total_tokens(&session.messages);
-        emit(RenderItem::Notice(format!(
-            "context compacted: {before} → {after} tokens"
-        )));
-    }
-
-    /// Run one whole turn: assemble the context, record the prompt, stream the
-    /// agent loop into the transcript, append every message that enters
-    /// history, and close the log on failure (ADR-0009 D2/D5).
-    fn run_turn(
-        &self,
-        state: &mut TurnState,
-        skills: &[Skill],
-        prompt: Prompt,
-        emit: &mut dyn FnMut(RenderItem),
-    ) -> Result<TurnReport, String> {
-        let title_was_none = state.session.title.is_none();
-        let context = ContextBuilder::new()
-            .with_environment(self.environment.clone())
-            .with_context_files(&self.context_files)
-            .with_skills(skills)
-            .with_history(state.session.messages.clone())
-            .with_user_prompt(&prompt.text)
-            .build()?;
-        // A turn adds exactly one message to history — the user prompt. The
-        // system prompt is assembled per turn and never stored (ADR-0012 D3).
-        let prompt_msg = context
-            .messages
-            .last()
-            .expect("context always has a prompt message")
-            .clone();
-        state.session.messages.push(prompt_msg.clone());
-        if let Err(e) = self.store.append(&state.session, &prompt_msg) {
-            emit(RenderItem::Notice(format!("session log: {e}")));
-        }
-        if title_was_none {
-            // Read the raw history, not the assembled context: a compaction
-            // checkpoint is not a prompt and must never become the title.
-            state.session.title = infer_title(&state.session.messages);
-        }
-        // A title that only became known now must reach an existing log: the
-        // creation header is already written, so it needs its own record
-        // (ADR-0009 D1).
-        if title_was_none
-            && let Some(title) = state.session.title.as_ref()
-            && let Ok(path) = self.store.session_path(&state.session.id)
-            && path.exists()
-            && let Err(e) = self.store.append_title(&state.session, title)
-        {
-            emit(RenderItem::Notice(format!("session log: {e}")));
-        }
-        // Record the typed prompt before the turn, so a failed turn still
-        // records what the user wrote.
-        if prompt.record
-            && let Err(e) = self.history.append(&prompt.text)
-        {
-            emit(RenderItem::Notice(format!("history: {e}")));
-        }
-
-        let cfg = RunConfig::default();
-        let mut appended = 0usize;
-        let mut append_errors: Vec<String> = Vec::new();
-        // A turn that dies before producing anything must still close an
-        // existing log on an assistant boundary; a turn with no log yet leaves
-        // none (the closing message would otherwise be the file's first
-        // assistant message and create one — ADR-0009 D5).
-        let log_exists = self
-            .store
-            .session_path(&state.session.id)
-            .map(|path| path.exists())
-            .unwrap_or(false);
-        // Usage belongs to the live session (ADR-0018 D4): the hook below
-        // accumulates each request's usage into it as the assistant messages
-        // arrive (ticket 03), replacing the old turn-end provider diff.
-        //
-        // The TUI adapter reads a shared view of the session to build the
-        // footer's usage + context item (ticket 04): seeded with the session
-        // as it enters the turn (including this turn's prompt), the hook
-        // keeps it in lockstep before each render, so the estimate always
-        // includes the just-completed assistant message.
-        let live = std::cell::RefCell::new(LiveUsageView {
-            messages: state.session.messages.clone(),
-            usage: state.session.usage,
-        });
-        let live = &live;
-        // Skill dedup history: the messages in play when the turn starts,
-        // including this turn's prompt. A `/skill:name` trigger prompt already
-        // carries the skill block, so a redundant `read` of the same skill in
-        // the same turn gives the already-loaded notice instead of the body a
-        // second time.
-        let history_for_skill_dedup = state.session.messages.clone();
-        let TurnState {
-            provider,
-            tools,
-            session,
-            cancel,
-        } = state;
-        let result = slimcode_app::runner::run_turn_with_hooks(
-            provider,
-            tools,
-            context,
-            &cfg,
-            &self.config,
-            cancel,
-            &mut TuiAdapter::with_skills(emit, skills.to_vec(), self.cwd.clone(), live),
-            &mut |msg: &AgentMessage, usage: Option<&TokenUsage>| -> Result<(), String> {
-                // The message entered history: mirror it into the session and
-                // append it to the log. Persistence is best-effort — a storage
-                // hiccup must not abort the turn.
-                session.messages.push(msg.clone());
-                appended += 1;
-                // The request's usage (None on tool results) accumulates into
-                // the session (ticket 03); a cancelled request never produces
-                // an assistant message, so it never lands here.
-                if let Some(u) = usage {
-                    session.usage = session.usage.saturating_add(u);
-                }
-                if let Err(e) = self.store.append(session, msg) {
-                    append_errors.push(e);
-                }
-                // Mirror into the adapter's live view *before* the sink
-                // renders the Usage item for this message, so the footer's
-                // estimate already includes it.
-                let mut live_view = live.borrow_mut();
-                live_view.messages.push(msg.clone());
-                live_view.usage = session.usage;
-                Ok(())
-            },
-            RunHooks {
-                before_tool: Some(Box::new(&mut |msg: &mut AgentMessage, index: usize| {
-                    let Some(call) = msg.tool_calls().get(index) else {
-                        return Ok(ToolDecision::Run);
-                    };
-                    if call.name != "read" {
-                        return Ok(ToolDecision::Run);
-                    }
-                    let Some(skill) = skill_for_read_args(skills, &self.cwd, &call.arguments)
-                    else {
-                        return Ok(ToolDecision::Run);
-                    };
-                    // A read of a skill's own file is served as the skill
-                    // active block — the full block on first load, the
-                    // already-loaded notice plus the base-dir and resource
-                    // hints when the skill is already in the message list.
-                    let already_loaded = skill_loaded_in(&history_for_skill_dedup, skill);
-                    Ok(ToolDecision::Skip(Ok(skill_prompt(
-                        skill,
-                        None,
-                        already_loaded,
-                    ))))
-                })),
-                ..Default::default()
-            },
-        );
-        for e in &append_errors {
-            emit(RenderItem::Notice(format!("session log: {e}")));
-        }
-        // The footer's usage + context already flowed per assistant message
-        // through the adapter (ticket 03): no turn-end Usage emit.
-        match result {
-            Ok((_, StopReason::Completed)) => {
-                // Auto-compaction (spec `.scratch/compact`): only a completed
-                // turn triggers it, and only once the history crossed the
-                // threshold. The compaction call reuses the same provider, so
-                // a failed compaction leaves the turn's result in place and
-                // the next turn simply sees the full history again.
-                self.run_compaction(session, provider, cancel, false, emit);
-            }
-            Ok((_, StopReason::Cancelled)) => {
-                // Esc: the partial turn is adopted; the log is closed on an
-                // assistant boundary so it never ends on a dangling tool batch
-                // (ADR-0009 D3).
-                if appended > 0 || log_exists {
-                    self.close_turn(state, MessageStopReason::Aborted, None, emit);
-                }
-            }
-            Err(e) => {
-                // A failed turn still leaves the session persisted, with its
-                // prior messages intact; the failure closes the log on an
-                // assistant boundary (or leaves no file at all if the turn was
-                // the session's first and produced nothing). The library shows
-                // the returned error.
-                if appended > 0 || log_exists {
-                    self.close_turn(state, MessageStopReason::Error, Some(e.clone()), emit);
-                }
-                return Err(e);
-            }
-        }
-        Ok(TurnReport { appended })
+        ControlFlow::Continue
     }
 }
 
@@ -890,15 +795,42 @@ impl UiHandler for TuiSession<'_> {
         prompt: Prompt,
         emit: &mut dyn FnMut(RenderItem),
     ) -> Result<TurnReport, String> {
-        let skills = self.skills_snapshot();
-        let mut state = self.take_turn()?;
-        let result = self.run_turn(&mut state, &skills, prompt, emit);
-        self.put_turn(state);
-        result
+        // A short lock clones the session and its adapter out; the turn then
+        // runs without holding anything, so `cancel` (the frame thread) only
+        // ever touches the session's cancel token and never waits here.
+        let (session, adapter) = self.current();
+        // The typed prompt is recorded before the turn, so a failed turn still
+        // records what the user wrote (input history stays a CLI concern,
+        // ADR-0013 D3).
+        if prompt.record
+            && let Err(e) = self.history.append(&prompt.text)
+        {
+            emit(RenderItem::Notice(format!("history: {e}")));
+        }
+        // The adapter's live view starts this turn in lockstep with the
+        // session: the per-message usage renders then report the session's
+        // history and totals (ADR-0018 D4).
+        adapter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reseed(session.messages(), session.usage());
+        let before = session.messages().len();
+        // The SDK delivers its events synchronously on this worker thread and
+        // only while `prompt` runs, so binding this thread's emit channel here
+        // is what keeps the turn streaming into the transcript.
+        let result = with_emit_slot(emit, || session.prompt(&prompt.text));
+        result.map(|_| TurnReport {
+            // `appended` counts what the turn itself produced: everything that
+            // entered history except the prompt it was built from.
+            appended: session.messages().len().saturating_sub(before + 1),
+        })
     }
 
     fn cancel(&self) {
-        self.inner.lock().expect("session lock").cancel.cancel();
+        // Only sets the session's cancel token: never waits on the session
+        // lock, so Esc reaches an in-flight turn (and its bash child) from the
+        // frame thread (ADR-0013 D2).
+        self.session().abort();
     }
 }
 
@@ -945,12 +877,17 @@ fn parse_replay_index(text: &str) -> Option<usize> {
 mod tests {
     use super::*;
 
-    use slimcode_tui::footer::{ContextUsage, FooterUsage};
     use std::fs;
+    use std::sync::Condvar;
 
     use slimcode_ai::wire::TokenUsage;
     use slimcode_ai::{Delta, FinishReason};
-    use slimcode_core::session::Message;
+    use slimcode_app::context::ContextBuilder;
+    use slimcode_app::session::project_key;
+    use slimcode_core::agent::{CancelToken, ToolSpec};
+    use slimcode_core::session::{Message, Role};
+    use slimcode_sdk::AgentMessage;
+    use slimcode_tui::footer::{ContextUsage, FooterUsage};
 
     /// A scratch directory for one test, removed on drop.
     struct Scratch {
@@ -980,6 +917,49 @@ mod tests {
         }
     }
 
+    /// A gate a test uses to hold a request mid-flight: the provider marks the
+    /// request entered and blocks until the test opens the gate.
+    #[derive(Clone)]
+    struct Gate {
+        state: Arc<(Mutex<(bool, bool)>, Condvar)>,
+    }
+
+    impl Gate {
+        fn new() -> Self {
+            Self {
+                state: Arc::new((Mutex::new((false, false)), Condvar::new())),
+            }
+        }
+
+        /// The provider's side: mark the request entered, then block until the
+        /// test opens the gate.
+        fn enter(&self) {
+            let (lock, cv) = &*self.state;
+            let mut state = lock.lock().expect("gate lock");
+            state.0 = true;
+            cv.notify_all();
+            while !state.1 {
+                state = cv.wait(state).expect("gate wait");
+            }
+        }
+
+        /// The test's side: wait until a request entered the gate.
+        fn wait_entered(&self) {
+            let (lock, cv) = &*self.state;
+            let mut state = lock.lock().expect("gate lock");
+            while !state.0 {
+                state = cv.wait(state).expect("gate wait");
+            }
+        }
+
+        /// The test's side: release the request.
+        fn open(&self) {
+            let (lock, cv) = &*self.state;
+            lock.lock().expect("gate lock").1 = true;
+            cv.notify_all();
+        }
+    }
+
     /// A scripted provider: each `chat` returns the next delta batch, and
     /// `fail_at` makes one call fail the way a network error does.
     struct FakeProvider {
@@ -993,6 +973,8 @@ mod tests {
         /// Cancel the shared token before returning the Nth call's batch
         /// (1-based), simulating Esc arriving mid-request.
         cancel_on_call: Option<usize>,
+        /// Hold the request in flight until the test opens the gate.
+        gate: Option<Gate>,
     }
 
     impl FakeProvider {
@@ -1004,6 +986,7 @@ mod tests {
                 usage: TokenUsage::default(),
                 per_call: TokenUsage::default(),
                 cancel_on_call: None,
+                gate: None,
             }
         }
 
@@ -1017,17 +1000,7 @@ mod tests {
                 usage: TokenUsage::default(),
                 per_call: TokenUsage::default(),
                 cancel_on_call: None,
-            }
-        }
-
-        fn with_usage(usage: TokenUsage) -> Self {
-            Self {
-                script: Vec::new(),
-                calls: 0,
-                fail_at: None,
-                usage,
-                per_call: TokenUsage::default(),
-                cancel_on_call: None,
+                gate: None,
             }
         }
 
@@ -1042,13 +1015,19 @@ mod tests {
             self.cancel_on_call = Some(call);
             self
         }
+
+        /// Block every request on `gate` until the test opens it.
+        fn blocking(mut self, gate: Gate) -> Self {
+            self.gate = Some(gate);
+            self
+        }
     }
 
     impl Provider for FakeProvider {
         fn chat(
             &mut self,
             _messages: &[Message],
-            _tools: &[slimcode_core::agent::ToolSpec],
+            _tools: &[ToolSpec],
             _config: &ProviderConfig,
             cancel: &CancelToken,
             on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
@@ -1059,6 +1038,9 @@ mod tests {
             if self.cancel_on_call == Some(self.calls + 1) {
                 cancel.cancel();
             }
+            if let Some(gate) = &self.gate {
+                gate.enter();
+            }
             let batch = self.script.get(self.calls).cloned().unwrap_or_default();
             self.calls += 1;
             self.usage = self.usage.saturating_add(&self.per_call);
@@ -1067,8 +1049,8 @@ mod tests {
             for delta in batch {
                 on_delta(delta)?;
             }
-            // The request's usage rides the return value (ticket 01): what
-            // the runner attaches to the assistant message event. The runner
+            // The request's usage rides the return value (ticket 01): what the
+            // runner attaches to the assistant message event. The runner
             // discards it when the cancel above won the race.
             Ok(Some(self.per_call))
         }
@@ -1078,7 +1060,54 @@ mod tests {
         }
     }
 
-    /// The stores one handler needs, kept alive for the handler's borrows.
+    /// A provider handle every session a handler opens shares, so a scripted
+    /// call sequence survives `/new` and a load: the SDK moves its provider into
+    /// the session it builds, so the state has to live behind an `Arc`.
+    struct SharedProvider(Arc<Mutex<FakeProvider>>);
+
+    impl Provider for SharedProvider {
+        fn chat(
+            &mut self,
+            messages: &[Message],
+            tools: &[ToolSpec],
+            config: &ProviderConfig,
+            cancel: &CancelToken,
+            on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
+        ) -> Result<Option<TokenUsage>, String> {
+            self.0
+                .lock()
+                .expect("provider lock")
+                .chat(messages, tools, config, cancel, on_delta)
+        }
+
+        fn total_usage(&self) -> TokenUsage {
+            self.0.lock().expect("provider lock").total_usage()
+        }
+    }
+
+    /// The tools a session gets, built per session: a `Tool` is a boxed closure
+    /// and cannot be cloned, and one handler opens several sessions.
+    type Tools = Arc<dyn Fn() -> Vec<Tool> + Send + Sync>;
+
+    /// A session with no tools.
+    fn no_tools() -> Tools {
+        Arc::new(Vec::new)
+    }
+
+    /// A session with the `probe` tool the scripted turns call.
+    fn probe_tools() -> Tools {
+        Arc::new(|| {
+            vec![Tool::new(
+                "probe",
+                "a probe",
+                serde_json::json!({}),
+                |_args| Ok("probed".to_string()),
+            )]
+        })
+    }
+
+    /// The stores one handler needs, kept alive for the handler's borrows, plus
+    /// the pinned home and cwd every session is built under.
     struct Fixture {
         scratch: Scratch,
         store: SessionStore,
@@ -1093,37 +1122,55 @@ mod tests {
             let cwd = scratch.path("proj");
             fs::create_dir_all(&home).expect("home");
             fs::create_dir_all(&cwd).expect("cwd");
+            // A `.git` marker makes the project home resolve to `cwd` itself,
+            // so the SDK's session store (keyed by the project home) and the
+            // CLI's picker list land in the same directory deterministically.
+            fs::create_dir_all(cwd.join(".git")).expect("git marker");
             Self {
-                store: SessionStore::new(scratch.path("sessions"), "proj", &cwd),
+                store: SessionStore::new(home.join("sessions"), project_key(&cwd), cwd.clone()),
                 history: HistoryStore::new(scratch.path("history.json")),
                 skills: SkillStore::new(&home, &cwd),
                 scratch,
             }
         }
 
-        fn handler(&self, provider: Box<dyn Provider + Send>, tools: Vec<Tool>) -> TuiSession<'_> {
-            let session = self.store.new_session();
-            let completions = CliCompletions::new(self.skills.list().unwrap_or_default());
-            TuiSession {
-                cwd: self.scratch.path("proj"),
-                store: &self.store,
-                history: &self.history,
-                skills: &self.skills,
-                context_files: Vec::new(),
-                environment: Environment {
-                    os: "test".to_string(),
-                    global_home: self.scratch.path("home"),
-                    project_home: self.scratch.path("proj"),
-                },
-                completions,
-                config: ProviderConfig::new("test-key", "https://example.invalid/v1", "test-model"),
-                inner: Mutex::new(Inner {
-                    session,
-                    provider: Some(provider),
-                    tools,
-                    cancel: CancelToken::new(),
-                }),
-            }
+        fn home(&self) -> PathBuf {
+            self.scratch.path("home")
+        }
+
+        fn cwd(&self) -> PathBuf {
+            self.scratch.path("proj")
+        }
+
+        /// A handler over a fresh SDK session driven by `provider`: the same
+        /// provider and tool set seed every session the handler opens.
+        fn handler(&self, provider: FakeProvider, tools: Tools) -> TuiSession<'_> {
+            // One provider handle shared by every session the handler opens, so
+            // a scripted call sequence survives `/new` and a load.
+            let shared = Arc::new(Mutex::new(provider));
+            let deps: SessionDeps =
+                Arc::new(move || (Box::new(SharedProvider(Arc::clone(&shared))), tools()));
+            TuiSession::new(
+                self.home(),
+                self.cwd(),
+                ProviderConfig::new("test-key", "https://example.invalid/v1", "test-model"),
+                &self.store,
+                &self.history,
+                &self.skills,
+                Some(deps),
+            )
+            .expect("the session opens")
+        }
+
+        /// A handler whose current session resumes `id`: the CLI's own load
+        /// path (the SDK replays the log through `with_session_id`), which is
+        /// also the public-API way to seed a live history.
+        fn resuming(&self, provider: FakeProvider, tools: Tools, id: &str) -> TuiSession<'_> {
+            let mut handler = self.handler(provider, tools);
+            let (flow, items) = drive(&mut handler, Effect::LoadSession { id: id.to_string() });
+            assert_eq!(flow, ControlFlow::Continue);
+            assert_eq!(handler.session_id(), id, "the load failed: {items:?}");
+            handler
         }
 
         /// Write a skill into the user skills dir, the way a store scan finds
@@ -1189,14 +1236,32 @@ mod tests {
     /// Write a session log with a title and one user/assistant pair, as the
     /// first assistant message does at runtime, and return its id.
     fn saved_session(store: &SessionStore, prompt: &str, reply: &str) -> String {
+        saved_messages(
+            store,
+            vec![
+                AgentMessage::text(Role::User, prompt),
+                AgentMessage::text(Role::Assistant, reply),
+            ],
+            Some(prompt),
+        )
+    }
+
+    /// Write a session log holding exactly `messages` (the last one creates the
+    /// file, which persists the whole backlog) and return its id.
+    fn saved_messages(
+        store: &SessionStore,
+        messages: Vec<AgentMessage>,
+        title: Option<&str>,
+    ) -> String {
         let mut session = store.new_session();
-        session.title = Some(prompt.to_string());
-        session
+        session.title = title.map(str::to_string);
+        session.messages = messages;
+        let last = session
             .messages
-            .push(AgentMessage::text(Role::User, prompt));
-        let assistant = AgentMessage::text(Role::Assistant, reply);
-        session.messages.push(assistant.clone());
-        store.append(&session, &assistant).expect("log created");
+            .last()
+            .expect("a message to persist")
+            .clone();
+        store.append(&session, &last).expect("log created");
         session.id
     }
 
@@ -1207,10 +1272,20 @@ mod tests {
         }
     }
 
+    /// The current session's messages.
+    fn messages(handler: &TuiSession<'_>) -> Vec<AgentMessage> {
+        handler.session().messages()
+    }
+
+    /// A string that alone pushes the estimated history past the 92% threshold.
+    fn over_threshold_text() -> String {
+        "y".repeat(slimcode_app::compaction::estimated_context_window() * 4)
+    }
+
     #[test]
     fn help_lists_every_command() {
         let fx = Fixture::new("help");
-        let mut handler = fx.handler(Box::new(FakeProvider::new(Vec::new())), Vec::new());
+        let mut handler = fx.handler(FakeProvider::new(Vec::new()), no_tools());
         let items = command(&mut handler, "/help");
         let lines = lines(&items);
         assert_eq!(lines[0], "commands:");
@@ -1223,7 +1298,7 @@ mod tests {
     #[test]
     fn exit_quits_the_loop() {
         let fx = Fixture::new("exit");
-        let mut handler = fx.handler(Box::new(FakeProvider::new(Vec::new())), Vec::new());
+        let mut handler = fx.handler(FakeProvider::new(Vec::new()), no_tools());
         let (flow, items) = drive(
             &mut handler,
             Effect::Command {
@@ -1238,7 +1313,7 @@ mod tests {
     #[test]
     fn skills_list_reports_none_and_then_each_skill() {
         let fx = Fixture::new("skills");
-        let mut handler = fx.handler(Box::new(FakeProvider::new(Vec::new())), Vec::new());
+        let mut handler = fx.handler(FakeProvider::new(Vec::new()), no_tools());
         assert_eq!(
             lines(&command(&mut handler, "/skills")),
             ["no skills installed"]
@@ -1255,7 +1330,7 @@ mod tests {
     fn unknown_command_gets_a_did_you_mean_notice() {
         let fx = Fixture::new("unknown");
         fx.write_user_skill("grill", "stress-test a plan");
-        let mut handler = fx.handler(Box::new(FakeProvider::new(Vec::new())), Vec::new());
+        let mut handler = fx.handler(FakeProvider::new(Vec::new()), no_tools());
         let items = command(&mut handler, "/gril");
         let lines = lines(&items);
         assert_eq!(lines[0], "unknown command: /gril");
@@ -1266,7 +1341,7 @@ mod tests {
     fn skill_trigger_submits_the_skill_block_without_recording() {
         let fx = Fixture::new("skill-trigger");
         fx.write_user_skill("grill", "stress-test a plan");
-        let mut handler = fx.handler(Box::new(FakeProvider::new(Vec::new())), Vec::new());
+        let mut handler = fx.handler(FakeProvider::new(Vec::new()), no_tools());
         let (flow, items) = drive(
             &mut handler,
             Effect::Command {
@@ -1310,7 +1385,7 @@ mod tests {
         let fx = Fixture::new("replay");
         fx.history.append("first").unwrap();
         fx.history.append("second").unwrap();
-        let mut handler = fx.handler(Box::new(FakeProvider::new(Vec::new())), Vec::new());
+        let mut handler = fx.handler(FakeProvider::new(Vec::new()), no_tools());
 
         // `/!!` reruns the newest entry: the boxed prompt the typed path
         // shows, then the turn (never recorded again).
@@ -1351,7 +1426,7 @@ mod tests {
     #[test]
     fn bad_replay_indexes_are_errors() {
         let fx = Fixture::new("replay-bad");
-        let mut handler = fx.handler(Box::new(FakeProvider::new(Vec::new())), Vec::new());
+        let mut handler = fx.handler(FakeProvider::new(Vec::new()), no_tools());
         assert_eq!(
             lines(&command(&mut handler, "/!")),
             ["/!N needs a number (1 = newest)"]
@@ -1367,7 +1442,7 @@ mod tests {
     #[test]
     fn new_session_changes_the_session_and_clears_the_transcript() {
         let fx = Fixture::new("new");
-        let mut handler = fx.handler(Box::new(FakeProvider::new(Vec::new())), Vec::new());
+        let mut handler = fx.handler(FakeProvider::new(Vec::new()), no_tools());
         let before = handler.session_id();
         let items = command(&mut handler, "/new");
         let after = handler.session_id();
@@ -1382,7 +1457,7 @@ mod tests {
         let fx = Fixture::new("picker");
         let a = saved_session(&fx.store, "first prompt", "first reply");
         let b = saved_session(&fx.store, "second prompt", "second reply");
-        let mut handler = fx.handler(Box::new(FakeProvider::new(Vec::new())), Vec::new());
+        let mut handler = fx.handler(FakeProvider::new(Vec::new()), no_tools());
 
         let items = command(&mut handler, "/session");
         let [RenderItem::SessionPicker { rows }] = &items[..] else {
@@ -1403,19 +1478,20 @@ mod tests {
     fn picker_rows_fall_back_to_the_id_and_the_singular_count() {
         let fx = Fixture::new("picker-fallback");
         // No title record, and a single message record.
-        let mut one = fx.store.new_session();
-        let msg = AgentMessage::text(Role::Assistant, "only");
-        one.messages.push(msg.clone());
-        fx.store.append(&one, &msg).unwrap();
-        let mut handler = fx.handler(Box::new(FakeProvider::new(Vec::new())), Vec::new());
+        let id = saved_messages(
+            &fx.store,
+            vec![AgentMessage::text(Role::Assistant, "only")],
+            None,
+        );
+        let mut handler = fx.handler(FakeProvider::new(Vec::new()), no_tools());
 
         let items = command(&mut handler, "/session");
         let [RenderItem::SessionPicker { rows }] = &items[..] else {
             panic!("expected one picker item: {items:?}");
         };
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id, one.id);
-        assert_eq!(rows[0].title, one.id, "no title record -> the id");
+        assert_eq!(rows[0].id, id);
+        assert_eq!(rows[0].title, id, "no title record -> the id");
         assert!(rows[0].meta.starts_with("1 msg  "), "{}", rows[0].meta);
     }
 
@@ -1423,9 +1499,11 @@ mod tests {
     fn session_reports_a_scan_failure_without_opening_the_picker() {
         let fx = Fixture::new("picker-error");
         // A file where the project directory should be makes the scan fail.
-        fs::create_dir_all(fx.scratch.path("sessions")).expect("sessions dir");
-        fs::write(fx.scratch.path("sessions/proj"), b"not a directory").expect("blocking file");
-        let mut handler = fx.handler(Box::new(FakeProvider::new(Vec::new())), Vec::new());
+        let sessions = fx.home().join("sessions");
+        fs::create_dir_all(&sessions).expect("sessions dir");
+        fs::write(sessions.join(project_key(&fx.cwd())), b"not a directory")
+            .expect("blocking file");
+        let mut handler = fx.handler(FakeProvider::new(Vec::new()), no_tools());
         let items = command(&mut handler, "/session");
         assert_eq!(items.len(), 1);
         assert!(matches!(items[0], RenderItem::Error(_)), "{items:?}");
@@ -1435,7 +1513,7 @@ mod tests {
     fn load_session_emits_the_change_before_the_notices() {
         let fx = Fixture::new("load-effect");
         let id = saved_session(&fx.store, "the prompt", "the reply");
-        let mut handler = fx.handler(Box::new(FakeProvider::new(Vec::new())), Vec::new());
+        let mut handler = fx.handler(FakeProvider::new(Vec::new()), no_tools());
 
         let (flow, items) = drive(&mut handler, Effect::LoadSession { id: id.clone() });
         assert_eq!(flow, ControlFlow::Continue);
@@ -1450,33 +1528,8 @@ mod tests {
         );
         assert!(items.iter().any(|i| matches!(i, RenderItem::Branch(_))));
         assert_eq!(handler.session_id(), id);
-        assert_eq!(handler.inner.lock().unwrap().session.messages.len(), 2);
-    }
-
-    #[test]
-    fn load_session_keeps_the_repair_notices_after_the_change() {
-        let fx = Fixture::new("load-repair");
-        let id = saved_session(&fx.store, "the prompt", "the reply");
-        // Append an unreadable record line by hand, so the load skips one.
-        let path = fx.store.session_path(&id).expect("path");
-        let mut log = fs::read_to_string(&path).expect("log");
-        log.push_str("not json\n");
-        fs::write(&path, log).expect("corrupt log");
-        let mut handler = fx.handler(Box::new(FakeProvider::new(Vec::new())), Vec::new());
-
-        let (_, items) = drive(&mut handler, Effect::LoadSession { id });
-        let changed = items
-            .iter()
-            .position(|i| matches!(i, RenderItem::SessionChanged { .. }))
-            .expect("session change");
-        let skipped = items
-            .iter()
-            .position(|i| matches!(i, RenderItem::Notice(t) if t.contains("skipped 1")))
-            .expect("skip notice");
-        assert!(
-            changed < skipped,
-            "notice must survive the clear: {items:?}"
-        );
+        assert_eq!(messages(&handler).len(), 2);
+        assert_eq!(handler.session().title().as_deref(), Some("the prompt"));
     }
 
     #[test]
@@ -1484,34 +1537,26 @@ mod tests {
         let fx = Fixture::new("load-replay");
         // A session with a tool round trip, so the replay covers prompt boxes,
         // assistant text, a tool start/result pair and the final answer.
-        let mut session = fx.store.new_session();
-        session.title = Some("replay".to_string());
-        session
-            .messages
-            .push(AgentMessage::text(Role::User, "list it"));
-        session.messages.push(AgentMessage::llm(Message {
-            role: Role::Assistant,
-            parts: vec![slimcode_ai::message::Part::Text {
-                text: String::new(),
-            }],
-            tool_calls: vec![slimcode_core::session::ToolCall {
-                id: "call_1".to_string(),
-                name: "bash".to_string(),
-                arguments: r#"{"command":"ls"}"#.to_string(),
-            }],
-            tool_call_id: None,
-        }));
-        session
-            .messages
-            .push(AgentMessage::tool_result("call_1", "marker.txt"));
-        session
-            .messages
-            .push(AgentMessage::text(Role::Assistant, "done listing"));
-        let last = session.messages.last().unwrap().clone();
-        let id = session.id.clone();
-        fx.store.append(&session, &last).expect("log created");
+        let history = vec![
+            AgentMessage::text(Role::User, "list it"),
+            AgentMessage::llm(Message {
+                role: Role::Assistant,
+                parts: vec![slimcode_ai::message::Part::Text {
+                    text: String::new(),
+                }],
+                tool_calls: vec![slimcode_core::session::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "bash".to_string(),
+                    arguments: r#"{"command":"ls"}"#.to_string(),
+                }],
+                tool_call_id: None,
+            }),
+            AgentMessage::tool_result("call_1", "marker.txt"),
+            AgentMessage::text(Role::Assistant, "done listing"),
+        ];
+        let id = saved_messages(&fx.store, history, Some("replay"));
 
-        let mut handler = fx.handler(Box::new(FakeProvider::new(Vec::new())), Vec::new());
+        let mut handler = fx.handler(FakeProvider::new(Vec::new()), no_tools());
         let (_, items) = drive(&mut handler, Effect::LoadSession { id });
 
         // The change clears first, then the notices, then the replayed
@@ -1554,27 +1599,42 @@ mod tests {
                 &RenderItem::Text("done listing".to_string()),
             ]
         );
-        assert_eq!(handler.inner.lock().unwrap().session.messages.len(), 4);
+        assert_eq!(messages(&handler).len(), 4);
     }
 
     #[test]
     fn loading_the_current_session_is_a_no_op() {
         let fx = Fixture::new("load-current");
-        let mut handler = fx.handler(Box::new(FakeProvider::new(Vec::new())), Vec::new());
+        let provider = FakeProvider::new(vec![vec![
+            Delta::Text("hi".to_string()),
+            Delta::Done(FinishReason::Stop),
+        ]]);
+        let mut handler = fx.handler(provider, no_tools());
+        handler.submit(user_message("one"), &mut |_| {}).unwrap();
         let id = handler.session_id();
-        // Memory is ahead of disk: reloading would drop this.
-        handler
-            .inner
-            .lock()
-            .unwrap()
-            .session
-            .messages
-            .push(AgentMessage::text(Role::User, "in memory"));
+        let before = messages(&handler);
 
+        // Memory is where the turn's history lives; reloading would drop it.
         let (flow, items) = drive(&mut handler, Effect::LoadSession { id });
         assert_eq!(flow, ControlFlow::Continue);
         assert!(items.is_empty(), "{items:?}");
-        assert_eq!(handler.inner.lock().unwrap().session.messages.len(), 1);
+        assert_eq!(messages(&handler), before);
+    }
+
+    #[test]
+    fn loading_a_missing_session_reports_the_error() {
+        let fx = Fixture::new("load-missing");
+        let mut handler = fx.handler(FakeProvider::new(Vec::new()), no_tools());
+        let (_, items) = drive(
+            &mut handler,
+            Effect::LoadSession {
+                id: "slimcode-does-not-exist".to_string(),
+            },
+        );
+        let [RenderItem::Error(text)] = &items[..] else {
+            panic!("expected one error line: {items:?}");
+        };
+        assert!(text.contains("cannot resume session"), "{text}");
     }
 
     #[test]
@@ -1586,9 +1646,15 @@ mod tests {
             total_tokens: 15,
             ..Default::default()
         };
-        let mut handler = fx.handler(Box::new(FakeProvider::with_usage(usage)), Vec::new());
+        let provider = FakeProvider::new(vec![vec![
+            Delta::Text("hi".to_string()),
+            Delta::Done(FinishReason::Stop),
+        ]])
+        .with_per_call(usage);
+        let mut handler = fx.handler(provider, no_tools());
+        handler.submit(user_message("one"), &mut |_| {}).unwrap();
         // The session, not the provider, is the display's source (ADR-0018 D4).
-        handler.inner.lock().unwrap().session.usage = usage;
+        assert_eq!(handler.session().usage(), usage);
         assert_eq!(
             lines(&command(&mut handler, "/usage")),
             ["tokens: 10 prompt (0 cached, 0%) + 5 completion = 15 total"]
@@ -1624,10 +1690,7 @@ mod tests {
             total_tokens: 15,
             ..Default::default()
         });
-        let tool = Tool::new("probe", "a probe", serde_json::json!({}), |_args| {
-            Ok("probed".to_string())
-        });
-        let mut handler = fx.handler(Box::new(provider), vec![tool]);
+        let mut handler = fx.handler(provider, probe_tools());
         let id = handler.session_id();
 
         let mut items = Vec::new();
@@ -1637,7 +1700,7 @@ mod tests {
 
         // Two requests × (10 prompt + 5 completion), counted once each.
         assert_eq!(
-            handler.inner.lock().unwrap().session.usage,
+            handler.session().usage(),
             TokenUsage {
                 prompt_tokens: 20,
                 completion_tokens: 10,
@@ -1692,14 +1755,14 @@ mod tests {
             total_tokens: 15,
             ..Default::default()
         });
-        let handler = fx.handler(Box::new(provider), Vec::new());
+        let handler = fx.handler(provider, no_tools());
         handler.submit(user_message("one"), &mut |_| {}).unwrap();
         handler.submit(user_message("two"), &mut |_| {}).unwrap();
 
         // Each turn adds its own request only; the total is not the running
         // counter read twice.
         assert_eq!(
-            handler.inner.lock().unwrap().session.usage.total_tokens,
+            handler.session().usage().total_tokens,
             30,
             "two turns × one request each"
         );
@@ -1722,15 +1785,12 @@ mod tests {
             ..Default::default()
         })
         .cancels_on(1);
-        let handler = fx.handler(Box::new(provider), Vec::new());
+        let handler = fx.handler(provider, no_tools());
         let mut items = Vec::new();
         handler
             .submit(user_message("go"), &mut |item| items.push(item))
             .expect("a cancelled turn is not an error");
-        assert_eq!(
-            handler.inner.lock().unwrap().session.usage,
-            TokenUsage::default()
-        );
+        assert_eq!(handler.session().usage(), TokenUsage::default());
         assert!(
             !items.iter().any(|i| matches!(i, RenderItem::Usage { .. })),
             "no usage for a cancelled request: {items:?}"
@@ -1750,15 +1810,12 @@ mod tests {
             total_tokens: 15,
             ..Default::default()
         });
-        let mut handler = fx.handler(Box::new(provider), Vec::new());
+        let mut handler = fx.handler(provider, no_tools());
         handler.submit(user_message("one"), &mut |_| {}).unwrap();
-        assert_eq!(handler.inner.lock().unwrap().session.usage.total_tokens, 15);
+        assert_eq!(handler.session().usage().total_tokens, 15);
 
         command(&mut handler, "/new");
-        assert_eq!(
-            handler.inner.lock().unwrap().session.usage,
-            TokenUsage::default()
-        );
+        assert_eq!(handler.session().usage(), TokenUsage::default());
         assert_eq!(
             lines(&command(&mut handler, "/usage")),
             ["tokens: 0 prompt (0 cached, 0%) + 0 completion = 0 total"]
@@ -1771,7 +1828,7 @@ mod tests {
         // the CLI must emit a follow-up Usage item right after it — here the
         // fresh session's `0%/200k`.
         let fx = Fixture::new("ctx-new");
-        let mut handler = fx.handler(Box::new(FakeProvider::new(Vec::new())), Vec::new());
+        let mut handler = fx.handler(FakeProvider::new(Vec::new()), no_tools());
         let items = command(&mut handler, "/new");
         let changed = items
             .iter()
@@ -1803,7 +1860,7 @@ mod tests {
         let saved = saved_session(&fx.store, "old prompt", "old reply");
         let expected =
             crate::render::to_context_usage(&fx.store.load(&saved).unwrap().session.messages);
-        let mut handler = fx.handler(Box::new(FakeProvider::new(Vec::new())), Vec::new());
+        let mut handler = fx.handler(FakeProvider::new(Vec::new()), no_tools());
         let (_, items) = drive(&mut handler, Effect::LoadSession { id: saved });
         let changed = items
             .iter()
@@ -1840,16 +1897,13 @@ mod tests {
             total_tokens: 15,
             ..Default::default()
         });
-        let mut handler = fx.handler(Box::new(provider), Vec::new());
+        let mut handler = fx.handler(provider, no_tools());
         handler.submit(user_message("one"), &mut |_| {}).unwrap();
-        assert_eq!(handler.inner.lock().unwrap().session.usage.total_tokens, 15);
+        assert_eq!(handler.session().usage().total_tokens, 15);
 
         // The previous session's numbers must not follow the load.
         drive(&mut handler, Effect::LoadSession { id: saved });
-        assert_eq!(
-            handler.inner.lock().unwrap().session.usage,
-            TokenUsage::default()
-        );
+        assert_eq!(handler.session().usage(), TokenUsage::default());
         assert_eq!(
             lines(&command(&mut handler, "/usage")),
             ["tokens: 0 prompt (0 cached, 0%) + 0 completion = 0 total"]
@@ -1866,7 +1920,7 @@ mod tests {
             "---\nname: grill\ndescription: stress-test a plan\n---\nBody.\n",
         )
         .unwrap();
-        let mut handler = fx.handler(Box::new(FakeProvider::new(Vec::new())), Vec::new());
+        let mut handler = fx.handler(FakeProvider::new(Vec::new()), no_tools());
         assert!(
             handler.completions.complete("/gr").is_empty(),
             "nothing installed yet"
@@ -1897,7 +1951,7 @@ mod tests {
             Delta::Text("there".to_string()),
             Delta::Done(FinishReason::Stop),
         ]]);
-        let handler = fx.handler(Box::new(provider), Vec::new());
+        let handler = fx.handler(provider, no_tools());
         let id = handler.session_id();
 
         let mut items = Vec::new();
@@ -1929,7 +1983,7 @@ mod tests {
             Delta::Text("ok".to_string()),
             Delta::Done(FinishReason::Stop),
         ]]);
-        let handler = fx.handler(Box::new(provider), Vec::new());
+        let handler = fx.handler(provider, no_tools());
         handler
             .submit(
                 Prompt {
@@ -1965,11 +2019,9 @@ mod tests {
             usage: TokenUsage::default(),
             per_call: TokenUsage::default(),
             cancel_on_call: None,
+            gate: None,
         };
-        let tool = Tool::new("probe", "a probe", serde_json::json!({}), |_args| {
-            Ok("probed".to_string())
-        });
-        let handler = fx.handler(Box::new(provider), vec![tool]);
+        let handler = fx.handler(provider, probe_tools());
         let id = handler.session_id();
 
         let err = handler
@@ -2004,8 +2056,9 @@ mod tests {
             usage: TokenUsage::default(),
             per_call: TokenUsage::default(),
             cancel_on_call: None,
+            gate: None,
         };
-        let handler = fx.handler(Box::new(provider), Vec::new());
+        let handler = fx.handler(provider, no_tools());
         let id = handler.session_id();
         handler
             .submit(user_message("one"), &mut |_| {})
@@ -2030,7 +2083,7 @@ mod tests {
     #[test]
     fn a_first_turn_that_dies_leaves_no_log() {
         let fx = Fixture::new("submit-fail-first");
-        let handler = fx.handler(Box::new(FakeProvider::failing_at_zero()), Vec::new());
+        let handler = fx.handler(FakeProvider::failing_at_zero(), no_tools());
         let id = handler.session_id();
         handler
             .submit(user_message("only"), &mut |_| {})
@@ -2041,22 +2094,38 @@ mod tests {
     }
 
     #[test]
-    fn cancel_flips_the_token_and_a_new_turn_resets_it() {
+    fn cancel_aborts_the_running_turn_and_the_next_turn_runs() {
+        // Esc arrives from the frame thread while the worker is inside a
+        // request: `cancel` must reach the session's token without waiting for
+        // the worker, and the following turn must start uncancelled.
         let fx = Fixture::new("cancel");
-        let provider = FakeProvider::new(vec![vec![
-            Delta::Text("done".to_string()),
-            Delta::Done(FinishReason::Stop),
-        ]]);
-        let handler = fx.handler(Box::new(provider), Vec::new());
-        handler.cancel();
-        assert!(
-            handler.inner.lock().unwrap().cancel.is_cancelled(),
-            "Esc reached the token"
-        );
+        let gate = Gate::new();
+        let provider = FakeProvider::new(vec![
+            vec![
+                Delta::Text("first".to_string()),
+                Delta::Done(FinishReason::Stop),
+            ],
+            vec![
+                Delta::Text("second".to_string()),
+                Delta::Done(FinishReason::Stop),
+            ],
+        ])
+        .blocking(gate.clone());
+        let handler = fx.handler(provider, no_tools());
 
-        // A fresh turn starts uncancelled, so it runs to completion.
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                handler
+                    .submit(user_message("go"), &mut |_| {})
+                    .expect("a cancelled turn is not an error");
+            });
+            gate.wait_entered();
+            handler.cancel();
+            gate.open();
+        });
+
         let report = handler
-            .submit(user_message("go"), &mut |_| {})
+            .submit(user_message("again"), &mut |_| {})
             .expect("turn succeeds");
         assert_eq!(report.appended, 1);
     }
@@ -2064,20 +2133,28 @@ mod tests {
     #[test]
     fn a_second_turn_while_one_runs_is_rejected() {
         let fx = Fixture::new("busy");
-        let handler = fx.handler(Box::new(FakeProvider::new(Vec::new())), Vec::new());
-        // Take the provider out, as a running turn does.
-        let state = handler.take_turn().expect("first turn");
-        assert_eq!(
-            handler.submit(user_message("go"), &mut |_| {}).unwrap_err(),
-            "a turn is already running"
-        );
-        handler.put_turn(state);
-        assert!(handler.submit(user_message("go"), &mut |_| {}).is_ok());
-    }
+        let gate = Gate::new();
+        let provider = FakeProvider::new(vec![vec![
+            Delta::Text("done".to_string()),
+            Delta::Done(FinishReason::Stop),
+        ]])
+        .blocking(gate.clone());
+        let handler = fx.handler(provider, no_tools());
 
-    /// A string that alone pushes the estimated history past the 92% threshold.
-    fn over_threshold_text() -> String {
-        "y".repeat(slimcode_app::compaction::estimated_context_window() * 4)
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                handler
+                    .submit(user_message("go"), &mut |_| {})
+                    .expect("turn succeeds");
+            });
+            gate.wait_entered();
+            // The SDK refuses a second turn while one is in flight.
+            assert_eq!(
+                handler.submit(user_message("go"), &mut |_| {}).unwrap_err(),
+                "a turn is already running"
+            );
+            gate.open();
+        });
     }
 
     #[test]
@@ -2093,19 +2170,17 @@ mod tests {
                 Delta::Done(FinishReason::Stop),
             ],
         ]);
-        let handler = fx.handler(Box::new(provider), Vec::new());
+        let handler = fx.handler(provider, no_tools());
         let id = handler.session_id();
         let mut items = Vec::new();
         handler
             .submit(user_message("long task"), &mut |i| items.push(i))
             .expect("turn succeeds");
 
-        {
-            let session = &handler.inner.lock().unwrap().session;
-            assert_eq!(session.messages.len(), 1, "{:?}", session.messages);
-            assert!(session.messages[0].is_compact_summary());
-            assert_eq!(session.messages[0].text_content(), "## Goal\ncompacted");
-        }
+        let session_messages = messages(&handler);
+        assert_eq!(session_messages.len(), 1, "{session_messages:?}");
+        assert!(session_messages[0].is_compact_summary());
+        assert_eq!(session_messages[0].text_content(), "## Goal\ncompacted");
         assert!(
             items
                 .iter()
@@ -2138,6 +2213,68 @@ mod tests {
         );
     }
 
+    /// The compaction's footer refresh reads the restored session, not the
+    /// pre-turn snapshot the turn state was taken from: the `Usage` item
+    /// emitted with the compaction notice carries the turn's request plus the
+    /// summary request (two calls), and its context segment is the
+    /// post-compaction estimate of the live history — never the stale zero
+    /// snapshot that used to render (a first turn's empty history).
+    #[test]
+    fn turn_end_auto_compaction_renders_the_post_compaction_footer() {
+        let fx = Fixture::new("auto-compact-footer");
+        let per_call = TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            ..Default::default()
+        };
+        let provider = FakeProvider::new(vec![
+            vec![
+                Delta::Text(over_threshold_text()),
+                Delta::Done(FinishReason::Stop),
+            ],
+            vec![
+                Delta::Text("## Goal\ncompacted".to_string()),
+                Delta::Done(FinishReason::Stop),
+            ],
+        ])
+        .with_per_call(per_call);
+        let handler = fx.handler(provider, no_tools());
+        let mut items = Vec::new();
+        handler
+            .submit(user_message("long task"), &mut |i| items.push(i))
+            .expect("turn succeeds");
+
+        // `note_compacted` emits the footer refresh immediately before the
+        // notice, so the refresh that belongs to the compaction is the last
+        // `Usage` item preceding it.
+        let notice_at = items
+            .iter()
+            .position(|i| matches!(i, RenderItem::Notice(t) if t.contains("context compacted")))
+            .expect("a compaction notice");
+        let (footer, context) = items[..notice_at]
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                RenderItem::Usage { usage, context } => Some((*usage, *context)),
+                _ => None,
+            })
+            .expect("the compaction's usage refresh");
+        assert_eq!(
+            footer.input + footer.output,
+            per_call.total_tokens * 2,
+            "the compaction cost must be included"
+        );
+        let context = context.expect("a context estimate");
+        let expected = slimcode_app::compaction::estimate_total_tokens(&messages(&handler)) as f64;
+        assert!(context.percent > 0.0, "a zero snapshot: {context:?}");
+        assert_eq!(
+            context.percent,
+            expected / context.window as f64 * 100.0,
+            "the context segment must match the post-compaction history"
+        );
+    }
+
     #[test]
     fn a_small_completed_turn_does_not_compact() {
         let fx = Fixture::new("no-auto-compact");
@@ -2145,14 +2282,14 @@ mod tests {
             Delta::Text("short answer".to_string()),
             Delta::Done(FinishReason::Stop),
         ]]);
-        let handler = fx.handler(Box::new(provider), Vec::new());
+        let handler = fx.handler(provider, no_tools());
         let mut items = Vec::new();
         handler
             .submit(user_message("small task"), &mut |i| items.push(i))
             .expect("turn succeeds");
-        let session = &handler.inner.lock().unwrap().session;
-        assert_eq!(session.messages.len(), 2);
-        assert!(session.messages.iter().all(|m| !m.is_compact_summary()));
+        let session_messages = messages(&handler);
+        assert_eq!(session_messages.len(), 2);
+        assert!(session_messages.iter().all(|m| !m.is_compact_summary()));
         assert!(
             !items
                 .iter()
@@ -2161,28 +2298,28 @@ mod tests {
         );
     }
 
-    /// Put an over-budget history into the live session without running a turn.
-    fn seed_long_history(handler: &TuiSession<'_>) {
-        let mut inner = handler.inner.lock().expect("session lock");
-        inner
-            .session
-            .messages
-            .push(AgentMessage::text(Role::User, "write a lot"));
-        inner
-            .session
-            .messages
-            .push(AgentMessage::text(Role::Assistant, over_threshold_text()));
+    /// A saved log whose history is over the compaction threshold: the CLI's
+    /// load path brings it into a live session without running a turn.
+    fn long_history(fx: &Fixture, title: &str) -> String {
+        saved_messages(
+            &fx.store,
+            vec![
+                AgentMessage::text(Role::User, "write a lot"),
+                AgentMessage::text(Role::Assistant, over_threshold_text()),
+            ],
+            Some(title),
+        )
     }
 
     #[test]
     fn compact_command_summarizes_on_demand() {
         let fx = Fixture::new("compact-cmd");
+        let long = long_history(&fx, "long");
         let provider = FakeProvider::new(vec![vec![
             Delta::Text("## Goal\ndone".to_string()),
             Delta::Done(FinishReason::Stop),
         ]]);
-        let mut handler = fx.handler(Box::new(provider), Vec::new());
-        seed_long_history(&handler);
+        let mut handler = fx.resuming(provider, no_tools(), &long);
 
         let items = command(&mut handler, "/compact");
         // The usage footer refresh rides the same batch.
@@ -2192,7 +2329,7 @@ mod tests {
         );
         let lines: Vec<&str> = items
             .iter()
-            .filter_map(|i| match i {
+            .filter_map(|item| match item {
                 RenderItem::Notice(t) | RenderItem::Error(t) => Some(t.as_str()),
                 _ => None,
             })
@@ -2202,27 +2339,17 @@ mod tests {
             lines.iter().any(|l| l.contains("context compacted:")),
             "{lines:?}"
         );
-        let session = &handler.inner.lock().unwrap().session;
-        assert_eq!(session.messages.len(), 1);
-        assert!(session.messages[0].is_compact_summary());
+        let session_messages = messages(&handler);
+        assert_eq!(session_messages.len(), 1, "{session_messages:?}");
+        assert!(session_messages[0].is_compact_summary());
     }
 
     #[test]
     fn compact_command_on_a_short_history_reports_nothing_to_do() {
         let fx = Fixture::new("compact-short");
-        let provider = FakeProvider::new(Vec::new());
-        let mut handler = fx.handler(Box::new(provider), Vec::new());
-        {
-            let mut inner = handler.inner.lock().unwrap();
-            inner
-                .session
-                .messages
-                .push(AgentMessage::text(Role::User, "hi"));
-            inner
-                .session
-                .messages
-                .push(AgentMessage::text(Role::Assistant, "hello"));
-        }
+        let short = saved_session(&fx.store, "hi", "hello");
+        let mut handler = fx.resuming(FakeProvider::new(Vec::new()), no_tools(), &short);
+
         let items = command(&mut handler, "/compact");
         let lines = lines(&items);
         assert!(
@@ -2236,8 +2363,9 @@ mod tests {
     #[test]
     fn a_failed_compaction_keeps_the_history() {
         let fx = Fixture::new("compact-fail");
-        let mut handler = fx.handler(Box::new(FakeProvider::failing_at_zero()), Vec::new());
-        seed_long_history(&handler);
+        let long = long_history(&fx, "long");
+        let mut handler = fx.resuming(FakeProvider::failing_at_zero(), no_tools(), &long);
+
         let items = command(&mut handler, "/compact");
         let lines = lines(&items);
         assert!(
@@ -2245,8 +2373,8 @@ mod tests {
             "{lines:?}"
         );
         // The turn's history is untouched.
-        let session = &handler.inner.lock().unwrap().session;
-        assert_eq!(session.messages.len(), 2);
-        assert!(session.messages.iter().all(|m| !m.is_compact_summary()));
+        let session_messages = messages(&handler);
+        assert_eq!(session_messages.len(), 2);
+        assert!(session_messages.iter().all(|m| !m.is_compact_summary()));
     }
 }

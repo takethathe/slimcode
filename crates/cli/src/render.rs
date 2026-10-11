@@ -11,17 +11,17 @@
 //! `ToolCallArgs`/`Done` deltas never reach a renderer — they are suppressed by
 //! `map_event` in `slimcode-app`.
 //!
-//! The same module owns the TUI's adapter: [`TuiAdapter`] implements the same
-//! `Renderer` trait but converts each `DisplayItem` into the
-//! [`RenderItem`](slimcode_tui::render::RenderItem) the TUI applies
-//! (ADR-0014 D1/D2). That is why the TUI crate needs no application-layer
-//! dependency of its own.
+//! The same module owns the TUI's adapter: [`TuiAdapter`] converts each
+//! `DisplayItem` into the [`RenderItem`](slimcode_tui::render::RenderItem) the
+//! TUI applies (ADR-0014 D1/D2), and keeps its own view of the live session so
+//! a usage item can carry the footer's context estimate. That is why the TUI
+//! crate needs no application-layer dependency of its own.
 
 use std::io::Write;
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use slimcode_ai::TokenUsage;
 use slimcode_app::render::{DisplayItem, Renderer, usage_summary};
@@ -201,32 +201,36 @@ pub fn to_context_usage(messages: &[AgentMessage]) -> ContextUsage {
     ContextUsage::new(percent, window)
 }
 
-/// A shared, in-turn view of the live session's usage-relevant state (ticket
-/// 04): the message history (for the context estimate) and the session's
-/// accumulated usage (what the footer shows, ADR-0018 D4). The CLI's
-/// persistence hook keeps it in lockstep with the session; the adapter reads
-/// it when a `DisplayItem::Usage` arrives — after the hook ran, so the view
-/// already includes the just-completed assistant message and its usage.
+/// The live session's usage-relevant state (ticket 04): the message history
+/// (for the context estimate) and the session's accumulated usage (what the
+/// footer shows, ADR-0018 D4). The adapter keeps it in lockstep with the
+/// session through the `Message` events, so a `DisplayItem::Usage` render
+/// always sees the just-completed assistant message and its usage.
 pub struct LiveUsageView {
     pub messages: Vec<AgentMessage>,
     pub usage: TokenUsage,
 }
 
-impl LiveUsageView {
-    /// A fresh view over an empty history and zero usage (tests).
-    #[cfg(test)]
-    pub fn empty() -> Self {
-        Self {
-            messages: Vec::new(),
-            usage: TokenUsage::default(),
-        }
-    }
+/// The adapter's mutable render state, kept in one lock: the pending
+/// skill-read pairs and the live session view.
+struct AdapterState {
+    /// `tool_call_id` → skill name for suppressed skill-read starts, paired to
+    /// their result when it arrives (parallel batches keep several pending).
+    pending_skill: HashMap<String, String>,
+    /// The live session view: read to build the footer's usage + context item
+    /// when a `DisplayItem::Usage` arrives (ticket 04).
+    live: LiveUsageView,
 }
 
-/// The CLI's TUI adapter (ADR-0014 D2): a [`Renderer`] that runs on the turn's
-/// worker thread and feeds each item into the library's emit callback. The
-/// library owns the channel and the frame loop; the CLI only decides how a
-/// `DisplayItem` looks in the TUI.
+/// The CLI's TUI adapter (ADR-0014 D2): a `Send + Sync` state object that
+/// turns the SDK's [`DisplayItem`](slimcode_app::render::DisplayItem)s into the
+/// items the TUI applies, and keeps its own view of the live session so a
+/// usage item can carry the footer's context estimate.
+///
+/// The emit channel is passed per call (`render(item, emit)`), not held: the
+/// same adapter is driven from whichever thread runs the turn, and only that
+/// thread knows how to reach the library's channel (the CLI's thread-local
+/// emit slot).
 ///
 /// With a skills list (and a cwd to resolve read paths against), a `read` of
 /// a skill's `SKILL.md` renders as a [`RenderItem::Skill`] active block
@@ -234,52 +238,42 @@ impl LiveUsageView {
 /// becomes the skill block (name + inner content, split from the `<skill>`
 /// block the runner wrote in place of the file content). Without skills the
 /// adapter is a plain mapper.
-pub struct TuiAdapter<'a> {
-    emit: &'a mut dyn FnMut(RenderItem),
+pub struct TuiAdapter {
     skills: Vec<Skill>,
     cwd: PathBuf,
-    /// `tool_call_id` → skill name for suppressed skill-read starts, paired to
-    /// their result when it arrives (parallel batches keep several pending).
-    pending_skill: HashMap<String, String>,
-    /// The live session view: read to build the footer's usage + context item
-    /// when a `DisplayItem::Usage` arrives (ticket 04).
-    live: &'a RefCell<LiveUsageView>,
+    state: Mutex<AdapterState>,
 }
 
-impl<'a> TuiAdapter<'a> {
-    /// Only the tests build a plain adapter; production always uses
-    /// [`TuiAdapter::with_skills`], which carries the CLI's skill context.
-    #[cfg(test)]
-    pub fn new(emit: &'a mut dyn FnMut(RenderItem), live: &'a RefCell<LiveUsageView>) -> Self {
-        Self {
-            emit,
-            skills: Vec::new(),
-            cwd: PathBuf::new(),
-            pending_skill: HashMap::new(),
-            live,
-        }
-    }
-
+impl TuiAdapter {
     /// A skill-aware adapter: `read` calls naming an installed skill's file
-    /// become skill active blocks.
-    pub fn with_skills(
-        emit: &'a mut dyn FnMut(RenderItem),
-        skills: Vec<Skill>,
-        cwd: PathBuf,
-        live: &'a RefCell<LiveUsageView>,
-    ) -> Self {
+    /// become skill active blocks, and the live view starts empty (the caller
+    /// [`Self::reseed`]s it when the session already has a history).
+    pub fn new(skills: Vec<Skill>, cwd: PathBuf) -> Self {
         Self {
-            emit,
             skills,
             cwd,
-            pending_skill: HashMap::new(),
-            live,
+            state: Mutex::new(AdapterState {
+                pending_skill: HashMap::new(),
+                live: LiveUsageView {
+                    messages: Vec::new(),
+                    usage: TokenUsage::default(),
+                },
+            }),
         }
     }
-}
 
-impl Renderer for TuiAdapter<'_> {
-    fn render(&mut self, item: &DisplayItem) -> Result<(), String> {
+    /// Replace the live view: the session a fresh transcript belongs to (a
+    /// `/new` or a load) or the compacted history a `Compacted` event reports.
+    pub fn reseed(&self, messages: Vec<AgentMessage>, usage: TokenUsage) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.pending_skill.clear();
+        state.live = LiveUsageView { messages, usage };
+    }
+
+    /// Route one display item: a skill-read pair collapses into a skill block,
+    /// a usage item becomes the footer's usage + context, and everything else
+    /// maps 1:1.
+    pub fn render(&self, item: &DisplayItem, emit: &mut dyn FnMut(RenderItem)) {
         match item {
             DisplayItem::ToolStart {
                 tool_call_id,
@@ -287,9 +281,12 @@ impl Renderer for TuiAdapter<'_> {
                 arguments,
             } if name == "read" => {
                 if let Some(skill) = skill_for_read_args(&self.skills, &self.cwd, arguments) {
-                    self.pending_skill
+                    self.state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .pending_skill
                         .insert(tool_call_id.clone(), skill.name.clone());
-                    return Ok(());
+                    return;
                 }
             }
             DisplayItem::ToolResult {
@@ -297,37 +294,71 @@ impl Renderer for TuiAdapter<'_> {
                 result,
                 ..
             } => {
-                if let Some(skill_name) = self.pending_skill.remove(tool_call_id) {
+                let pending = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .pending_skill
+                    .remove(tool_call_id);
+                if let Some(skill_name) = pending {
                     let content = parse_skill_block(result)
                         .map(|(_, inner)| inner.to_string())
                         .unwrap_or_default();
-                    (self.emit)(RenderItem::Skill {
+                    emit(RenderItem::Skill {
                         name: skill_name,
                         content,
                     });
-                    return Ok(());
+                    return;
                 }
             }
-            // The footer's usage + context item (ticket 04): the CLI's
-            // persistence hook ran before this render, so the shared live view
-            // already holds the session's history including the just-completed
-            // assistant message and the accumulated usage. Both numbers come
-            // from the session (ADR-0018 D4), not from the per-request usage
-            // this item carries.
+            // The footer's usage + context item (ticket 04): the `Message`
+            // event for this assistant message was delivered before this
+            // render, so the live view already holds it and its usage. Both
+            // numbers come from the session (ADR-0018 D4), not from the
+            // per-request usage this item carries.
             DisplayItem::Usage(_) => {
-                let live = self.live.borrow();
-                (self.emit)(RenderItem::Usage {
-                    usage: to_footer_usage(&live.usage),
-                    context: Some(to_context_usage(&live.messages)),
-                });
-                return Ok(());
+                self.emit_usage(emit);
+                return;
             }
             _ => {}
         }
         if let Some(render_item) = to_render_item(item) {
-            (self.emit)(render_item);
+            emit(render_item);
         }
-        Ok(())
+    }
+
+    /// Route one `Message` event into the live view: the message entered
+    /// history and the request's usage (if any) accumulates into the session
+    /// total (ADR-0018 D4). Nothing is rendered — the streamed display items
+    /// already cover it.
+    pub fn note_message(&self, message: &AgentMessage, usage: Option<&TokenUsage>) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.live.messages.push(message.clone());
+        if let Some(usage) = usage {
+            state.live.usage = state.live.usage.saturating_add(usage);
+        }
+    }
+
+    /// Route one `Compacted` event: refresh the footer from the (already
+    /// reseeded) live view and report the token change, exactly like
+    /// `/compact` does from its return value.
+    pub fn note_compacted(&self, before: usize, after: usize, emit: &mut dyn FnMut(RenderItem)) {
+        self.emit_usage(emit);
+        emit(RenderItem::Notice(format!(
+            "context compacted: {before} → {after} tokens"
+        )));
+    }
+
+    /// The footer's usage + context item, built from the live view.
+    pub fn emit_usage(&self, emit: &mut dyn FnMut(RenderItem)) {
+        let item = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            RenderItem::Usage {
+                usage: to_footer_usage(&state.live.usage),
+                context: Some(to_context_usage(&state.live.messages)),
+            }
+        };
+        emit(item);
     }
 }
 
@@ -343,16 +374,18 @@ enum OpenLine {
 }
 
 /// The CLI's renderer: turns [`DisplayItem`]s into one-shot terminal output.
-/// Wraps a `&mut dyn Write` so the one-shot path shares it with the shared turn
-/// runner.
+/// Owns a boxed `Write` — the SDK listener requires `Send + Sync`, and the
+/// renderer's streaming state (open line, pending skill reads) must survive
+/// across events, so the boxed writer is held by the struct rather than
+/// borrowed per call.
 ///
 /// With a skills list (and a cwd to resolve read paths against), a `read` of
 /// a skill's `SKILL.md` renders as a `[skill] <name>` line instead of a `read`
 /// tool block: the start is suppressed and the result prints only the skill
 /// name (pi's collapsed skill block; the one-shot has no expand key). Without
 /// skills the renderer prints tool blocks verbatim.
-pub struct TextRenderer<'a> {
-    out: &'a mut dyn Write,
+pub struct TextRenderer {
+    out: Box<dyn Write + Send + Sync>,
     /// The kind of streamed line currently open (no trailing newline), if any
     /// — the next structural line must start on its own row.
     open: Option<OpenLine>,
@@ -363,11 +396,11 @@ pub struct TextRenderer<'a> {
     pending_skill: HashMap<String, String>,
 }
 
-impl<'a> TextRenderer<'a> {
+impl TextRenderer {
     /// Wrap a `Write` target. Only the tests build a skill-less renderer;
     /// production uses [`TextRenderer::with_skills`].
     #[cfg(test)]
-    pub fn new(out: &'a mut dyn Write) -> Self {
+    pub fn new(out: Box<dyn Write + Send + Sync>) -> Self {
         Self {
             out,
             open: None,
@@ -379,7 +412,11 @@ impl<'a> TextRenderer<'a> {
 
     /// A skill-aware renderer: `read` calls naming an installed skill's file
     /// become `[skill]` active blocks.
-    pub fn with_skills(out: &'a mut dyn Write, skills: Vec<Skill>, cwd: PathBuf) -> Self {
+    pub fn with_skills(
+        out: Box<dyn Write + Send + Sync>,
+        skills: Vec<Skill>,
+        cwd: PathBuf,
+    ) -> Self {
         Self {
             out,
             open: None,
@@ -390,7 +427,7 @@ impl<'a> TextRenderer<'a> {
     }
 }
 
-impl Renderer for TextRenderer<'_> {
+impl Renderer for TextRenderer {
     fn render(&mut self, item: &DisplayItem) -> Result<(), String> {
         // A `read` of a skill's SKILL.md renders as a skill active block
         // instead of a `read` tool block.
@@ -455,7 +492,7 @@ impl Renderer for TextRenderer<'_> {
     }
 }
 
-impl TextRenderer<'_> {
+impl TextRenderer {
     /// Render a skill-read pair as a `[skill]` line, returning `true` when
     /// `item` was consumed. A `read` start naming an installed skill's file is
     /// remembered (nothing printed); its result prints `[skill] <name>` only —
@@ -525,20 +562,36 @@ mod tests {
     use slimcode_app::skills::SkillScope;
     use slimcode_app::testutil::unique_temp_dir;
     use slimcode_core::agent::{AgentEvent, Delta, FinishReason};
+    use std::sync::{Arc, Mutex};
+
+    /// A `Write` into a shared buffer, so a test can read back what the
+    /// renderer wrote after the boxed writer was moved in.
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     /// Feed a stream of agent events through the shared mapping and the
     /// `TextRenderer`, returning the rendered bytes as a string.
     fn render_stream(events: &[AgentEvent]) -> String {
-        let mut buf = Vec::new();
+        let buf = SharedBuf::default();
         {
-            let mut r = TextRenderer::new(&mut buf);
+            let mut r = TextRenderer::new(Box::new(buf.clone()));
             for e in events {
                 if let Some(item) = map_event(e) {
                     r.render(&item).unwrap();
                 }
             }
         }
-        String::from_utf8(buf).unwrap()
+        String::from_utf8(buf.0.lock().unwrap().clone()).unwrap()
     }
 
     #[test]
@@ -631,9 +684,9 @@ mod tests {
 
     #[test]
     fn usage_renders_with_leading_blank_line() {
-        let mut buf = Vec::new();
+        let buf = SharedBuf::default();
         {
-            let mut r = TextRenderer::new(&mut buf);
+            let mut r = TextRenderer::new(Box::new(buf.clone()));
             let u = TokenUsage {
                 prompt_tokens: 5,
                 completion_tokens: 3,
@@ -643,16 +696,16 @@ mod tests {
             r.render(&DisplayItem::Usage(u)).unwrap();
         }
         assert_eq!(
-            String::from_utf8(buf).unwrap(),
+            String::from_utf8(buf.0.lock().unwrap().clone()).unwrap(),
             "\ntokens: 5 prompt (0 cached, 0%) + 3 completion = 8 total\n"
         );
     }
 
     #[test]
     fn usage_renders_cached_count_when_details_present() {
-        let mut buf = Vec::new();
+        let buf = SharedBuf::default();
         {
-            let mut r = TextRenderer::new(&mut buf);
+            let mut r = TextRenderer::new(Box::new(buf.clone()));
             let u = TokenUsage {
                 prompt_tokens: 20,
                 completion_tokens: 4,
@@ -665,7 +718,7 @@ mod tests {
             r.render(&DisplayItem::Usage(u)).unwrap();
         }
         assert_eq!(
-            String::from_utf8(buf).unwrap(),
+            String::from_utf8(buf.0.lock().unwrap().clone()).unwrap(),
             "\ntokens: 20 prompt (16 cached, 80%) + 4 completion = 24 total\n"
         );
     }
@@ -822,19 +875,99 @@ mod tests {
     #[test]
     fn tui_adapter_emits_mapped_items_and_skips_dropped_ones() {
         let mut emitted: Vec<RenderItem> = Vec::new();
-        {
-            let mut record = |item: RenderItem| emitted.push(item);
-            let live = RefCell::new(LiveUsageView::empty());
-            let mut adapter = TuiAdapter::new(&mut record, &live);
-            adapter
-                .render(&DisplayItem::Text("answer".to_string()))
-                .unwrap();
-            adapter.render(&DisplayItem::Turn { turn: 1 }).unwrap();
-            adapter
-                .render(&DisplayItem::Stop(StopReason::Completed))
-                .unwrap();
-        }
+        let adapter = TuiAdapter::new(Vec::new(), PathBuf::new());
+        adapter.render(
+            &DisplayItem::Text("answer".to_string()),
+            &mut |item: RenderItem| emitted.push(item),
+        );
+        adapter.render(&DisplayItem::Turn { turn: 1 }, &mut |item: RenderItem| {
+            emitted.push(item)
+        });
+        adapter.render(
+            &DisplayItem::Stop(StopReason::Completed),
+            &mut |item: RenderItem| emitted.push(item),
+        );
         assert_eq!(emitted, vec![RenderItem::Text("answer".to_string())]);
+    }
+
+    #[test]
+    fn tui_adapter_note_message_feeds_the_live_view() {
+        // Ticket 05: the adapter owns its live view, so a `Message` event
+        // updates it (message pushed, usage accumulated) and the next usage
+        // render reports the session's totals — no persistence hook needed.
+        let mut emitted: Vec<RenderItem> = Vec::new();
+        let adapter = TuiAdapter::new(Vec::new(), PathBuf::new());
+        adapter.note_message(&AgentMessage::text(Role::User, "hi"), None);
+        let usage = TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            ..Default::default()
+        };
+        adapter.note_message(&AgentMessage::text(Role::Assistant, "hello"), Some(&usage));
+        adapter.render(&DisplayItem::Usage(usage), &mut |item: RenderItem| {
+            emitted.push(item)
+        });
+        assert_eq!(
+            emitted,
+            vec![RenderItem::Usage {
+                usage: FooterUsage::new(10, 5, 0, 0),
+                context: Some(to_context_usage(&[
+                    AgentMessage::text(Role::User, "hi"),
+                    AgentMessage::text(Role::Assistant, "hello"),
+                ])),
+            }]
+        );
+        // A tool result contributes no usage of its own.
+        emitted.clear();
+        adapter.note_message(&AgentMessage::tool_result("c1", "ok"), None);
+        adapter.render(
+            &DisplayItem::Usage(TokenUsage::default()),
+            &mut |item: RenderItem| emitted.push(item),
+        );
+        match &emitted[0] {
+            RenderItem::Usage { usage, context } => {
+                assert_eq!(*usage, FooterUsage::new(10, 5, 0, 0));
+                assert_ne!(
+                    *context,
+                    Some(to_context_usage(&[
+                        AgentMessage::text(Role::User, "hi"),
+                        AgentMessage::text(Role::Assistant, "hello"),
+                    ]))
+                );
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tui_adapter_note_compacted_refreshes_the_footer_and_reports_it() {
+        // Ticket 05: the automatic compaction path renders exactly what
+        // `/compact` renders — a usage refresh from the compacted history and
+        // the token change.
+        let mut emitted: Vec<RenderItem> = Vec::new();
+        let adapter = TuiAdapter::new(Vec::new(), PathBuf::new());
+        adapter.reseed(
+            vec![AgentMessage::compact_summary("summary", 400, None)],
+            TokenUsage {
+                prompt_tokens: 400,
+                total_tokens: 400,
+                ..Default::default()
+            },
+        );
+        adapter.note_compacted(1_000, 400, &mut |item: RenderItem| emitted.push(item));
+        assert_eq!(
+            emitted,
+            vec![
+                RenderItem::Usage {
+                    usage: FooterUsage::new(400, 0, 0, 0),
+                    context: Some(to_context_usage(&[AgentMessage::compact_summary(
+                        "summary", 400, None
+                    )])),
+                },
+                RenderItem::Notice("context compacted: 1000 → 400 tokens".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -847,27 +980,25 @@ mod tests {
         let mut emitted: Vec<RenderItem> = Vec::new();
         let messages = vec![AgentMessage::text(Role::User, "x".repeat(40_000))];
         let expected = to_context_usage(&messages);
-        let live = RefCell::new(LiveUsageView {
-            messages: messages.clone(),
-            usage: TokenUsage {
+        let adapter = TuiAdapter::new(Vec::new(), PathBuf::new());
+        adapter.reseed(
+            messages.clone(),
+            TokenUsage {
                 prompt_tokens: 12_000,
                 completion_tokens: 500,
                 total_tokens: 12_500,
                 ..Default::default()
             },
-        });
-        {
-            let mut record = |item: RenderItem| emitted.push(item);
-            let mut adapter = TuiAdapter::new(&mut record, &live);
-            // The DisplayItem's own usage is ignored: the footer reads the
-            // session view (ADR-0018 D4).
-            adapter
-                .render(&DisplayItem::Usage(TokenUsage {
-                    prompt_tokens: 999,
-                    ..Default::default()
-                }))
-                .unwrap();
-        }
+        );
+        // The DisplayItem's own usage is ignored: the footer reads the
+        // session view (ADR-0018 D4).
+        adapter.render(
+            &DisplayItem::Usage(TokenUsage {
+                prompt_tokens: 999,
+                ..Default::default()
+            }),
+            &mut |item: RenderItem| emitted.push(item),
+        );
         assert_eq!(
             emitted,
             vec![RenderItem::Usage {
@@ -1034,45 +1165,45 @@ Body.
         let skills = vec![store.install(&src, SkillScope::Project).unwrap()];
 
         let mut emitted: Vec<RenderItem> = Vec::new();
-        {
-            let mut record = |item: RenderItem| emitted.push(item);
-            let live = RefCell::new(LiveUsageView::empty());
-            let mut adapter = TuiAdapter::with_skills(&mut record, skills, cwd.clone(), &live);
-            // A read of the skill's own file: start suppressed, result becomes
-            // the skill block.
-            adapter
-                .render(&DisplayItem::ToolStart {
-                    tool_call_id: "c1".to_string(),
-                    name: "read".to_string(),
-                    arguments: r#"{"path": ".slimcode/skills/grill/SKILL.md"}"#.to_string(),
-                })
-                .unwrap();
-            adapter
-                .render(&DisplayItem::ToolResult {
-                    tool_call_id: "c1".to_string(),
-                    name: "read".to_string(),
-                    ok: true,
-                    result: "<skill name=\"grill\" location=\"/x/SKILL.md\">\nReferences are relative to /x.\n\nBody.\n</skill>"
-                        .to_string(),
-                })
-                .unwrap();
-            // A plain read still renders as a tool block.
-            adapter
-                .render(&DisplayItem::ToolStart {
-                    tool_call_id: "c2".to_string(),
-                    name: "read".to_string(),
-                    arguments: r#"{"path": "main.rs"}"#.to_string(),
-                })
-                .unwrap();
-            adapter
-                .render(&DisplayItem::ToolResult {
-                    tool_call_id: "c2".to_string(),
-                    name: "read".to_string(),
-                    ok: true,
-                    result: "fn main() {}".to_string(),
-                })
-                .unwrap();
-        }
+        let adapter = TuiAdapter::new(skills, cwd.clone());
+        // A read of the skill's own file: start suppressed, result becomes
+        // the skill block.
+        adapter.render(
+            &DisplayItem::ToolStart {
+                tool_call_id: "c1".to_string(),
+                name: "read".to_string(),
+                arguments: r#"{"path": ".slimcode/skills/grill/SKILL.md"}"#.to_string(),
+            },
+            &mut |item: RenderItem| emitted.push(item),
+        );
+        adapter.render(
+            &DisplayItem::ToolResult {
+                tool_call_id: "c1".to_string(),
+                name: "read".to_string(),
+                ok: true,
+                result: "<skill name=\"grill\" location=\"/x/SKILL.md\">\nReferences are relative to /x.\n\nBody.\n</skill>"
+                    .to_string(),
+            },
+            &mut |item: RenderItem| emitted.push(item),
+        );
+        // A plain read still renders as a tool block.
+        adapter.render(
+            &DisplayItem::ToolStart {
+                tool_call_id: "c2".to_string(),
+                name: "read".to_string(),
+                arguments: r#"{"path": "main.rs"}"#.to_string(),
+            },
+            &mut |item: RenderItem| emitted.push(item),
+        );
+        adapter.render(
+            &DisplayItem::ToolResult {
+                tool_call_id: "c2".to_string(),
+                name: "read".to_string(),
+                ok: true,
+                result: "fn main() {}".to_string(),
+            },
+            &mut |item: RenderItem| emitted.push(item),
+        );
         assert_eq!(
             emitted,
             vec![
@@ -1110,9 +1241,9 @@ Body.
         .unwrap();
         let skills = vec![store.install(&src, SkillScope::Project).unwrap()];
 
-        let mut buf = Vec::new();
+        let buf = SharedBuf::default();
         {
-            let mut r = TextRenderer::with_skills(&mut buf, skills, cwd.clone());
+            let mut r = TextRenderer::with_skills(Box::new(buf.clone()), skills, cwd.clone());
             r.render(&DisplayItem::ToolStart {
                 tool_call_id: "c1".to_string(),
                 name: "read".to_string(),
@@ -1128,7 +1259,7 @@ Body.
             })
             .unwrap();
         }
-        let out = String::from_utf8(buf).unwrap();
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
         // pi's collapsed skill block: the name only, no skill content.
         assert_eq!(out, "  [skill] grill\n");
         let _ = std::fs::remove_dir_all(&dir);

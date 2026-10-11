@@ -62,7 +62,10 @@ the TUI's take/put pattern (ADR-0013 D2): the provider/session/tools live behind
 taken out for the turn, and `abort(&self)` touches only the shared `CancelToken`, so it never
 waits on the lock. A second `prompt` while one runs errors ("a turn is already running"). Events
 are delivered synchronously to listeners in subscription order on the turn's thread; a consumer
-needing another thread's delivery bridges it itself. `dispose` marks the session dead and clears
+needing another thread's delivery bridges it itself. The turn's closing events (`TurnFinished`,
+then an optional `Compacted`) are emitted after the taken provider / tools / session state is put
+back, so a listener that reads the session inside them (`messages()` / `usage()`) sees the
+finished turn rather than the pre-turn snapshot. `dispose` marks the session dead and clears
 listeners.
 
 ### D5 — The SDK does not interpret `/` commands or own input history

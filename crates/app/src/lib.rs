@@ -23,7 +23,6 @@
 //!   `map_event`, and the `Renderer` trait (ADR-0004).
 //! - [`runner`]: the shared turn loop that streams every `AgentEvent` to a
 //!   `Renderer` live (ADR-0004).
-//! - [`setup`]: shared frontend runtime construction (provider + tools).
 
 pub mod compaction;
 pub mod config;
@@ -33,7 +32,6 @@ pub mod history;
 pub mod render;
 pub mod runner;
 pub mod session;
-pub mod setup;
 pub mod skills;
 pub mod tools;
 

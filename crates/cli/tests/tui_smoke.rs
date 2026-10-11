@@ -639,6 +639,24 @@ fn launch_one_shot(mock: &MockServer, ui: &Tmux, cwd: &Path, home: &Path, prompt
     ui.send_keys("Enter");
 }
 
+/// Recursively collect `*.jsonl` session logs under `dir` (a missing dir has
+/// none).
+fn session_logs(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut logs = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return logs;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            logs.extend(session_logs(&path));
+        } else if path.extension().is_some_and(|e| e == "jsonl") {
+            logs.push(path);
+        }
+    }
+    logs
+}
+
 /// The one-shot mode smoke: `slimcode "<prompt>"` against the same mock, with
 /// the real binary and the text renderer (no alternate screen). It shares the
 /// turn runner and the display mapping with the TUI, so this is the "both
@@ -686,6 +704,13 @@ fn tmux_smoke_one_shot_prints_a_run() {
         ),
         "usage summary not shown: {}",
         redact(&ui.capture())
+    );
+    // ADR-0009 D5: the one-shot never persists a session log, even though the
+    // same binary persists one in TUI mode.
+    assert!(
+        session_logs(&home).is_empty(),
+        "one-shot left session logs: {:?}",
+        session_logs(&home)
     );
 }
 

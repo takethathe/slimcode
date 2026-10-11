@@ -1365,6 +1365,7 @@ dependencies = [
  "slimcode-app",
  "slimcode-commands",
  "slimcode-core",
+ "slimcode-sdk",
  "slimcode-tui",
 ]
 

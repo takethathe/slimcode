@@ -24,7 +24,8 @@ Ask: *"if I swapped the provider, would this behave differently?"*
 - **No, the runner runs differently → runtime config** (`RunConfig`, `slimcode-core`): currently only
   `parallel_tools`. `RunConfig` must never grow a provider setting.
 - **Neither, it is application composition** (`app`/`cli`): model *name* already flows through
-  `ProviderConfig`; the choice of which provider to build stays in `app::setup`.
+  `ProviderConfig`; the choice of which provider to build stays in the composition seam
+  (`app::setup` then; `create_agent_session` since ADR-0022 deleted it).
 
 ### D2 — `BailianConfig` is renamed `ProviderConfig`; the name stops leaking
 
@@ -32,7 +33,7 @@ The type is pure provider data (`api_key`, `base_url`, `model`, `cache`), its 3-
 `with_cache(bool)` builder, its `cache: true` default and its `chat_completions_url()` all keep their
 current shape — only the name changes, from `BailianConfig` to `ProviderConfig`. `app` and `cli`
 must not know which provider sits below the seam; `BailianProvider` (the concrete implementation)
-stays a `slimcode-ai` detail that only `app::setup` names.
+stays a `slimcode-ai` detail that only the composition seam names (ADR-0022).
 
 ### D3 — The provider is stateless; config crosses `chat`
 

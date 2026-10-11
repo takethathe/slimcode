@@ -15,6 +15,8 @@
 mod common;
 use common::*;
 
+use std::sync::{Arc, Mutex};
+
 use slimcode_app::{
     AgentMessage, CancelToken, Delta, FinishReason, Message, Provider, ProviderConfig, StopReason,
     TokenUsage, ToolSpec,
@@ -329,6 +331,14 @@ fn a_failed_turn_never_compacts_even_with_huge_history() {
             .any(|e| matches!(e, SdkEvent::Compacted { .. })),
         "{events:?}"
     );
+    // The failed turn emits no end signal either: only the first turn's
+    // `TurnFinished` is in the stream, and no `Compacted` follows it (spec
+    // §5: `TurnFinished` belongs to a Completed / Cancelled turn).
+    let finished = events
+        .iter()
+        .filter(|e| matches!(e, SdkEvent::TurnFinished { .. }))
+        .count();
+    assert_eq!(finished, 1, "{events:?}");
     // The failed turn produced no reply; the log is closed with the Error
     // message and the huge history is intact (never compacted).
     let live = session.messages();
@@ -372,4 +382,237 @@ fn compaction_cost_lands_in_session_usage() {
     // the message sink; the compaction request adds its own `per_call` via the
     // provider-total delta (ADR-0018 D4) — exactly two calls' worth in total.
     assert_eq!(session.usage().total_tokens, per_call.total_tokens * 2);
+}
+
+/// What a listener saw at the `Compacted` event: the history and the usage it
+/// read through the public accessors.
+type SeenState = (Vec<AgentMessage>, TokenUsage);
+
+/// The turn-end events are delivered after the taken session state is put
+/// back: a listener that reads the session inside `Compacted` sees the
+/// post-compaction history and the usage that includes the summary request,
+/// not the pre-turn snapshot the state was taken from. The CLI's footer
+/// refresh (`route_event` reseeds the live view from the session) depends on
+/// it — the stale read renders usage 0 / context 0% after a turn-end
+/// auto-compaction.
+#[test]
+fn the_compacted_listener_sees_the_restored_session() {
+    let (_guard, _home, cwd) = test_env("compacted-state");
+    let per_call = usage(10, 5); // 15 tokens per chat call
+    let provider = FakeProvider::new(vec![big_reply(740_000)])
+        .with_summary("## Goal\nfinish the sdk")
+        .with_per_call(per_call);
+    let session = Arc::new(make_session(&cwd, Box::new(provider), vec![probe_tool()]));
+    // What a listener saw at the `Compacted` event, read through the public
+    // accessors exactly like the CLI's `route_event` does.
+    let seen: Arc<Mutex<Vec<SeenState>>> = Arc::new(Mutex::new(Vec::new()));
+    let session_handle = Arc::downgrade(&session);
+    let sink = Arc::clone(&seen);
+    let _unsubscribe = session.subscribe(move |event| {
+        if matches!(event, SdkEvent::Compacted { .. }) {
+            let session = session_handle
+                .upgrade()
+                .expect("the session outlives the turn");
+            sink.lock()
+                .expect("seen lock")
+                .push((session.messages(), session.usage()));
+        }
+    });
+
+    let stop = session.prompt("first").expect("turn");
+    assert_eq!(stop, StopReason::Completed);
+
+    let seen = seen.lock().expect("seen lock");
+    let (messages, usage_at_event) = seen.first().expect("the Compacted listener ran");
+    // The post-compaction history is already visible: the checkpoint head
+    // replaced the span it summarized.
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert!(messages[0].is_compact_summary(), "{messages:?}");
+    // The usage already includes the turn's request and the summary request.
+    assert_eq!(usage_at_event.total_tokens, per_call.total_tokens * 2);
+}
+
+// --- compact_now (on-demand compaction) -----------------------------------
+
+/// compact_now on a small history forces a compaction the auto path would
+/// skip: ~100k chars ≈ 25k tokens sits far below the 184k auto threshold, so
+/// the completed turn never auto-compacts, yet above the 16k keep budget so
+/// `compact_messages` has something to summarize. The history is replaced by
+/// a CompactSummary checkpoint, the `Compacted` event fires synchronously
+/// once with the returned tokens, and the log replays with the checkpoint as
+/// its head (ADR-0020 D2).
+#[test]
+fn compact_now_on_a_small_history_forces_compaction() {
+    let (_guard, home, cwd) = test_env("compact-now");
+    let provider =
+        FakeProvider::new(vec![big_reply(100_000)]).with_summary("## Goal\nfinish the sdk");
+    let session = make_session(&cwd, Box::new(provider), vec![probe_tool()]);
+    let recorder = Recorder::new();
+    let _unsubscribe = session.subscribe(recorder.listener());
+
+    session.prompt("first").expect("first turn");
+    // The small history is far below the auto threshold: the completed turn
+    // never auto-compacts, so no Compacted event precedes compact_now.
+    let before_events = recorder.events();
+    assert!(
+        !before_events
+            .iter()
+            .any(|e| matches!(e, SdkEvent::Compacted { .. })),
+        "{before_events:?}"
+    );
+
+    let (before, after) = session.compact_now().expect("compact_now");
+
+    // The returned change is real: the history shrank to a checkpoint.
+    assert!(after < before, "after: {after}, before: {before}");
+    let live = session.messages();
+    let checkpoint = live.first().expect("a checkpoint head");
+    assert!(checkpoint.is_compact_summary());
+    let summary = match checkpoint {
+        AgentMessage::CompactSummary { summary, .. } => summary,
+        other => panic!("expected a checkpoint, got {other:?}"),
+    };
+    assert!(summary.contains("finish the sdk"), "{summary}");
+
+    // The Compacted event fires synchronously with the returned tokens.
+    let events = recorder.events();
+    let compacted: Vec<(usize, usize)> = events
+        .iter()
+        .filter_map(|e| match e {
+            SdkEvent::Compacted { before, after } => Some((*before, *after)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(compacted, vec![(before, after)], "{events:?}");
+
+    // The log replays with the checkpoint as the head (ADR-0020 D2).
+    let store = store_for(&home, &cwd);
+    let outcome = store.load(session.session_id()).expect("load");
+    assert_eq!(outcome.session.messages, live);
+}
+
+/// compact_now on an empty history has nothing to summarize: it errors with a
+/// clear message, emits no event, and leaves the history untouched.
+#[test]
+fn compact_now_with_an_empty_history_errors() {
+    let (_guard, _home, cwd) = test_env("compact-now-empty");
+    let provider = FakeProvider::new(vec![]).with_summary("unused");
+    let session = make_session(&cwd, Box::new(provider), vec![probe_tool()]);
+    let recorder = Recorder::new();
+    let _unsubscribe = session.subscribe(recorder.listener());
+
+    let err = session.compact_now().unwrap_err();
+    assert!(err.contains("nothing to compact"), "err: {err}");
+    assert!(
+        !recorder
+            .events()
+            .iter()
+            .any(|e| matches!(e, SdkEvent::Compacted { .. })),
+        "no event on a failed compact_now"
+    );
+    assert!(session.messages().is_empty(), "history untouched");
+}
+
+/// compact_now on a tiny history that fits the retained budget errors too
+/// (there is no span old enough to fold into a summary).
+#[test]
+fn compact_now_on_a_tiny_history_errors() {
+    let (_guard, _home, cwd) = test_env("compact-now-tiny");
+    let provider = FakeProvider::new(vec![vec![text("hello"), done_stop()]]).with_summary("unused");
+    let session = make_session(&cwd, Box::new(provider), vec![probe_tool()]);
+
+    session.prompt("first").expect("first turn");
+
+    let err = session.compact_now().unwrap_err();
+    assert!(err.contains("nothing to compact"), "err: {err}");
+    assert_eq!(session.messages().len(), 2, "history untouched");
+}
+
+/// Single-flight: compact_now while a turn is running is rejected with "a
+/// turn is already running"; releasing the turn lets both complete.
+#[test]
+fn compact_now_during_a_turn_is_rejected_single_flight() {
+    let (_guard, _home, cwd) = test_env("compact-now-singleflight");
+    let started = Arc::new(Mutex::new(false));
+    let release = Arc::new(Mutex::new(false));
+    let provider = BlockingProvider {
+        started: started.clone(),
+        release: release.clone(),
+    };
+    let session = Arc::new(make_session(&cwd, Box::new(provider), Vec::new()));
+
+    let session_thread = Arc::clone(&session);
+    let handle = std::thread::spawn(move || session_thread.prompt("first"));
+    wait_until(&started);
+
+    let err = session.compact_now().unwrap_err();
+    assert!(err.contains("a turn is already running"), "err: {err}");
+
+    *release.lock().expect("release lock") = true;
+    let stop = handle.join().expect("prompt thread").expect("first prompt");
+    assert_eq!(stop, StopReason::Completed);
+}
+
+/// A failed summary request surfaces the provider error detail, leaves the
+/// history untouched, and emits no event.
+#[test]
+fn compact_now_failure_reports_the_provider_error_and_keeps_the_history() {
+    let (_guard, _home, cwd) = test_env("compact-now-fail");
+    let provider = FakeProvider::new(vec![big_reply(100_000)])
+        .with_summary("never used")
+        .fails_summary();
+    let session = make_session(&cwd, Box::new(provider), vec![probe_tool()]);
+    let recorder = Recorder::new();
+    let _unsubscribe = session.subscribe(recorder.listener());
+
+    session.prompt("first").expect("first turn");
+    let before = session.messages();
+
+    let err = session.compact_now().unwrap_err();
+    assert!(err.contains("summary provider exploded"), "err: {err}");
+
+    // The failure leaves the history untouched and emits no event.
+    assert_eq!(session.messages(), before, "history must not change");
+    assert!(
+        !recorder
+            .events()
+            .iter()
+            .any(|e| matches!(e, SdkEvent::Compacted { .. })),
+        "no Compacted event on a failed compact_now"
+    );
+}
+
+/// The summary request's token cost folds into `session.usage` (ADR-0018 D4)
+/// exactly like the auto path: the turn's assistant message carries one
+/// `per_call`, the compaction request adds its own via the provider-total
+/// delta.
+#[test]
+fn compact_now_cost_lands_in_session_usage() {
+    let (_guard, _home, cwd) = test_env("compact-now-usage");
+    let per_call = usage(10, 5); // 15 tokens per chat call
+    let provider = FakeProvider::new(vec![big_reply(100_000)])
+        .with_summary("## Goal\nfinish the sdk")
+        .with_per_call(per_call);
+    let session = make_session(&cwd, Box::new(provider), vec![probe_tool()]);
+
+    session.prompt("first").expect("turn");
+    // The small history never auto-compacted: only the turn's assistant
+    // message carried `per_call` in.
+    assert_eq!(session.usage().total_tokens, per_call.total_tokens);
+
+    session.compact_now().expect("compact_now");
+    // Exactly two calls' worth in total.
+    assert_eq!(session.usage().total_tokens, per_call.total_tokens * 2);
+}
+
+/// A disposed session rejects compact_now like it rejects prompt.
+#[test]
+fn compact_now_after_dispose_errors() {
+    let (_guard, _home, cwd) = test_env("compact-now-dispose");
+    let provider = FakeProvider::new(vec![big_reply(100_000)]).with_summary("unused");
+    let session = make_session(&cwd, Box::new(provider), vec![probe_tool()]);
+    session.dispose();
+
+    let err = session.compact_now().unwrap_err();
+    assert!(err.contains("session is disposed"), "err: {err}");
 }

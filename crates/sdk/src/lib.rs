@@ -56,7 +56,10 @@ pub use slimcode_app::{AgentMessage, Provider, StopReason, TokenUsage, Tool};
 /// is always `TurnFinished { stop_reason }` for a `Completed` / `Cancelled`
 /// turn. When turn-end auto-compaction replaced part of the history, one
 /// `Compacted { before, after }` event follows that turn's `TurnFinished`
-/// (spec §5 event order).
+/// (spec §5 event order). Both turn-end events are emitted after the turn's
+/// provider / tools / session state is put back, so a listener that reads the
+/// session inside them (`messages()` / `usage()`) sees the turn's own result —
+/// never the pre-turn snapshot the state was taken from.
 #[derive(Clone, Debug)]
 pub enum SdkEvent {
     /// A streamed display unit (text fragment, thinking line, tool start /
@@ -71,10 +74,11 @@ pub enum SdkEvent {
     /// The authoritative end signal of one `prompt` — always the last event
     /// of a `Completed` / `Cancelled` turn.
     TurnFinished { stop_reason: StopReason },
-    /// Turn-end auto-compaction replaced part of the history: `before` /
-    /// `after` are the estimated history tokens before / after the replacement
-    /// (ticket 06). Emitted after the `TurnFinished` of the turn that crossed
-    /// the threshold; never emitted when compaction fails.
+    /// Turn-end auto-compaction replaced part of the history, or an explicit
+    /// [`AgentSession::compact_now`] call did: `before` / `after` are the
+    /// estimated history tokens before / after the replacement (ticket 06).
+    /// Emitted after the `TurnFinished` of the turn that crossed the threshold,
+    /// or synchronously by `compact_now`; never emitted when compaction fails.
     Compacted { before: usize, after: usize },
 }
 
@@ -100,6 +104,10 @@ pub struct AgentSessionOptions {
     pub cwd: Option<PathBuf>,
     /// Persist the session as a JSONL session log. Defaults to `true`.
     pub persist: bool,
+    /// Resume an existing session by its id: on creation, the session is
+    /// replayed leniently from the session store (messages / title restored,
+    /// usage from zero). Requires `persist: true` — loading needs the store.
+    pub session_id: Option<String>,
     /// Override the provider base URL.
     pub base_url: Option<String>,
     /// Override the provider model.
@@ -108,10 +116,15 @@ pub struct AgentSessionOptions {
     pub api_key: Option<String>,
     /// Override the explicit-cache flag.
     pub cache: Option<bool>,
+    /// Pin the slimcode home directory (session store root, skills and
+    /// context-file discovery, `Environment.global_home`). Defaults to
+    /// `config::slimcode_home()`.
+    pub home: Option<PathBuf>,
     /// The provider to drive; defaults to a `BailianProvider`.
     pub provider: Option<Box<dyn Provider + Send>>,
     /// The tools the turn may invoke; defaults to the seven tools bound to
-    /// `cwd`.
+    /// `cwd`, cancellable through the session's own token (an `abort` kills
+    /// a running bash child).
     pub tools: Option<Vec<Tool>>,
     /// The skills advertised to the model; `None` discovers from the user
     /// and project scopes.
@@ -125,10 +138,12 @@ impl AgentSessionOptions {
         Self {
             cwd,
             persist: true,
+            session_id: None,
             base_url: None,
             model: None,
             api_key: None,
             cache: None,
+            home: None,
             provider: None,
             tools: None,
             skills: None,
@@ -138,6 +153,16 @@ impl AgentSessionOptions {
     /// Choose persistence (defaults to `true`).
     pub fn with_persist(mut self, persist: bool) -> Self {
         self.persist = persist;
+        self
+    }
+
+    /// Resume the session with the given id: [`create_agent_session`]
+    /// replays the id's persisted log into the new session (messages / title
+    /// restored, usage from zero) instead of starting fresh, and the session
+    /// keeps appending to the same log. Loading requires the session store,
+    /// so this forces `persist: true` (`with_persist(false)` errors).
+    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
         self
     }
 
@@ -162,6 +187,13 @@ impl AgentSessionOptions {
     /// Override the explicit-cache flag.
     pub fn with_cache(mut self, cache: bool) -> Self {
         self.cache = Some(cache);
+        self
+    }
+
+    /// Pin the slimcode home directory. Without it, the process-level
+    /// `SLIMCODE_HOME` (via `config::slimcode_home()`) is used.
+    pub fn with_home(mut self, home: impl Into<PathBuf>) -> Self {
+        self.home = Some(home.into());
         self
     }
 
@@ -197,11 +229,13 @@ struct Inner {
     disposed: bool,
 }
 
-/// A programmatic slimcode session: `prompt` one turn, subscribe to events,
-/// and read the session's messages / id / title / usage.
+/// A programmatic slimcode session: `prompt` one turn, `compact_now` the
+/// history on demand, subscribe to events, and read the session's messages /
+/// id / title / usage.
 ///
-/// `Send + Sync`: the internals are `Arc`-shared; `prompt` is synchronous and
-/// single-flight (a second concurrent `prompt` errors), events are delivered
+/// `Send + Sync`: the internals are `Arc`-shared; `prompt` and `compact_now`
+/// are synchronous and share a single-flight seam (a second concurrent call
+/// of either errors), events are delivered
 /// synchronously on the calling thread in subscription order, and a
 /// panicking listener is isolated (it is skipped; the turn and the other
 /// listeners continue). A listener may call its own [`Unsubscribe`] from
@@ -229,11 +263,20 @@ pub struct AgentSession {
 }
 
 /// Create an [`AgentSession`], assembling the services exactly like the CLI
-/// startup path: four-layer config resolution, the slimcode home directory,
-/// the project home / project key, and the project-scoped session store.
+/// startup path: four-layer config resolution, the slimcode home directory
+/// (pinnable via [`AgentSessionOptions::with_home`]), the project home /
+/// project key, and the project-scoped session store.
+///
+/// With [`AgentSessionOptions::with_session_id`], the session is instead
+/// resumed from the store by id: the id's persisted log is replayed leniently
+/// into the new session (messages / title restored, usage from zero) and the
+/// session keeps appending to the same log. Resuming requires the store, so
+/// `persist: false` errors.
 ///
 /// Provider and tools are injectable (the test / FFI-host seam); the defaults
-/// are a `BailianProvider` and the seven tools bound to `cwd`. AGENTS.md
+/// are a `BailianProvider` and the seven tools bound to `cwd` — cancellable
+/// through the session's own token, so `abort` / `dispose` also terminate a
+/// running bash child. AGENTS.md
 /// context files are discovered from `cwd` (and the slimcode home for the
 /// global file) and skills from the user + project scopes — both exactly like
 /// the CLI — with explicit `options.skills` bypassing discovery. The skill
@@ -243,6 +286,15 @@ pub fn create_agent_session(options: AgentSessionOptions) -> Result<AgentSession
     let cwd = options
         .cwd
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    // A resume loads from the session store, so `persist: false` (no store)
+    // is rejected up front — validated before the store is built.
+    if let Some(id) = &options.session_id
+        && !options.persist
+    {
+        return Err(format!(
+            "cannot resume session {id:?}: loading requires the session store, so persist must be true"
+        ));
+    }
     // Four-layer config resolution with the explicit options on top
     // (overrides > env > config.toml > defaults).
     let app = config::load_app_config(Overrides {
@@ -251,8 +303,16 @@ pub fn create_agent_session(options: AgentSessionOptions) -> Result<AgentSession
         cache: options.cache,
         api_key: options.api_key,
     })?;
-    let home =
-        config::slimcode_home().ok_or_else(|| "cannot determine home directory".to_string())?;
+    // `with_home` pins the slimcode home (session store root, skills and
+    // context-file discovery, `Environment.global_home`); without it the
+    // process-level `SLIMCODE_HOME` (or the default user home) is used,
+    // exactly like the CLI startup path.
+    let home = match options.home {
+        Some(home) => home,
+        None => {
+            config::slimcode_home().ok_or_else(|| "cannot determine home directory".to_string())?
+        }
+    };
     let user_home = std::env::var_os("HOME").map(PathBuf::from);
     let project_home = resolve_project_home(&cwd, user_home.as_deref());
     // The session store is scoped to the current project; startup empty-log
@@ -273,7 +333,15 @@ pub fn create_agent_session(options: AgentSessionOptions) -> Result<AgentSession
         Some(provider) => provider,
         None => Box::new(BailianProvider::new()?),
     };
-    let tools = options.tools.unwrap_or_else(|| tools::build_tools(&cwd));
+    // The default tool set is cancellable and shares the session's own cancel
+    // token (spec D1, ticket 01): the token is created before the tools so a
+    // `bash` child can observe an `abort` / `dispose`; it is reset at prompt
+    // start and set on abort / dispose, exactly like the TUI. Injected tools
+    // are used as-is (the host owns their cancellation).
+    let session_cancel = CancelToken::new();
+    let tools = options
+        .tools
+        .unwrap_or_else(|| tools::build_tools_with_cancel(&cwd, &session_cancel));
     // Resource assembly mirrors the CLI startup path (spec D2): AGENTS.md
     // context files are discovered from the slimcode home (global) and the
     // working directory (project), and skills are discovered from the user
@@ -290,12 +358,30 @@ pub fn create_agent_session(options: AgentSessionOptions) -> Result<AgentSession
         global_home: home.clone(),
         project_home: project_home.clone(),
     };
-    let session = Session {
-        id: new_session_id(),
-        created_at: now_rfc3339(),
-        messages: Vec::new(),
-        title: None,
-        usage: TokenUsage::default(),
+    let session = match &options.session_id {
+        // Lenient replay (ADR-0009 D3): `SessionStore::load` skips malformed
+        // or unknown records and repairs torn tails, and a compaction
+        // checkpoint boundary is honored; a missing log is a loud error. The
+        // restored session carries its persisted messages and title; usage is
+        // never persisted, so it starts at zero (ADR-0018 D4).
+        Some(id) => {
+            // The persist check above guarantees the store exists; the guard
+            // keeps this total if that invariant ever changes.
+            let store = store.as_ref().ok_or_else(|| {
+                format!("cannot resume session {id:?}: the session store is unavailable (persist disabled)")
+            })?;
+            store
+                .load(id)
+                .map_err(|e| format!("cannot resume session {id:?}: {e}"))?
+                .session
+        }
+        None => Session {
+            id: new_session_id(),
+            created_at: now_rfc3339(),
+            messages: Vec::new(),
+            title: None,
+            usage: TokenUsage::default(),
+        },
     };
     Ok(AgentSession {
         id: session.id.clone(),
@@ -305,7 +391,7 @@ pub fn create_agent_session(options: AgentSessionOptions) -> Result<AgentSession
             tools,
             disposed: false,
         })),
-        cancel: CancelToken::new(),
+        cancel: session_cancel,
         listeners: Arc::new(Mutex::new(Vec::new())),
         next_listener_id: AtomicUsize::new(0),
         config: app.provider,
@@ -318,12 +404,17 @@ pub fn create_agent_session(options: AgentSessionOptions) -> Result<AgentSession
 }
 
 /// What one turn produced, so `prompt` can put the taken state back even when
-/// the turn failed.
+/// the turn failed — and, once it did, emit the turn's closing events
+/// (`TurnFinished`, then `Compacted`) against the restored session.
 struct TurnOutcome {
     provider: Box<dyn Provider + Send>,
     tools: Vec<Tool>,
     session: Session,
     result: Result<StopReason, String>,
+    /// The turn-end auto-compaction's token change, if one ran: emitted as
+    /// [`SdkEvent::Compacted`] right after this turn's `TurnFinished`.
+    /// Always `None` on a failed turn (only the `Completed` arm compacts).
+    compacted: Option<(usize, usize)>,
 }
 
 impl AgentSession {
@@ -335,8 +426,8 @@ impl AgentSession {
     /// inference, best-effort persistence, closing messages on failure /
     /// cancellation). `text` is plain user input — `/` commands are a
     /// frontend concern and are not interpreted. Empty / whitespace-only
-    /// prompts are rejected. A concurrent `prompt` errors with
-    /// `"a turn is already running"`.
+    /// prompts are rejected. A concurrent `prompt` or [`Self::compact_now`]
+    /// errors with `"a turn is already running"`.
     pub fn prompt(&self, text: &str) -> Result<StopReason, String> {
         if text.trim().is_empty() {
             return Err("prompt text must not be empty".to_string());
@@ -374,13 +465,31 @@ impl AgentSession {
         inner.session = outcome.session;
         drop(inner);
 
+        // The turn's closing events go out only once the state is back inside
+        // the lock, so a listener that reads the session (`messages()` /
+        // `usage()`) inside them sees the turn's own result — not the pre-turn
+        // snapshot the state was taken from (the CLI's footer refresh on
+        // `Compacted` depends on it). Order and the failure contract are
+        // unchanged: `TurnFinished` only after a `Completed` / `Cancelled`
+        // turn, and a turn-end `Compacted` right after it.
+        if let Ok(stop_reason) = &outcome.result {
+            self.emit(SdkEvent::TurnFinished {
+                stop_reason: stop_reason.clone(),
+            });
+            if let Some((before, after)) = outcome.compacted {
+                self.emit(SdkEvent::Compacted { before, after });
+            }
+        }
         outcome.result
     }
 
     /// The whole turn orchestration, mirroring the CLI's `TuiSession::run_turn`
     /// (context assembly → prompt recording + title inference → shared turn
     /// loop with an SDK renderer and a persisting message sink → closing
-    /// messages on failure / cancellation).
+    /// messages on failure / cancellation). It does not emit the closing
+    /// `TurnFinished` / `Compacted` events itself: they are the caller's, sent
+    /// after this turn's state is put back so listeners read the restored
+    /// session (see [`Self::prompt`]).
     fn run_turn(
         &self,
         mut provider: Box<dyn Provider + Send>,
@@ -405,6 +514,7 @@ impl AgentSession {
                     tools,
                     session,
                     result: Err(e),
+                    compacted: None,
                 };
             }
         };
@@ -518,20 +628,24 @@ impl AgentSession {
                     tools,
                     session,
                     result: Err(e),
+                    compacted: None,
                 };
             }
         };
-        // Turn-end auto-compaction, captured so the `Compacted` event can be
-        // delivered after `TurnFinished` (spec §5 event order). Only a
-        // completed turn can reach it: the trigger sits inside the `Completed`
-        // arm, so cancelled and failed turns never compact.
+        // Turn-end auto-compaction, captured so the caller can deliver the
+        // `Compacted` event after `TurnFinished` and after the taken session
+        // state is restored (spec §5 event order). Only a completed turn can
+        // reach it: the trigger sits inside the `Completed` arm, so cancelled
+        // and failed turns never compact.
         let mut compacted: Option<(usize, usize)> = None;
         match &stop_reason {
             StopReason::Completed => {
                 // Auto-compaction (ticket 06): a completed turn whose history
                 // crossed the threshold replaces the old span with a summary
                 // checkpoint; a failure keeps the full history silently.
-                compacted = self.run_compaction(&mut provider, &mut session, &cancel);
+                compacted = self
+                    .run_compaction(&mut provider, &mut session, &cancel, false)
+                    .unwrap_or_default();
             }
             StopReason::Cancelled => {
                 // Esc: the partial turn is adopted; the log is closed on an
@@ -543,48 +657,44 @@ impl AgentSession {
                 }
             }
         }
-        self.emit(SdkEvent::TurnFinished {
-            stop_reason: stop_reason.clone(),
-        });
-        if let Some((before, after)) = compacted {
-            self.emit(SdkEvent::Compacted { before, after });
-        }
         TurnOutcome {
             provider,
             tools,
             session,
             result: Ok(stop_reason),
+            compacted,
         }
     }
 
-    /// Turn-end auto-compaction, mirroring the CLI's `TuiSession::run_compaction`
-    /// (spec §5 step 4, ADR-0020 D3): when a completed turn left the history
-    /// past the threshold, summarize the old span, replace it in the session,
-    /// persist the checkpoint, fold the summary request's own cost into
-    /// `session.usage` (ADR-0018 D4), and report the token change so the
-    /// caller can emit [`SdkEvent::Compacted`].
+    /// Compact the history when it crossed the threshold (auto path) or when
+    /// the caller forced it (`compact_now`, `/compact` semantics): summarize
+    /// the old span, replace it in the session, persist the checkpoint
+    /// best-effort, fold the summary request's own cost into `session.usage`
+    /// (ADR-0018 D4), and report the token change so the caller can emit
+    /// [`SdkEvent::Compacted`].
     ///
-    /// A failure is silent (spec User Story 28): the history and this turn's
-    /// result survive untouched, no event is emitted, and the next turn sees
-    /// the full history again.
+    /// `Ok(Some((before, after)))` reports a completed compaction; `Ok(None)`
+    /// means no compaction ran (auto path below the threshold — never with
+    /// `force`). A failure returns the provider error detail (or the
+    /// "nothing to compact" error of [`compaction::compact_messages`]) with
+    /// the history and this turn's result untouched; the auto path swallows it
+    /// silently, `compact_now` propagates it.
     fn run_compaction(
         &self,
         provider: &mut Box<dyn Provider + Send>,
         session: &mut Session,
         cancel: &CancelToken,
-    ) -> Option<(usize, usize)> {
-        if !compaction::should_compact(&session.messages) {
-            return None;
+        force: bool,
+    ) -> Result<Option<(usize, usize)>, String> {
+        if !force && !compaction::should_compact(&session.messages) {
+            return Ok(None);
         }
         let before = compaction::estimate_total_tokens(&session.messages);
         // The summary request spends tokens too (ADR-0018 D4): snapshot the
         // provider total so the compaction's own cost lands in `session.usage`.
         let usage_before = provider.total_usage();
         let compacted =
-            match compaction::compact_messages(provider, &self.config, cancel, &session.messages) {
-                Ok(compacted) => compacted,
-                Err(_) => return None,
-            };
+            compaction::compact_messages(provider, &self.config, cancel, &session.messages)?;
         session.messages = compacted;
         // Persist the checkpoint as the boundary it is: the log is append-only
         // and keeps the records it replaced, but the load path drops everything
@@ -597,7 +707,66 @@ impl AgentSession {
             .usage
             .saturating_add(&provider.total_usage().saturating_sub(&usage_before));
         let after = compaction::estimate_total_tokens(&session.messages);
-        Some((before, after))
+        Ok(Some((before, after)))
+    }
+
+    /// Force an on-demand compaction of the session's history, ignoring the
+    /// auto-compaction threshold (`/compact` semantics). Single-flight with
+    /// [`Self::prompt`] (take/put): a turn currently running rejects the call
+    /// with `"a turn is already running"`, and a disposed session errors.
+    ///
+    /// On success the history is replaced by a `CompactSummary` checkpoint
+    /// (persisted best-effort, ADR-0020 D2), the summary request's token cost
+    /// folds into [`Self::usage`] (ADR-0018 D4), a synchronous
+    /// [`SdkEvent::Compacted { before, after }`](SdkEvent::Compacted) is
+    /// emitted, and `Ok((before, after))` reports the token change. A failure
+    /// returns the provider error detail (or a clear "nothing to compact"
+    /// error) with the history untouched and no event emitted.
+    pub fn compact_now(&self) -> Result<(usize, usize), String> {
+        // Take the turn state out of the lock so compaction runs without
+        // holding it (the same take/put seam as `prompt`). The provider slot
+        // is the single-flight marker: a running turn holds it, so a
+        // concurrent `compact_now` errors and vice versa.
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "session lock poisoned".to_string())?;
+        if inner.disposed {
+            return Err("session is disposed".to_string());
+        }
+        let Some(mut provider) = inner.provider.take() else {
+            return Err("a turn is already running".to_string());
+        };
+        let mut session = inner.session.clone();
+        // A fresh compaction starts uncancelled. Reset while still holding the
+        // lock so a concurrent `dispose` (which needs the lock to set its flag)
+        // cannot have its cancel wiped by this call's start.
+        self.cancel.reset();
+        let cancel = self.cancel.clone();
+        drop(inner);
+
+        let outcome = self.run_compaction(&mut provider, &mut session, &cancel, true);
+
+        // Put everything back, whatever the outcome (a failure leaves the
+        // history and this turn's result untouched).
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "session lock poisoned".to_string())?;
+        inner.provider = Some(provider);
+        inner.session = session;
+        drop(inner);
+
+        match outcome {
+            Ok(Some((before, after))) => {
+                self.emit(SdkEvent::Compacted { before, after });
+                Ok((before, after))
+            }
+            // `force` makes `run_compaction` skip the threshold guard, so this
+            // arm is unreachable; it stays for exhaustiveness.
+            Ok(None) => unreachable!("compact_now forces compaction past the threshold"),
+            Err(e) => Err(e),
+        }
     }
 
     /// Request cancellation of the running turn from any thread.

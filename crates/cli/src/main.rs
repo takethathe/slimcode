@@ -17,6 +17,8 @@
 
 mod config_cmd;
 mod render;
+#[cfg(test)]
+mod testutil;
 mod tui;
 
 use std::env;
@@ -25,15 +27,14 @@ use std::path::{Path, PathBuf};
 
 use slimcode_ai::ProviderConfig;
 use slimcode_app::config::{self, Overrides};
-use slimcode_app::context::{ContextBuilder, Environment};
-use slimcode_app::context_files::{ContextFile, load_context_files, resolve_project_home};
+use slimcode_app::context_files::resolve_project_home;
 use slimcode_app::history::HistoryStore;
+use slimcode_app::render::Renderer;
 use slimcode_app::session::{SessionStore, project_key};
 use slimcode_app::skills::{
-    Skill, SkillStore, find_skill, leading_skill_ref, normalize_skill_trigger, skill_for_read_args,
-    skill_prompt,
+    Skill, SkillStore, find_skill, leading_skill_ref, normalize_skill_trigger, skill_prompt,
 };
-use slimcode_core::session::AgentMessage;
+use slimcode_sdk::{AgentSession, AgentSessionOptions, SdkEvent, create_agent_session};
 
 fn usage() -> String {
     format!(
@@ -65,114 +66,124 @@ fn usage() -> String {
 /// Non-interactive one-shot: run one prompt, print usage. Sessions are never
 /// persisted here (ADR-0009 D5): the one-shot has no interactive session
 /// workflow, so it leaves no session files behind — matching the TUI's rule
-/// that a turn with no assistant message leaves no log.
-//
-// `clippy::too_many_arguments` is allowed: all seven parameters are the
-// distinct inputs of the one-shot entry point (prompt, cwd, config, skills,
-// context files, environment, output), and bundling them would only move the
-// sprawl into a struct with no shared lifecycle.
-#[allow(clippy::too_many_arguments)]
+/// that a turn with no assistant message leaves no log. `home` is the home
+/// the startup path resolved, pinned into the session so the one-shot reads
+/// the same config / skills / session-store root as startup.
 fn run_once(
     prompt: &str,
     cwd: &Path,
+    home: &Path,
     config: ProviderConfig,
     skills: &[Skill],
-    context_files: &[ContextFile],
-    environment: Environment,
-    out: &mut dyn Write,
+    out: Box<dyn Write + Send + Sync>,
 ) -> Result<i32, String> {
-    let (mut provider, tools) = slimcode_app::setup::setup(cwd)?;
+    run_once_with(prompt, cwd, home, config, skills, out, create_agent_session)
+}
+
+/// The one-shot's wiring, shared by [`run_once`] and its tests: session
+/// creation is injectable, so a test can drive the whole one-shot through the
+/// SDK with a scripted provider (`AgentSessionOptions::with_provider`) instead
+/// of a network round trip.
+fn run_once_with(
+    prompt: &str,
+    cwd: &Path,
+    home: &Path,
+    config: ProviderConfig,
+    skills: &[Skill],
+    out: Box<dyn Write + Send + Sync>,
+    create: impl FnOnce(AgentSessionOptions) -> Result<AgentSession, String>,
+) -> Result<i32, String> {
     // The CLI one-shot path has no command parser, so a leading skill trigger
     // (`/skill:{name}` or `/{name}` for an installed skill) injects the skill
     // active block as the user prompt — the same content the TUI's `/`-command
     // path embeds, so the model sees the skill instructions either way. Any
     // other leading `/`-form is normalized to the `/{name}` text form.
-    let prompt = if let Some((name, arg)) = leading_skill_ref(prompt) {
-        match find_skill(skills, name) {
-            Some(skill) => skill_prompt(skill, (!arg.is_empty()).then_some(arg), false),
-            None => normalize_skill_trigger(prompt),
+    let prompt = normalize_skill_trigger_prompt(prompt, skills);
+    // One-shot: a `persist: false` AgentSession (ADR-0009 D5), the resolved
+    // home pinned (so the session reads the same root startup resolved), the
+    // frozen config re-applied as the highest-precedence overrides (spec
+    // Decision 4), and the CLI's skills snapshot. The SDK discovers the
+    // AGENTS.md context files and the environment itself.
+    let session = create(one_shot_options(cwd, home, &config, skills))?;
+    // Stream the SDK's display events into the shared renderer. The renderer
+    // owns the boxed writer (the listener requires `Send + Sync`), and a
+    // `Mutex` lets the `Fn` listener mutate the renderer's streaming state.
+    let renderer = std::sync::Mutex::new(render::TextRenderer::with_skills(
+        out,
+        skills.to_vec(),
+        cwd.to_path_buf(),
+    ));
+    // The handle is held for the one-shot's lifetime: dropping it would not
+    // unsubscribe, but keeping it documents that the session owns the listener.
+    let _subscription = session.subscribe(move |event: SdkEvent| {
+        if let SdkEvent::Display(item) = event {
+            let _ = renderer.lock().unwrap().render(&item);
         }
-    } else {
-        normalize_skill_trigger(prompt)
-    };
-    let context = ContextBuilder::new()
-        .with_environment(environment)
-        .with_context_files(context_files)
-        .with_skills(skills)
-        .with_user_prompt(prompt)
-        .build()?;
-    let cfg = slimcode_core::agent::RunConfig::default();
-    let cancel = slimcode_core::agent::CancelToken::new();
-    let mut renderer = render::TextRenderer::with_skills(out, skills.to_vec(), cwd.to_path_buf());
-    // One-shot: no session persistence, so the per-message sink is a no-op.
-    // Skill dedup history is the turn's own messages: when the prompt already
-    // carries a skill block (a `/skill:name` trigger), a later `read` of the
-    // same skill yields the already-loaded notice instead of the body again.
-    let skill_dedup_history: Vec<AgentMessage> = context.messages.clone();
-    let (_updated, _stop) = slimcode_app::runner::run_turn_with_hooks(
-        &mut provider,
-        &tools,
-        context,
-        &cfg,
-        &config,
-        &cancel,
-        &mut renderer,
-        &mut |_, _| Ok(()),
-        slimcode_core::agent::RunHooks {
-            before_tool: Some(Box::new(&mut |msg: &mut AgentMessage, index: usize| {
-                let Some(call) = msg.tool_calls().get(index) else {
-                    return Ok(slimcode_core::agent::ToolDecision::Run);
-                };
-                if call.name != "read" {
-                    return Ok(slimcode_core::agent::ToolDecision::Run);
-                }
-                let Some(skill) = skill_for_read_args(skills, cwd, &call.arguments) else {
-                    return Ok(slimcode_core::agent::ToolDecision::Run);
-                };
-                let already_loaded =
-                    slimcode_app::context::skill_loaded_in(&skill_dedup_history, skill);
-                Ok(slimcode_core::agent::ToolDecision::Skip(Ok(skill_prompt(
-                    skill,
-                    None,
-                    already_loaded,
-                ))))
-            })),
-            ..Default::default()
-        },
-    )?;
+    });
+    session.prompt(&prompt)?;
     // Per-request usage already streamed into the renderer with each assistant
     // message (ticket 03): no final total line, so a single-request turn does
     // not print its usage twice.
     Ok(0)
 }
 
-/// Interactive TUI (ADR-0003). Provider + tool setup happens inside the TUI
-/// entry, before the alternate screen opens, so config/API-key errors surface
-/// on the normal terminal.
+/// The one-shot's `AgentSessionOptions`: no persistence (ADR-0009 D5), the
+/// resolved home pinned (so the SDK uses the startup path's root instead of
+/// re-reading the environment), the frozen config re-applied as the
+/// highest-precedence overrides (spec Decision 4 — overrides beat env and
+/// `config.toml`, so the resolved values are reproduced exactly), and the
+/// CLI's skills snapshot. `max_tokens` has no options field and the CLI's
+/// config always resolves it to `None` anyway (no loss).
+fn one_shot_options(
+    cwd: &Path,
+    home: &Path,
+    config: &ProviderConfig,
+    skills: &[Skill],
+) -> AgentSessionOptions {
+    AgentSessionOptions::new(Some(cwd.to_path_buf()))
+        .with_persist(false)
+        .with_home(home.to_path_buf())
+        .with_base_url(config.base_url.clone())
+        .with_model(config.model.clone())
+        .with_api_key(config.api_key.clone())
+        .with_cache(config.cache)
+        .with_skills(skills.to_vec())
+}
+
+/// The one-shot's leading-skill-trigger normalization (frontend semantics,
+/// spec Decision 2): `/skill:{name}` / `/{name}` for an installed skill
+/// becomes the skill active block, any other leading `/`-form is normalized to
+/// the `/{name}` text form. Runs before the prompt reaches the SDK.
+fn normalize_skill_trigger_prompt(prompt: &str, skills: &[Skill]) -> String {
+    if let Some((name, arg)) = leading_skill_ref(prompt) {
+        match find_skill(skills, name) {
+            Some(skill) => skill_prompt(skill, (!arg.is_empty()).then_some(arg), false),
+            None => normalize_skill_trigger(prompt),
+        }
+    } else {
+        normalize_skill_trigger(prompt)
+    }
+}
+
+/// Interactive TUI (ADR-0003). The session (provider, tools, store, skills,
+/// context files) is built inside the TUI entry from the pinned home, before
+/// the alternate screen opens, so config/API-key errors surface on the normal
+/// terminal.
 fn run_tui(
     cwd: &Path,
+    home: &Path,
     config: ProviderConfig,
     store: &SessionStore,
     history: &HistoryStore,
     skills: &SkillStore,
-    context_files: &[ContextFile],
-    environment: Environment,
 ) -> Result<i32, String> {
-    tui::run(
-        cwd,
-        config,
-        store,
-        history,
-        skills,
-        context_files,
-        environment,
-    )
+    tui::run(cwd, home, config, store, history, skills)
 }
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let tty = std::io::stdout().is_terminal();
-    match run(&args, &mut std::io::stdout(), tty) {
+    match run(&args, Box::new(std::io::stdout()), tty) {
         Ok(code) => std::process::exit(code),
         Err(e) => {
             eprintln!("slimcode: {e}");
@@ -211,8 +222,10 @@ fn chmod_warning(_path: &Path, _source: config::ApiKeySource) -> Option<String> 
 
 /// Argument parsing + mode dispatch (I/O separated from main for testability).
 /// `tty` is whether stdout is a terminal (launch rule uses
-/// `std::io::IsTerminal`), injected so the dispatch is unit-testable.
-fn run(args: &[String], out: &mut dyn Write, tty: bool) -> Result<i32, String> {
+/// `std::io::IsTerminal`), injected so the dispatch is unit-testable. `out` is
+/// owned so the one-shot path can hand a `Send + Sync` boxed writer to the SDK
+/// listener; help / config output writes through the same box.
+fn run(args: &[String], mut out: Box<dyn Write + Send + Sync>, tty: bool) -> Result<i32, String> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         writeln!(out, "{}", usage()).map_err(|e| e.to_string())?;
         return Ok(0);
@@ -226,7 +239,7 @@ fn run(args: &[String], out: &mut dyn Write, tty: bool) -> Result<i32, String> {
             tty,
             std::io::stdin().is_terminal(),
             &mut std::io::stdin().lock(),
-            out,
+            &mut *out,
         )?;
         return Ok(0);
     }
@@ -263,9 +276,8 @@ fn run(args: &[String], out: &mut dyn Write, tty: bool) -> Result<i32, String> {
     if let Some(w) = chmod_warning(&home.join("config.toml"), api_key_source) {
         eprintln!("slimcode: {w}");
     }
-    // System environment info: OS name, global home (slimcode home), and the
-    // project home (git root, falling back to the OS user home). Frozen at
-    // startup; a restored session keeps the environment from its first turn.
+    // The project home (git root, falling back to the OS user home) keys the
+    // session store and is the boundary the SDK's session store is scoped to.
     let user_home = std::env::var_os("HOME").map(PathBuf::from);
     let project_home = resolve_project_home(&cwd, user_home.as_deref());
     // The session store is scoped to the current project: sessions persist
@@ -285,33 +297,10 @@ fn run(args: &[String], out: &mut dyn Write, tty: bool) -> Result<i32, String> {
     let skills_store = SkillStore::new(&home, &cwd);
     // Skill discovery failures must not block a run; `/skills` surfaces them.
     let skills = skills_store.list().unwrap_or_default();
-    // AGENTS.md discovery is infallible: missing files simply yield none.
-    let context_files = load_context_files(&home, &cwd);
-    let environment = Environment {
-        os: std::env::consts::OS.to_string(),
-        global_home: home.clone(),
-        project_home,
-    };
 
     match parsed.prompt {
-        Some(p) => run_once(
-            &p,
-            &cwd,
-            app_config,
-            &skills,
-            &context_files,
-            environment,
-            out,
-        ),
-        None => run_tui(
-            &cwd,
-            app_config,
-            &store,
-            &history,
-            &skills_store,
-            &context_files,
-            environment,
-        ),
+        Some(p) => run_once(&p, &cwd, &home, app_config, &skills, out),
+        None => run_tui(&cwd, &home, app_config, &store, &history, &skills_store),
     }
 }
 
@@ -398,6 +387,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::SharedBuf;
 
     /// Serializes tests that mutate process-global env vars (`run_isolated`
     /// and `no_args_no_tty_errors_clearly` both touch `ENV_API_KEY`/`ENV_HOME`;
@@ -413,8 +403,7 @@ mod tests {
         unsafe { env::remove_var(config::ENV_API_KEY) };
         let old_home = env::var_os(config::ENV_HOME);
         unsafe { env::set_var(config::ENV_HOME, std::env::temp_dir()) };
-        let mut buf = Vec::new();
-        let result = run(args, &mut buf, tty);
+        let result = run(args, Box::new(Vec::new()), tty);
         // restore
         match old_key {
             Some(v) => unsafe { env::set_var(config::ENV_API_KEY, v) },
@@ -427,12 +416,17 @@ mod tests {
         result
     }
 
+    /// Run `args` capturing the written bytes, for output-asserting tests.
+    fn run_captured(args: &[String], tty: bool) -> Result<(i32, String), String> {
+        let buf = SharedBuf::default();
+        let code = run(args, Box::new(buf.clone()), tty)?;
+        Ok((code, buf.contents()))
+    }
+
     #[test]
     fn help_prints_usage() {
-        let mut buf = Vec::new();
-        let code = run(&["--help".to_string()], &mut buf, false).unwrap();
+        let (code, s) = run_captured(&["--help".to_string()], false).unwrap();
         assert_eq!(code, 0);
-        let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("USAGE"));
         assert!(s.contains("interactive TUI"));
     }
@@ -444,7 +438,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let old_key = env::var_os(config::ENV_API_KEY);
         unsafe { env::remove_var(config::ENV_API_KEY) };
-        let err = run(&[], &mut Vec::new(), false).unwrap_err();
+        let err = run(&[], Box::new(Vec::new()), false).unwrap_err();
         match old_key {
             Some(v) => unsafe { env::set_var(config::ENV_API_KEY, v) },
             None => unsafe { env::remove_var(config::ENV_API_KEY) },
@@ -454,7 +448,7 @@ mod tests {
 
     #[test]
     fn no_args_on_tty_dispatches_to_tui_needs_config() {
-        // No prompt on a TTY → the TUI path: its provider/tool setup fails on
+        // No prompt on a TTY → the TUI path: its config resolution fails on
         // the missing API key before the alternate screen opens.
         let err = run_isolated(&[], true).unwrap_err();
         assert!(err.contains(config::ENV_API_KEY), "err: {err}");
@@ -548,10 +542,8 @@ mod tests {
 
     #[test]
     fn help_lists_api_key_flag_and_env_precedence() {
-        let mut buf = Vec::new();
-        let code = run(&["--help".to_string()], &mut buf, false).unwrap();
+        let (code, s) = run_captured(&["--help".to_string()], false).unwrap();
         assert_eq!(code, 0);
-        let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("--api-key"), "help must list --api-key");
         assert!(s.contains("config"), "help must list slimcode config");
         assert!(
@@ -562,10 +554,8 @@ mod tests {
 
     #[test]
     fn help_lists_cache_flags() {
-        let mut buf = Vec::new();
-        let code = run(&["--help".to_string()], &mut buf, false).unwrap();
+        let (code, s) = run_captured(&["--help".to_string()], false).unwrap();
         assert_eq!(code, 0);
-        let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("--cache"), "help must list --cache");
         assert!(s.contains("--no-cache"), "help must list --no-cache");
         assert!(
@@ -647,7 +637,7 @@ mod tests {
     fn config_subcommand_non_tty_errors() {
         // `slimcode config` is interactive: on a non-TTY it must fail before
         // touching any config (mirrors the launch rule).
-        let err = run(&["config".to_string()], &mut Vec::new(), false).unwrap_err();
+        let err = run(&["config".to_string()], Box::new(Vec::new()), false).unwrap_err();
         assert!(err.contains("terminal"), "err: {err}");
     }
 
@@ -657,7 +647,7 @@ mod tests {
         // rejects extra positional args.
         let err = run(
             &["config".to_string(), "extra".to_string()],
-            &mut Vec::new(),
+            Box::new(Vec::new()),
             true,
         )
         .unwrap_err();
@@ -670,5 +660,340 @@ mod tests {
         // as a later positional it is an ordinary prompt.
         let parsed = parse_args(&["hello".to_string(), "config".to_string()]).unwrap();
         assert_eq!(parsed.prompt.as_deref(), Some("hello"));
+    }
+
+    // --- one-shot converges on the SDK (ticket 04) -------------------------
+
+    /// A scripted provider: each `chat` replays the next delta batch, so the
+    /// one-shot turn can be driven end-to-end without a network. Every message
+    /// batch it sees is recorded, so a test can assert what the SDK actually
+    /// sent after the CLI normalized the prompt. Injected via
+    /// `AgentSessionOptions::with_provider` (the SDK's test seam).
+    struct FakeProvider {
+        script: Vec<Vec<slimcode_ai::Delta>>,
+        calls: usize,
+        error: Option<String>,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    }
+
+    impl FakeProvider {
+        fn new(script: Vec<Vec<slimcode_ai::Delta>>) -> Self {
+            Self {
+                script,
+                calls: 0,
+                error: None,
+                seen: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        /// A provider whose request always fails, for the error path.
+        fn failing(message: &str) -> Self {
+            Self {
+                error: Some(message.to_string()),
+                ..Self::new(Vec::new())
+            }
+        }
+
+        /// The message batches this provider saw (shares its record).
+        fn seen(&self) -> std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>> {
+            std::sync::Arc::clone(&self.seen)
+        }
+    }
+
+    impl slimcode_app::Provider for FakeProvider {
+        fn chat(
+            &mut self,
+            messages: &[slimcode_core::session::Message],
+            _tools: &[slimcode_core::agent::ToolSpec],
+            _config: &ProviderConfig,
+            _cancel: &slimcode_core::agent::CancelToken,
+            on_delta: &mut dyn FnMut(slimcode_ai::Delta) -> Result<(), String>,
+        ) -> Result<Option<slimcode_ai::TokenUsage>, String> {
+            self.seen.lock().unwrap().push(
+                messages
+                    .iter()
+                    .map(slimcode_core::session::Message::text_content)
+                    .collect(),
+            );
+            if let Some(e) = &self.error {
+                return Err(e.clone());
+            }
+            let batch = self.script.get(self.calls).cloned().unwrap_or_default();
+            self.calls += 1;
+            for delta in batch {
+                on_delta(delta)?;
+            }
+            Ok(None)
+        }
+    }
+
+    /// Run `f` with `SLIMCODE_HOME` pointed at a scratch home and a `cwd`
+    /// carrying a `.git` marker (so the project home resolves deterministically
+    /// to the cwd itself, mirroring the SDK test scaffolding). Serialized by
+    /// `ENV_LOCK`, since `SLIMCODE_HOME` is process-global.
+    fn with_scratch_home<T>(
+        tag: &str,
+        f: impl FnOnce(&std::path::Path, &std::path::Path) -> T,
+    ) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = slimcode_app::testutil::unique_temp_dir(tag);
+        let home = root.join("home");
+        let cwd = root.join("proj");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(cwd.join(".git")).unwrap();
+        let old_home = env::var_os(config::ENV_HOME);
+        unsafe { env::set_var(config::ENV_HOME, &home) };
+        let result = f(&home, &cwd);
+        match old_home {
+            Some(v) => unsafe { env::set_var(config::ENV_HOME, v) },
+            None => unsafe { env::remove_var(config::ENV_HOME) },
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        result
+    }
+
+    /// Recursively count session logs under `dir` (a missing store dir counts
+    /// as zero).
+    fn count_jsonl(dir: &std::path::Path) -> usize {
+        if !dir.exists() {
+            return 0;
+        }
+        let mut n = 0;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let ty = entry.file_type().unwrap();
+            n += if ty.is_dir() {
+                count_jsonl(&entry.path())
+            } else if entry.path().extension().is_some_and(|e| e == "jsonl") {
+                1
+            } else {
+                0
+            };
+        }
+        n
+    }
+
+    /// A frozen config for the one-shot tests (all four overrides set, so
+    /// session creation never touches env / config.toml).
+    fn test_config() -> ProviderConfig {
+        ProviderConfig::new("sk-test", "https://example.invalid/v1", "test-model")
+    }
+
+    /// One installed skill for the trigger tests.
+    fn test_skill() -> Skill {
+        Skill {
+            name: "grill".to_string(),
+            description: "stress-test a plan".to_string(),
+            disable_model_invocation: false,
+            body: "# Grill\n\nPush back on the plan.".to_string(),
+            scope: slimcode_app::skills::SkillScope::Project,
+            dir: std::path::PathBuf::from("/proj/.slimcode/skills/grill"),
+            file: std::path::PathBuf::from("/proj/.slimcode/skills/grill/SKILL.md"),
+        }
+    }
+
+    /// The one-shot options: no persistence (ADR-0009 D5), the resolved home
+    /// pinned, and the resolved config re-applied as the highest-precedence
+    /// overrides, so the SDK reproduces the frozen values (spec Decision 4).
+    #[test]
+    fn one_shot_options_freeze_the_resolved_config_without_persistence() {
+        let opts = one_shot_options(
+            Path::new("/proj"),
+            Path::new("/home/user"),
+            &test_config(),
+            &[test_skill()],
+        );
+        assert!(!opts.persist, "one-shot must never persist (ADR-0009 D5)");
+        assert_eq!(opts.cwd.as_deref(), Some(Path::new("/proj")));
+        assert_eq!(opts.home.as_deref(), Some(Path::new("/home/user")));
+        assert_eq!(opts.base_url.as_deref(), Some("https://example.invalid/v1"));
+        assert_eq!(opts.model.as_deref(), Some("test-model"));
+        assert_eq!(opts.api_key.as_deref(), Some("sk-test"));
+        assert_eq!(opts.cache, Some(true));
+        assert_eq!(opts.skills.as_deref(), Some([test_skill()].as_slice()));
+    }
+
+    /// The one-shot drives the whole turn through an `AgentSession`: the SDK's
+    /// `Display` events reach the boxed writer (streamed text, tool block, tool
+    /// result) and a successful turn exits 0.
+    #[test]
+    fn one_shot_streams_the_sdk_display_events() {
+        with_scratch_home("cli-oneshot-stream", |home, cwd| {
+            let provider = FakeProvider::new(vec![
+                vec![
+                    slimcode_ai::Delta::Text("hello ".to_string()),
+                    slimcode_ai::Delta::Text("world".to_string()),
+                    slimcode_ai::Delta::ToolCallStart {
+                        index: 0,
+                        id: "c1".to_string(),
+                        name: "probe".to_string(),
+                    },
+                    slimcode_ai::Delta::ToolCallArgs {
+                        index: 0,
+                        fragment: "{}".to_string(),
+                    },
+                    slimcode_ai::Delta::Done(slimcode_ai::FinishReason::ToolCalls),
+                ],
+                vec![
+                    slimcode_ai::Delta::Text("done".to_string()),
+                    slimcode_ai::Delta::Done(slimcode_ai::FinishReason::Stop),
+                ],
+            ]);
+            let buf = SharedBuf::default();
+            let code = run_once_with(
+                "hello",
+                cwd,
+                home,
+                test_config(),
+                &[],
+                Box::new(buf.clone()),
+                move |opts| {
+                    create_agent_session(opts.with_provider(Box::new(provider)).with_tools(vec![
+                        slimcode_app::Tool::new(
+                            "probe",
+                            "returns a probe result",
+                            serde_json::json!({}),
+                            |_| Ok("probed".to_string()),
+                        ),
+                    ]))
+                },
+            )
+            .unwrap();
+            assert_eq!(code, 0);
+            let out = buf.contents();
+            assert!(out.contains("hello world"), "streamed text: {out}");
+            assert!(out.contains("▶ probe"), "tool block: {out}");
+            assert!(out.contains("probed"), "tool result: {out}");
+        });
+    }
+
+    /// ADR-0009 D5: the one-shot never leaves a session log behind, even though
+    /// the same SDK path persists by default.
+    #[test]
+    fn one_shot_never_persists_a_session() {
+        with_scratch_home("cli-oneshot-nopersist", |home, cwd| {
+            let provider = FakeProvider::new(vec![vec![
+                slimcode_ai::Delta::Text("hi".to_string()),
+                slimcode_ai::Delta::Done(slimcode_ai::FinishReason::Stop),
+            ]]);
+            let buf = SharedBuf::default();
+            let code = run_once_with(
+                "hi",
+                cwd,
+                home,
+                test_config(),
+                &[],
+                Box::new(buf.clone()),
+                move |opts| {
+                    assert!(
+                        !opts.persist,
+                        "the one-shot must create a non-persisting session"
+                    );
+                    assert_eq!(
+                        opts.home.as_deref(),
+                        Some(home),
+                        "the one-shot must pin the resolved home"
+                    );
+                    create_agent_session(opts.with_provider(Box::new(provider)))
+                },
+            )
+            .unwrap();
+            assert_eq!(code, 0);
+            assert_eq!(count_jsonl(home), 0, "home: {}", home.display());
+        });
+    }
+
+    /// The CLI's leading-skill-trigger semantics (spec Decision 2): a
+    /// `/skill:name` trigger becomes the skill activation block before the
+    /// prompt reaches the SDK, so the provider sees the skill instructions.
+    #[test]
+    fn one_shot_skill_trigger_reaches_the_provider_as_a_skill_block() {
+        with_scratch_home("cli-oneshot-skill", |home, cwd| {
+            let provider = FakeProvider::new(vec![vec![
+                slimcode_ai::Delta::Text("ok".to_string()),
+                slimcode_ai::Delta::Done(slimcode_ai::FinishReason::Stop),
+            ]]);
+            let seen = provider.seen();
+            let skills = [test_skill()];
+            run_once_with(
+                "/skill:grill stress my plan",
+                cwd,
+                home,
+                test_config(),
+                &skills,
+                Box::new(SharedBuf::default()),
+                move |opts| create_agent_session(opts.with_provider(Box::new(provider))),
+            )
+            .unwrap();
+            let batches = seen.lock().unwrap().clone();
+            let prompt = batches
+                .iter()
+                .flatten()
+                .find(|text| text.contains("stress my plan"))
+                .expect("the normalized prompt reached the provider");
+            assert!(prompt.contains("<skill name=\"grill\""), "prompt: {prompt}");
+            assert!(
+                prompt.contains("Push back on the plan."),
+                "prompt: {prompt}"
+            );
+        });
+    }
+
+    #[test]
+    fn one_shot_skill_trigger_injects_the_skill_block() {
+        // A leading `/skill:name` trigger injects the skill active block.
+        let prompt = normalize_skill_trigger_prompt("/skill:grill stress my plan", &[test_skill()]);
+        assert!(prompt.contains("<skill name=\"grill\""), "prompt: {prompt}");
+        assert!(prompt.contains("stress my plan"), "prompt: {prompt}");
+        // A bare `/{name}` trigger works the same way.
+        let prompt = normalize_skill_trigger_prompt("/grill stress my plan", &[test_skill()]);
+        assert!(prompt.contains("<skill name=\"grill\""), "prompt: {prompt}");
+        // An unknown skill falls back to the `/{name}` text form.
+        assert_eq!(
+            normalize_skill_trigger_prompt("/skill:nope hi", &[test_skill()]),
+            "/nope hi"
+        );
+        // A plain prompt passes through unchanged.
+        assert_eq!(
+            normalize_skill_trigger_prompt("hello", &[test_skill()]),
+            "hello"
+        );
+    }
+
+    /// A session-creation failure stays an `Err`, so `main` exits 1.
+    #[test]
+    fn one_shot_session_creation_failure_is_an_error() {
+        with_scratch_home("cli-oneshot-create-err", |home, cwd| {
+            let err = run_once_with(
+                "hi",
+                cwd,
+                home,
+                test_config(),
+                &[],
+                Box::new(Vec::new()),
+                |_| Err("missing API key".to_string()),
+            )
+            .unwrap_err();
+            assert!(err.contains("missing API key"), "err: {err}");
+        });
+    }
+
+    /// A turn failure propagates as an `Err`, so `main` exits 1.
+    #[test]
+    fn one_shot_turn_failure_is_an_error() {
+        with_scratch_home("cli-oneshot-turn-err", |home, cwd| {
+            let provider = FakeProvider::failing("boom");
+            let err = run_once_with(
+                "hi",
+                cwd,
+                home,
+                test_config(),
+                &[],
+                Box::new(Vec::new()),
+                move |opts| create_agent_session(opts.with_provider(Box::new(provider))),
+            )
+            .unwrap_err();
+            assert!(err.contains("boom"), "err: {err}");
+        });
     }
 }
