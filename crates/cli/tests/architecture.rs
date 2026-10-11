@@ -96,8 +96,11 @@ fn tui_depends_on_no_other_crate() {
     assert_deps("tui", &[]);
 }
 
+/// `cli_depends_on_every_crate_except_sdk`: the CLI takes every other crate
+/// (it is the only binary), but deliberately not the SDK — the CLI thin-shell
+/// refactor that makes it a SDK consumer is follow-up work (ADR-0021 D1).
 #[test]
-fn cli_depends_on_every_other_crate() {
+fn cli_depends_on_every_crate_except_sdk() {
     assert_deps(
         "cli",
         &[
@@ -108,6 +111,11 @@ fn cli_depends_on_every_other_crate() {
             "slimcode-tui",
         ],
     );
+}
+
+#[test]
+fn sdk_depends_on_app_only() {
+    assert_deps("sdk", &["slimcode-app"]);
 }
 
 /// The three application-layer names the TUI must not know (ADR-0011 D3 /

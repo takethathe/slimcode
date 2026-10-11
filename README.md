@@ -16,7 +16,7 @@
 
 ## 架构
 
-cargo workspace，六个 crate，唯一二进制 `slimcode`；依赖单向、由测试断言
+cargo workspace，七个 crate，唯一二进制 `slimcode`；依赖单向、由测试断言
 （`crates/cli/tests/architecture.rs`，见 ADR-0011）：
 
 | crate | 包名 | 职责 |
@@ -27,6 +27,7 @@ cargo workspace，六个 crate，唯一二进制 `slimcode`；依赖单向、由
 | `crates/app` | `slimcode-app` | 前端无关应用层：`DisplayItem`/`map_event`/`Renderer`/`run_turn`、上下文组装、会话与输入历史持久化、skills、七工具（→ ai, core, commands） |
 | `crates/tui` | `slimcode-tui` | 终端图形库：`App` reducer + 帧循环 + `RenderItem`/`UiHandler` seam（无 slimcode 依赖） |
 | `crates/cli` | `slimcode` | 唯一二进制 = 总入口：argv / 模式选择（one-shot 文本 vs 交互 TUI）/ 配置 / 服务构建 / 命令语义 / 会话落盘 / 两个显示适配器 |
+| `crates/sdk` | `slimcode-sdk` | 可嵌入 SDK：`create_agent_session` → `AgentSession`（prompt / abort / dispose / subscribe / messages / session_id / title / usage）+ `SdkEvent`（Display / Message / TurnFinished / Compacted）；会话复用现有 JSONL 日志（→ app） |
 
 ## 安装
 

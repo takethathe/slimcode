@@ -313,3 +313,44 @@ _Avoid_: config directory, rc file
 **API key / credential**:
 A secret (e.g. `DASHSCOPE_API_KEY` / `[ai] api_key`) with source precedence `--api-key` > env > `config.toml`, distinct from non-secret Config. When stored in `config.toml` it is plaintext on disk, so slimcode suggests `chmod 600` on loose permissions and `slimcode config` tightens to 0600 after writing a key.
 _Avoid_: config value, setting
+
+**SDK**:
+The `slimcode-sdk` crate — a programmatic, session-centric API that embeds slimcode in another
+Rust process (pi's `pi-coding-agent` SDK is the model). It wraps the app layer (`run_turn_with_hooks`,
+`ContextBuilder`, `SessionStore`, skills, context files, config, the seven tools) behind a
+`create_agent_session` factory and an `AgentSession` object, without the terminal binary. It does
+not interpret `/` commands (a frontend concern) and stays synchronous (no async runtime). A future
+`FFI 模块` (cdylib + C ABI) and a CLI-thin-shell refactor are follow-up work (ADR-0021).
+_Avoid_: library, embedding API
+
+**AgentSession**:
+The SDK's conversation object returned by `create_agent_session`: `prompt` (one synchronous,
+single-flight agent turn returning `StopReason`; a concurrent `prompt` fails with "a turn is
+already running"), `subscribe` (event listener + `Unsubscribe`), `abort` (cross-thread cancel via
+the shared `CancelToken`, never waiting on the session lock), `dispose` (rejects later prompts with
+"session is disposed", cancels an in-flight turn, and clears every listener), and read-only
+accessors (`messages` / `session_id` / `title` / `usage`). It reuses the same `Session` data
+structure the CLI/TUI use; `persist: false` keeps it purely in memory. Distinct from `Session` (the
+CLI/TUI's conversation unit) — an `AgentSession` is the programmatic equivalent on the SDK side.
+_Avoid_: session object, session handle
+
+**SdkEvent**:
+The SDK's event payload a subscriber receives from `AgentSession::subscribe`: `Display(DisplayItem)`
+(streamed display units, reusing the app-layer enum), `Message { message, usage }` (one event per
+message as it enters history — the user prompt and tool results carry `usage: None`, assistant
+replies carry the request's usage), `TurnFinished { stop_reason }` (the authoritative end of one `prompt`, roughly
+pi's `agent_settled`), and `Compacted { before, after }` (an auto-compaction just replaced an old
+history span). Delivered synchronously on the turn's calling thread, in subscription order.
+_Avoid_: event, session event
+
+**事件订阅 (event subscription)**:
+The SDK's listener mechanism: `AgentSession::subscribe(listener) -> Unsubscribe`; the returned
+`Unsubscribe` stops delivery. Distinct from the core `AgentEvent` stream (the runtime's raw events
+`run_turn` maps to `DisplayItem`).
+_Avoid_: callback, event stream
+
+**FFI 模块**:
+The follow-up cdylib crate (`slimcode-ffi`) exposing the SDK over a plain C ABI (opaque handle,
+create/prompt/subscribe/abort/dispose + last-error) so Node (koffi/node-ffi) and Python
+(ctypes/cffi) can drive slimcode via FFI; not implemented in the SDK's first slice (ADR-0021).
+_Avoid_: bindings, addon, extension module

@@ -1403,6 +1403,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "slimcode-sdk"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "slimcode-app",
+]
+
+[[package]]
 name = "slimcode-tui"
 version = "0.1.0"
 dependencies = [

@@ -27,7 +27,7 @@ cargo clippy --all-targets --all-features --message-format=json -- -D warnings
 
 ### crate 分层（ADR-0011–0014）
 
-cargo workspace，六个 crate，唯一二进制 `slimcode`：
+cargo workspace，七个 crate，唯一二进制 `slimcode`：
 
 | crate | 包名 | 职责（对外界面） | 依赖 |
 | --- | --- | --- | --- |
@@ -37,10 +37,11 @@ cargo workspace，六个 crate，唯一二进制 `slimcode`：
 | `crates/commands` | `slimcode-commands` | `/` 命令注册表 + fuzzy 预测（纯数据 + 纯函数，无 I/O） | 无 |
 | `crates/tui` | `slimcode-tui` | 终端图形库：`RenderItem` / `Effect` / `App`(new/apply/draw/handle_key) / `run(terminal, app, handler)` / `UiHandler` / 组件（theme/markdown/toolcall/footer/text/git） | **无 slimcode 依赖** |
 | `crates/cli` | `slimcode` | 唯一二进制 = 总入口：argv / 模式选择（one-shot 文本 vs 交互 TUI）/ 配置解析 / 服务构建 / 命令语义 / 会话落盘 / `TextRenderer` / `TuiAdapter` / 补全与文案 | → 全部 |
+| `crates/sdk` | `slimcode-sdk` | 可嵌入 SDK：`create_agent_session(AgentSessionOptions)` → `AgentSession`（`prompt` 同步单飞回合 / `subscribe`→Unsubscribe / `abort` 跨线程取消且不等会话锁 / `dispose` 拒绝后续 prompt、取消在途回合并清空监听器 / `messages` / `session_id` / `title` / `usage`）+ `SdkEvent`（Display / Message / TurnFinished / Compacted）；持久化单回合 prompt 复用共享 `run_turn_with_hooks`，会话落为现有 JSONL 日志（ADR-0021） | → app |
 
 重命名（ticket 01）：`crates/agent` → `crates/core`、`crates/common` → `crates/app`。关键依赖反转（ticket 02）：`Provider` trait 与 LLM `Message` 由 `ai` 拥有，`ai` 不再反向依赖运行时。
 
-依赖方向由测试断言（ticket 06，`crates/cli/tests/architecture.rs`）：`ai` 无 slimcode 依赖；`core` → 仅 `ai`；`app` → `ai`/`core`/`commands`；`tui` 无 slimcode 依赖；`cli` → 全部；`tui` 源码不得出现 `SessionStore`/`SkillStore`/`Config`。
+依赖方向由测试断言（ticket 06，`crates/cli/tests/architecture.rs`）：`ai` 无 slimcode 依赖；`core` → 仅 `ai`；`app` → `ai`/`core`/`commands`；`tui` 无 slimcode 依赖；`cli` → 除 `sdk` 外全部（薄壳化是后续工作，ADR-0021）；`sdk` → 仅 `app`（ADR-0021）；`tui` 源码不得出现 `SessionStore`/`SkillStore`/`Config`。
 
 ### crates/ai Bailian provider 与 LLM seam
 

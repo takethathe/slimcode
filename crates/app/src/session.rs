@@ -47,6 +47,12 @@ const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 /// FNV-1a 64-bit prime.
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
+/// Process-wide counter for session ids: `slimcode-<unix>-<pid>-<n>` is
+/// unique per `n`, so a shared counter keeps ids unique across every session
+/// store in the process (the free function serves the persistent store and
+/// the future in-memory sessions alike).
+static NEXT_SESSION_ID: AtomicUsize = AtomicUsize::new(0);
+
 /// FNV-1a 64-bit hash (stable across releases, no external dep). Used only to
 /// disambiguate project directories: the basename already provides readability,
 /// the hash guards against same-named repos at different paths.
@@ -256,6 +262,21 @@ pub struct SessionSummary {
     pub messages: usize,
 }
 
+/// Generate a fresh session id: `slimcode-<unix>-<pid>-<n>`. The shared id
+/// scheme for both the persistent [`SessionStore`] and in-memory sessions
+/// (spec Implementation Decisions §3), so the two modes produce identical
+/// ids. The unix timestamp is clamped to 0 when the clock predates the epoch;
+/// the `n` component comes from a process-wide counter. No chrono dependency;
+/// the format is stable across releases.
+pub fn new_session_id() -> String {
+    let unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let n = NEXT_SESSION_ID.fetch_add(1, Ordering::SeqCst);
+    format!("slimcode-{unix}-{}-{n}", std::process::id())
+}
+
 /// A project-scoped, directory-backed session store
 /// (`<base>/<project-key>/<id>.jsonl`).
 pub struct SessionStore {
@@ -265,7 +286,6 @@ pub struct SessionStore {
     project_home: String,
     /// Whole-store byte quota; appends evict oldest sessions past this.
     max_bytes: u64,
-    next_id: AtomicUsize,
 }
 
 impl SessionStore {
@@ -289,7 +309,6 @@ impl SessionStore {
             project: project.into(),
             project_home,
             max_bytes: DEFAULT_MAX_BYTES,
-            next_id: AtomicUsize::new(0),
         }
     }
 
@@ -300,14 +319,11 @@ impl SessionStore {
         self
     }
 
-    /// Generate a fresh session id: `slimcode-<unix>-<pid>-<n>`.
+    /// Generate a fresh session id: `slimcode-<unix>-<pid>-<n>`. A thin
+    /// delegate to the shared [`new_session_id`], so ids are byte-identical
+    /// to the in-memory sessions' ids.
     pub fn new_id(&self) -> String {
-        let unix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let n = self.next_id.fetch_add(1, Ordering::SeqCst);
-        format!("slimcode-{unix}-{}-{n}", std::process::id())
+        new_session_id()
     }
 
     /// Build a fresh session with a new id and timestamp.
@@ -1080,6 +1096,14 @@ mod tests {
         let s = SessionStore::new(std::env::temp_dir(), "proj-test", std::env::temp_dir());
         let a = s.new_id();
         let b = s.new_id();
+        assert_ne!(a, b);
+        assert!(a.starts_with("slimcode-"));
+    }
+
+    #[test]
+    fn new_session_id_is_unique_and_prefixed() {
+        let a = new_session_id();
+        let b = new_session_id();
         assert_ne!(a, b);
         assert!(a.starts_with("slimcode-"));
     }

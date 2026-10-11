@@ -59,7 +59,8 @@ slimcode crate (ADR-0014).
 | `slimcode-app` | `ai`, `core`, `commands` |
 | `slimcode-commands` | — |
 | `slimcode-tui` | — |
-| `slimcode` (bin) | all of the above |
+| `slimcode-sdk` | `app` |
+| `slimcode` (bin) | `ai`, `core`, `app`, `commands`, `tui` (not `sdk` — the CLI thin-shell refactor is follow-up, ADR-0021 D1) |
 
 ticket 06 pins this with a test that reads each crate's `Cargo.toml`
 (`.scratch/arch-realignment/issues/06`).

@@ -37,5 +37,18 @@ pub mod setup;
 pub mod skills;
 pub mod tools;
 
+// The core/ai types the SDK (and other app consumers) name in their public
+// APIs, re-exported so a downstream crate can depend on `slimcode-app` alone
+// and still spell `slimcode_app::AgentMessage` / `slimcode_app::StopReason` / …
+// without a direct `slimcode-core` / `slimcode-ai` dependency (ADR-0011 D4,
+// ADR-0021 D1: sdk → app → ai/core/commands).
+pub use slimcode_ai::BailianProvider;
+pub use slimcode_core::agent::ToolSpec;
+pub use slimcode_core::agent::{
+    CancelToken, Delta, FinishReason, Provider, ProviderConfig, RunConfig, RunHooks, StopReason,
+    TokenUsage, Tool, ToolDecision,
+};
+pub use slimcode_core::session::{AgentMessage, Message, MessageStopReason, Role, Session};
+
 #[doc(hidden)]
 pub mod testutil;
