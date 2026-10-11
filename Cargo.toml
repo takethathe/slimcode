@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/ai", "crates/core", "crates/app", "crates/cli", "crates/commands", "crates/tui", "crates/sdk"]
+members = ["crates/ai", "crates/core", "crates/app", "crates/cli", "crates/commands", "crates/tui", "crates/sdk", "crates/ffi"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,3 +14,4 @@ slimcode-app = { path = "crates/app" }
 slimcode-commands = { path = "crates/commands" }
 slimcode-tui = { path = "crates/tui" }
 slimcode-sdk = { path = "crates/sdk" }
+slimcode-ffi = { path = "crates/ffi" }

@@ -322,8 +322,8 @@ Rust process (pi's `pi-coding-agent` SDK is the model). It wraps the app layer (
 not interpret `/` commands (a frontend concern) and stays synchronous (no async runtime).
 `AgentSessionOptions` pins the home (`with_home`) and resumes an existing conversation by id
 (`with_session_id`); `AgentSession::compact_now` forces a compaction outside a turn. The CLI runs
-as a thin shell over it (ADR-0022). A future `FFI 模块` (cdylib + C ABI) remains follow-up work
-(ADR-0021).
+as a thin shell over it (ADR-0022). The `FFI 模块` (cdylib + C ABI) is the SDK's non-Rust
+consumer face (ADR-0023).
 _Avoid_: library, embedding API
 
 **AgentSession**:
@@ -373,7 +373,36 @@ The SDK's listener mechanism: `AgentSession::subscribe(listener) -> Unsubscribe`
 _Avoid_: callback, event stream
 
 **FFI 模块**:
-The follow-up cdylib crate (`slimcode-ffi`) exposing the SDK over a plain C ABI (opaque handle,
-create/prompt/subscribe/abort/dispose + last-error) so Node (koffi/node-ffi) and Python
-(ctypes/cffi) can drive slimcode via FFI; not implemented in the SDK's first slice (ADR-0021).
+The `crates/ffi` crate (`slimcode-ffi`, `cdylib` + `rlib`) exposing the SDK over a plain C ABI
+with opaque handles: options arrive as one UTF-8 JSON object (unknown fields rejected), events
+leave as flat UTF-8 JSON strings, a failure is `NULL` / `-1` plus a thread-local
+`slimcode_last_error()`, every returned string is library-owned and released with
+`slimcode_free_string()`, and a panic is converted into an error code instead of unwinding
+across the ABI. Every fallible entry point clears the previous message on entry and sets this one
+on failure; `abi_version`, `abort`, `dispose`, `last_error` and `free_string` never touch it, so
+the pointer stays valid until the next call that updates it on the same thread. `include/slimcode.h`
+is the written-once contract (signatures, return codes,
+`timeout_ms` semantics, handle lifetime, ownership, threading, ABI version), and the crate
+depends on `slimcode-sdk` only. A host drives slimcode from Node ≥ 26 (built-in `node:ffi`) or
+Python (ctypes/cffi) — no subprocess, no terminal parsing. The FFI slice landed the whole ABI
+(all 13 symbols: `abi_version` / `create` / `prompt` / `next_event` / `compact_now` / `abort` /
+`dispose` / `session_id` / `title` / `usage_json` / `messages_json` / `last_error` /
+`free_string`), and its acceptance evidence is the zero-dependency Node demo under
+`crates/ffi/demo/` (ADR-0023). One handle = one session; `dispose` invalidates the pointer.
 _Avoid_: bindings, addon, extension module
+
+**FFI 事件队列 (FFI event queue)**:
+The per-handle unbounded event queue behind `slimcode_session_next_event`. At `create` the FFI
+subscribes one listener (dropping the returned SDK `Unsubscribe` keeps it subscribed), encodes
+every `SdkEvent` into the flat wire JSON and pushes it; a host takes events with the blocking
+`slimcode_session_next_event(handle, timeout_ms)` (`< 0` waits forever, `0` polls, `> 0` waits at
+most that long). Events are never dropped or merged while the session is live — the host drains
+the queue while a turn runs — and an event the FFI cannot encode (unreachable for the current wire
+types) is reported through the turn thread's `last_error` instead of being dropped silently. A
+timeout or an empty poll returns `NULL` with an EMPTY
+`last_error`; a NULL / unknown / already-disposed handle at call time returns `NULL` with
+`last_error` set — the two `NULL` kinds are told apart by `last_error` alone. A waiter already
+blocked when `dispose` closes the queue wakes with `NULL` and an empty `last_error` (the session
+ended, not a failure), and dispose drops the unconsumed events. The C side never calls back into
+the host language, so any language and thread model can pump it.
+_Avoid_: callback, channel, subscription

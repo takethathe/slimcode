@@ -70,7 +70,8 @@ pub struct WireFunctionDelta {
 }
 
 /// Token usage reported by the endpoint (streamed with `include_usage=true`).
-#[derive(Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
+// Serialized for the FFI wire contract (ADR-0023).
+#[derive(Deserialize, Serialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct TokenUsage {
     #[serde(default)]
     pub prompt_tokens: u64,
@@ -87,7 +88,8 @@ pub struct TokenUsage {
 
 /// Cache-hit breakdown inside `usage.prompt_tokens_details`. Both fields are
 /// optional on the wire; a missing field counts as 0.
-#[derive(Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
+// Serialized for the FFI wire contract (ADR-0023).
+#[derive(Deserialize, Serialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PromptTokensDetails {
     /// Prompt tokens served from the cache (cache hits).
     #[serde(default)]
@@ -1418,5 +1420,58 @@ mod tests {
         assert_eq!(before.saturating_add(&none).cached_tokens(), 4);
         assert_eq!(before.saturating_sub(&none).cached_tokens(), 4);
         assert_eq!(none.saturating_add(&before).cached_tokens(), 4);
+    }
+
+    // --- the FFI wire shape (ADR-0023) -------------------------------------
+
+    #[test]
+    fn usage_round_trips_through_the_ffi_wire_shape() {
+        // The FFI `usage` event carries exactly this object (the spec's ABI
+        // contract section); `Serialize` is additive for that contract
+        // (ADR-0023).
+        let wire = serde_json::json!({
+            "prompt_tokens": 12,
+            "completion_tokens": 3,
+            "total_tokens": 15,
+            "prompt_tokens_details": {
+                "cached_tokens": 4,
+                "cache_creation_input_tokens": 1,
+            },
+        });
+        let usage: TokenUsage = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(
+            (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens
+            ),
+            (12, 3, 15),
+            "the existing Deserialize side still reads the wire object"
+        );
+        assert_eq!(serde_json::to_value(usage).unwrap(), wire);
+    }
+
+    #[test]
+    fn absent_usage_details_serialize_as_null_not_zero() {
+        // The endpoint omitting the details must stay visible on the wire so
+        // hosts can tell "no cache accounting" from "zero cached tokens".
+        let value = serde_json::to_value(TokenUsage::default()).unwrap();
+        assert_eq!(value["prompt_tokens"], 0);
+        assert_eq!(value["prompt_tokens_details"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn prompt_tokens_details_serializes_to_the_ffi_wire_shape() {
+        let details = PromptTokensDetails {
+            cached_tokens: 4,
+            cache_creation_input_tokens: 1,
+        };
+        assert_eq!(
+            serde_json::to_value(details).unwrap(),
+            serde_json::json!({
+                "cached_tokens": 4,
+                "cache_creation_input_tokens": 1,
+            })
+        );
     }
 }

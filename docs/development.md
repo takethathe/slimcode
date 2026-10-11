@@ -27,7 +27,7 @@ cargo clippy --all-targets --all-features --message-format=json -- -D warnings
 
 ### crate 分层（ADR-0011–0014）
 
-cargo workspace，七个 crate，唯一二进制 `slimcode`：
+cargo workspace，八个 crate，唯一二进制 `slimcode`：
 
 | crate | 包名 | 职责（对外界面） | 依赖 |
 | --- | --- | --- | --- |
@@ -38,10 +38,11 @@ cargo workspace，七个 crate，唯一二进制 `slimcode`：
 | `crates/tui` | `slimcode-tui` | 终端图形库：`RenderItem` / `Effect` / `App`(new/apply/draw/handle_key) / `run(terminal, app, handler)` / `UiHandler` / 组件（theme/markdown/toolcall/footer/text/git） | **无 slimcode 依赖** |
 | `crates/cli` | `slimcode` | 唯一二进制 = 总入口，SDK 之上的薄壳（ADR-0022）：argv / 模式选择（one-shot 文本 vs 交互 TUI）/ 终端生命周期 / 配置解析（启动时冻结）/ `/` 命令语义 / 输入历史 / 会话 picker 列表 / 显示适配（`TextRenderer` / `TuiAdapter`）/ 会话对象管理（创建、切换、dispose `AgentSession`）/ 补全与文案 | → 全部（含 sdk） |
 | `crates/sdk` | `slimcode-sdk` | 可嵌入 SDK：`create_agent_session(AgentSessionOptions)` → `AgentSession`（`prompt` 同步单飞回合 / `compact_now` 回合外强制压缩 / `subscribe`→Unsubscribe / `abort` 跨线程取消且不等会话锁 / `dispose` 拒绝后续 prompt、取消在途回合并清空监听器 / `messages` / `session_id` / `title` / `usage`）+ `SdkEvent`（Display / Message / TurnFinished / Compacted，回合结束事件在会话状态回填后送达，监听器读到的是本回合结果）；选项可 pin home（`with_home`）、按 id 续会（`with_session_id`），默认七工具绑定会话自己的 `CancelToken`（可取消）；持久化单回合 prompt 复用共享 `run_turn_with_hooks`，会话落为现有 JSONL 日志；CLI 两端都消费它（ADR-0021 / ADR-0022） | → app |
+| `crates/ffi` | `slimcode-ffi` | FFI 模块（ADR-0023）：把 SDK 暴露为纯 C ABI 的 `cdylib` + `rlib`（不透明句柄；选项走一个 JSON 对象、事件走扁平 JSON 串；失败 = `NULL`/`-1` + thread-local `last_error`，panic 一律转错误码；返回串由 `free_string` 释放；契约载体是手写头文件 `include/slimcode.h`）。全套 13 个符号已落地（会话 / 事件 / 状态 / 生命周期 / 压缩），验收证据是 `crates/ffi/demo/` 的零依赖 Node demo；详见下文「crates/ffi 纯 C ABI」 | → sdk |
 
 重命名（ticket 01）：`crates/agent` → `crates/core`、`crates/common` → `crates/app`。关键依赖反转（ticket 02）：`Provider` trait 与 LLM `Message` 由 `ai` 拥有，`ai` 不再反向依赖运行时。
 
-依赖方向由测试断言（ticket 06，`crates/cli/tests/architecture.rs`）：`ai` 无 slimcode 依赖；`core` → 仅 `ai`；`app` → `ai`/`core`/`commands`；`tui` 无 slimcode 依赖；`cli` → 全部（含 `sdk`：薄壳化后 CLI 消费 SDK 的 `AgentSession`，ADR-0022）；`sdk` → 仅 `app`（ADR-0021）；`tui` 源码不得出现 `SessionStore`/`SkillStore`/`Config`。
+依赖方向由测试断言（ticket 06，`crates/cli/tests/architecture.rs`）：`ai` 无 slimcode 依赖；`core` → 仅 `ai`；`app` → `ai`/`core`/`commands`；`tui` 无 slimcode 依赖；`cli` → 全部（含 `sdk`：薄壳化后 CLI 消费 SDK 的 `AgentSession`，ADR-0022）；`sdk` → 仅 `app`（ADR-0021）；`ffi` → 仅 `sdk`（FFI 模块是 SDK 之上的薄 ABI 层）；`tui` 源码不得出现 `SessionStore`/`SkillStore`/`Config`。
 
 ### crates/ai Bailian provider 与 LLM seam
 
@@ -593,3 +594,157 @@ TUI（`slimcode-tui`，见上节），行式 REPL 已移除（见 ADR-0003）。
 
 core crate 的 `core` 模块 `pub use session::{Message, Role, ToolCall}`，CLI 统一从
 `slimcode_core::agent` 引用消息类型。
+
+### crates/ffi 纯 C ABI（`slimcode-ffi`）
+
+`crates/ffi` 是 `slimcode-sdk` 之上的薄 ABI 层（ADR-0023），给非 Rust 宿主（Node ≥ 26 的内建
+`node:ffi`、Python 的 ctypes/cffi、C）一个进程内入口，而不是起子进程解析终端输出。
+`crate-type = ["cdylib", "rlib"]`，依赖只有 `slimcode-sdk` + `serde`/`serde_json`（含
+`[dev-dependencies]`）；架构测试 `crates/cli/tests/architecture.rs::ffi_depends_on_sdk_only`
+把 `ffi → 仅 sdk` 这条边界钉死。`cdylib` 是宿主 `dlopen` 的发布产物
+（`libslimcode_ffi.{dylib,so,dll}`），`rlib` 是集成测试能 `use slimcode_ffi::…` 并直接
+`unsafe` 调用符号的前提（仅 cdylib 时连 `use` 都解析不了，E0433）。
+
+契约载体是手写头文件 `crates/ffi/include/slimcode.h`：符号与签名、返回码、字符串所有权、
+thread-local 错误、线程语义与 ABI 版本（当前 1；只有不兼容的签名 / 返回码 / 所有权变化才升版本，
+新增符号与可选 JSON 字段是加法）。`tests/abi_contract.rs::the_abi_is_exactly_the_spec_symbol_set`
+断言头文件声明的符号、测试里 `ABI_SYMBOLS` 记录的 ABI 清单（转抄自 spec 的符号表）与
+`src/**/*.rs` 里定义的 `slimcode_*` 符号三者相等，头文件不会与实现漂移。
+
+模块（`src/`）：`error.rs` thread-local `last_error`；`handle.rs` 进程级句柄注册表
+（`Arc<SessionHandle>`，指针作 key）与 per-handle 事件队列（`Mutex<VecDeque>` + `Condvar`）；
+`options.rs` 选项 JSON → `AgentSessionOptions`；`wire.rs` `SdkEvent` → 扁平 wire JSON 的穷尽映射；
+`abi/{session,events,lifecycle,state,compact}.rs` 五个文件按符号分组。
+
+#### 符号表（ABI version 1，共 13 个）
+
+| 符号 | 返回 | 语义与所有权 |
+| --- | --- | --- |
+| `slimcode_abi_version()` | `uint32_t` | 本库实现的 ABI 版本（当前 1）；无前置条件、永不失败 |
+| `slimcode_session_create(options_json)` | `void*` | 成功 = 不透明句柄（归调用者，直到 `dispose`）；失败 = `NULL` + `last_error` |
+| `slimcode_session_prompt(session, text)` | `int32_t` | 同步跑完一整轮：`0` Completed / `1` Cancelled（非错误）/ `-1` + `last_error`；按句柄单飞 |
+| `slimcode_session_next_event(session, timeout_ms)` | `char*` | 成功 = 一条事件 JSON（`free_string` 释放）；`timeout_ms < 0` 无限等待、`0` 轮询、`> 0` 至多等该毫秒数；超时 / 空轮询 / `dispose` 唤醒 = `NULL` 且 `last_error` 为空，句柄无效 = `NULL` + `last_error` |
+| `slimcode_session_compact_now(session)` | `char*` | 成功 = `{"before":N,"after":M}`（释放同上）并往队列推一条 `compacted`；失败 = `NULL` + `last_error`（历史不变）；与 `prompt` 单飞互斥 |
+| `slimcode_session_abort(session)` | `void` | 任意线程、任意时刻可调；只碰取消令牌、不等会话锁；无回合 / `NULL` / 未知句柄 = no-op；既不设也不清 `last_error` |
+| `slimcode_session_dispose(session)` | `void` | dispose SDK 会话、唤醒 `next_event` 等待者（`NULL`）、丢弃未取事件、句柄失效；`NULL` / 未知 / 二次 `dispose` = 静默 no-op（不碰 `last_error`） |
+| `slimcode_session_id(session)` | `char*` | 会话 id（`slimcode-<unix>-<pid>-<n>`）；`free_string` 释放；`NULL` / 失效句柄 = `NULL` + `last_error` |
+| `slimcode_session_title(session)` | `char*` | 推断出的标题；无标题 = 空串（从不是 `NULL`）；释放同上 |
+| `slimcode_session_usage_json(session)` | `char*` | 累计 token 用量的 JSON 对象（与 `usage` 事件载荷同形）；释放同上 |
+| `slimcode_session_messages_json(session)` | `char*` | 历史 `AgentMessage` 的 JSON 数组（会话日志形状）；释放同上 |
+| `slimcode_last_error()` | `const char*` | 本线程最近一次错误，或 `NULL`；库所有、**不可** `free_string`。规则只写一次：每个可失败入口进入时清空旧消息、失败时设置新消息，从不碰它的是 `slimcode_abi_version` / `slimcode_session_abort` / `slimcode_session_dispose` / `slimcode_last_error` / `slimcode_free_string`，所以指针在同线程下一次**会更新它的**调用前有效（要留就自己拷贝） |
+| `slimcode_free_string(s)` | `void` | 释放库返回的字符串；`NULL` = no-op；不得传 `last_error` 的指针、不得二次释放 |
+
+#### 选项 JSON（`slimcode_session_create`）
+
+一个 UTF-8 JSON 对象；未知字段报错（`deny_unknown_fields`，防 `api_key` 拼错被静默忽略）：
+
+```json
+{ "cwd": "/path", "persist": true, "session_id": "slimcode-…",
+  "base_url": "http://…", "model": "…", "api_key": "…",
+  "cache": false, "home": "/path/to/slimcode-home" }
+```
+
+- 省略的字段回落 SDK 的四层配置解析（显式选项 > 环境变量 > `config.toml` > 默认值）；
+- `persist` 缺省即 `true`，与 SDK/CLI 一致（ADR-0021 D3）：不写选项 = CLI 等价行为；
+  `persist: false` + 临时 `home` = 零文件会话；`session_id` 与 `persist: false` 同时给 = 创建失败
+  （没有 store 的续会是静默的谎言）；
+- `home` 钉住 slimcode home（会话日志根、skills、AGENTS.md 发现）；`cwd` 是工具与项目解析的基准；
+  `base_url` / `model` / `api_key` / `cache` 是 provider overrides；
+- FFI **不暴露** provider / tools / skills 注入：Rust trait 对象与工具闭包跨不了 C ABI，宿主唯一
+  可替换的外部依赖是 HTTP 端点（`base_url`）——测试与 demo 因此伪造端点而不是 provider，保证
+  被测产物 == 发布产物。
+
+#### 事件 JSON（`slimcode_session_next_event`）
+
+`create` 时为句柄订阅一个 SDK 监听器，把每个 `SdkEvent` 编码成一条扁平 JSON（`kind` 字段）推入
+该句柄的队列；宿主 `switch (event.kind)` 消费。映射在 `wire.rs` 里对 `SdkEvent` / `DisplayItem`
+穷尽 match（无 `_` 分支），所以 `DisplayItem` 新增变体时 FFI 编译失败，逼着 wire 契约与头文件
+一起更新；`DisplayItem` 本身不加 `Serialize`（serde 的 internally-tagged 表示装不下
+`Text(String)` 这类 newtype-in-primitive 变体）。
+
+```json
+{"kind":"turn","turn":1}
+{"kind":"reasoning","text":"…"}
+{"kind":"text","text":"…"}
+{"kind":"tool_start","tool_call_id":"…","name":"…","arguments":"{…}"}
+{"kind":"tool_result","tool_call_id":"…","name":"…","ok":true,"result":"…"}
+{"kind":"stop","reason":"completed"|"cancelled"}
+{"kind":"usage","usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0,
+                         "prompt_tokens_details":{"cached_tokens":0,"cache_creation_input_tokens":0}}}
+{"kind":"message","message":{"kind":"llm","…":"…"},"usage":null}
+{"kind":"turn_finished","stop_reason":"completed"|"cancelled"}
+{"kind":"compacted","before":0,"after":0}
+```
+
+- `message.message` 用会话日志的 `AgentMessage` 形状（`{"kind":"llm",…}` /
+  `{"kind":"compact_summary",…}`），因此队列、`messages_json` 与 JSONL 会话日志可以共用一个
+  解码器；用户 prompt 与工具结果的 `usage` 为 `null`，assistant 回复带本请求的 usage；
+- `usage.usage` 是 `TokenUsage` 的 serde 序列化：端点没报 `prompt_tokens_details` 时该字段是
+  `null`（**不**归一化零对象），读的时候要防御；
+- 一个纯文本回合的顺序：用户 `message` → `turn` → 流式 `reasoning`/`text` → assistant `message`
+  （带 usage）→ `usage` → `stop` → `turn_finished`（权威的回合结束，总在最后；回合末自动压缩的
+  `compacted` 可能跟在它之后）。在到达 provider 之前就失败的回合没有 `stop` 与 `turn_finished`，
+  失败由 `prompt` 返回码 + `last_error()` 表达；
+- `next_event` 的两种 `NULL` 不同：等待中被 `dispose` 唤醒 = 「会话结束了」，不是错误（`last_error`
+  为空）；**调用时**句柄就 `NULL` / 未知 / 已 dispose = 错误（`last_error` 非空）。两者同为
+  `NULL`，只能靠 `last_error` 区分。
+
+#### 错误、所有权与线程语义
+
+- 失败一律 `NULL`（指针返回）或 `-1`（`int32_t`）**加** thread-local `slimcode_last_error()`。
+  规则只写一次：每个可失败入口进入时清空旧消息、失败时设置新消息；从不碰它的是
+  `slimcode_abi_version` / `slimcode_session_abort` / `slimcode_session_dispose` /
+  `slimcode_last_error` / `slimcode_free_string`，所以 `last_error` 的指针库所有、
+  **不可** `free_string`，在同线程下一次**会更新它的**调用前有效（要留就自己拷贝），
+  跨线程互不可见（新线程从空开始）；
+- 库返回的每个字符串（`session_id` / `title` / `usage_json` / `messages_json` / `next_event` /
+  `compact_now`）都由库分配，宿主用 `slimcode_free_string` 释放恰好一次；`free_string(NULL)` 是 no-op。
+  每个返回串都是 UTF-8：内部 NUL 字节无法存在于 C 字符串，会被转义成两个字符 `\0`（反斜杠 + 零），
+  不截断、不丢载荷；
+- `next_event` 的两种 `NULL` 靠 `last_error` 区分：超时 / `timeout_ms: 0` 空轮询 / 已阻塞时
+  `dispose` 唤醒 → `NULL` 且 `last_error` 为空（「暂时没有」/「会话结束了」，不是失败）；
+  调用时句柄就 `NULL` / 未知 / 已 dispose → `NULL` 且 `last_error` 非空；
+- `Cancelled` 不是错误：`prompt` 返回 `1`、`last_error` 保持空；已流出的 partial 文本只作为 display
+  事件交付、不进历史（ADR-0019 D3 的取消边界，provider 丢弃残缺的 SSE 尾巴）；
+- 每个**可能失败**的 `extern "C"` 函数体跑在 `catch_unwind` 里：panic 转成错误码，绝不跨 ABI unwind（唯一例外是只加载常量的 `slimcode_abi_version`）；
+- 线程语义：`create` / 只读访问器 / `prompt` / `compact_now` / `dispose` 任意线程可调；`prompt` 与
+  `compact_now` 按句柄单飞（对方在跑时第二个调用立即失败，带 `"a turn is already running"`）；
+  `abort` 任意线程、任意时刻（含 `prompt` 阻塞在 provider / 工具里时）只碰取消令牌、不等会话锁；
+  `next_event` 故意阻塞调用线程——C 侧永不回调进宿主语言，所以宿主自己决定 pump 放在哪个线程；
+- 句柄：一个句柄一个会话（`create` 的选项里只有 `session_id` 续会，没有多会话管理）；`dispose`
+  唤醒阻塞的 `next_event`（`NULL`）、丢弃未取事件、使指针失效，之后该指针不得再用、二次 `dispose`
+  是 no-op；`abort(NULL)` / `dispose(NULL)` 是静默 no-op。默认七工具绑定会话自己的取消令牌，
+  所以 `abort` / `dispose` 也会杀掉在途 `bash` 子进程；
+- 队列无界：事件不丢不合并（当前 wire 类型不可能编码失败；万一失败，监听器把它记进回合线程的
+  `last_error`，而不是静默丢弃），宿主必须在回合进行时及时取走；ABI v1 不提供跨句柄多路复用，
+  一个会话一个 pump 线程（或 `next_event(handle, 0)` 轮询）。
+
+#### 验收证据：Node demo
+
+前提：Node ≥ 26（内建 `node:ffi`）、`cargo`、Linux / macOS。一条命令（任意 cwd 可跑，
+沿用 `CARGO_TARGET_DIR`）：
+
+```bash
+bash crates/ffi/demo/run.sh
+```
+
+它先 `cargo build -p slimcode-ffi`，按平台解析 `libslimcode_ffi.{dylib,so}`，然后依次跑两个
+零依赖 Node 脚本，任一失败即非零退出：
+
+- `node/smoke.mjs`（10 项检查）：ABI 版本、选项 JSON 创建、只读访问器、结构化错误路径、
+  dispose 幂等与字符串所有权；
+- `node/demo.mjs`（39 项检查，验收主体）：五段自断言——工具回合 + 实时事件流（worker 线程跑
+  `prompt`、主线程 pump 同一句柄）、跨线程 `abort`（`prompt` 返回 1、partial 文本不进历史）、
+  只读访问器与事件流逐条对照、持久化（`persist: false` 零文件、JSONL 落盘位置、`session_id`
+  续会回放并追加）、坏选项错误路径。
+
+全部通过时打印 `PASS: slimcode-ffi Node demo — 39 checks` 与
+`PASS: slimcode-ffi demo (2 script(s))`；任何一项失败打印 `FAIL <检查名> — <细节>` 并非零退出。
+`node:ffi` 在 stderr 打印一行 `ExperimentalWarning: FFI is an experimental feature…` 是正常的、
+**不是失败**；`--no-experimental-ffi`（或 `NODE_OPTIONS`）会禁用该模块，脚本会直接报错。
+更老的 Node 可用 koffi 等第三方绑定同一份 cdylib 与头文件——`demo/README.md` 记了这条替代路径，
+仓库**不提供**适配代码。demo 完全离线、不需要 API key：伪 Bailian SSE 端点绑在 `127.0.0.1:0`，
+会话 `home` / `cwd` 都在 `mkdtemp` 临时根下，不读不写真实的 `~/.slimcode`。
+`compact_now` 不在 Node demo 里（由 `crates/ffi/tests/compact_now.rs` 覆盖）；ABI 的各条行为路径
+（文本回合 / 工具回合 / 失败回合 / 单飞 / 取消 / 持久化 / 并发句柄）由 Rust 集成测试用一个
+stdlib-only 的 mock SSE 端点覆盖，`cargo test` 因此离线、无需 key。

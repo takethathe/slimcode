@@ -17,7 +17,7 @@ slimcode 的 coding-agent 能力（prompt 一轮 agent 循环、流式事件、�
 
 会话两种持久化模式：默认复用现有 `SessionStore`（项目分区 JSONL 日志，与 TUI `/session` picker 完全兼容），`persist: false` 时纯内存、不写任何文件。配置与资源组装对齐 CLI 启动路径：显式选项（`cwd` / `base_url` / `model` / `api_key` / `provider` / `tools` / `skills`…）优先，缺省回落现有四层配置解析与默认七工具、AGENTS.md 上下文文件、skills 发现、环境信息。SDK 不解释 `/` 命令（那是前端语义），prompt 按纯文本处理。
 
-后续工作（本次不实现，另行文档化）：`slimcode-ffi` cdylib 模块（纯 C ABI，不透明句柄，供 Node/Python 薄绑定）；CLI 重构为 SDK 的消费者（pi 的薄壳模式）。
+后续工作（FFI 部分已实现，spec 见 `.scratch/ffi/spec.md`）：`slimcode-ffi` cdylib 模块（纯 C ABI，不透明句柄，供 Node/Python 薄绑定）；CLI 重构为 SDK 的消费者（pi 的薄壳模式）。
 
 ## User Stories
 

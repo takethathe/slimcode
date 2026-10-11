@@ -25,6 +25,7 @@
 
 use crate::session::convert;
 pub use crate::session::{AgentMessage, Message, Role, ToolCall};
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -87,7 +88,10 @@ fn assemble(deltas: &[Delta]) -> (String, Vec<ToolCall>, FinishReason) {
 }
 
 /// How a run ended.
-#[derive(Clone, Debug, PartialEq, Eq)]
+// Serialized for the FFI wire contract (ADR-0023): the `stop` and
+// `turn_finished` event payloads carry "completed" / "cancelled".
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StopReason {
     /// The model produced a final answer with no tool calls.
     Completed,
@@ -2313,5 +2317,22 @@ mod tests {
             .map(|m| m.tool_call_id().unwrap())
             .collect();
         assert_eq!(history, vec!["call_0", "call_1"]);
+    }
+
+    // --- the FFI wire shape (ADR-0023) -------------------------------------
+
+    #[test]
+    fn stop_reason_serializes_to_the_ffi_wire_shape() {
+        // The FFI `stop` / `turn_finished` events carry exactly these strings
+        // (the spec's ABI contract section); `Serialize` + snake_case is
+        // additive for that contract (ADR-0023).
+        assert_eq!(
+            serde_json::to_value(StopReason::Completed).unwrap(),
+            serde_json::json!("completed")
+        );
+        assert_eq!(
+            serde_json::to_value(StopReason::Cancelled).unwrap(),
+            serde_json::json!("cancelled")
+        );
     }
 }

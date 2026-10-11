@@ -120,6 +120,15 @@ fn sdk_depends_on_app_only() {
     assert_deps("sdk", &["slimcode-app"]);
 }
 
+/// `ffi_depends_on_sdk_only`: the FFI module is a plain C ABI over the SDK and
+/// nothing more (ADR-0023 D1 / the ffi spec D1), so it never reaches into
+/// app/ai/core/commands/cli/tui — not even from a dev-dependency (this reader
+/// covers every dependency table).
+#[test]
+fn ffi_depends_on_sdk_only() {
+    assert_deps("ffi", &["slimcode-sdk"]);
+}
+
 /// The three application-layer names the TUI must not know (ADR-0011 D3 /
 /// ticket 06): deliberately coarse. Application leakage beyond them stays a
 /// review concern; the dependency matrix above is the real boundary.

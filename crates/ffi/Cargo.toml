@@ -1,0 +1,17 @@
+[package]
+name = "slimcode-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Plain C ABI (cdylib + rlib) over slimcode-sdk, for non-Rust hosts"
+
+[lib]
+# `cdylib` is the shipped artifact; `rlib` is what the integration tests link
+# against (a cdylib alone makes `use slimcode_ffi::…` unresolvable, E0433).
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+slimcode-sdk.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
