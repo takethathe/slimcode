@@ -160,12 +160,16 @@ A message in a Session's message history, owned by `slimcode-core`: the user/ass
 _Avoid_: session message (ambiguous with a session-log record), stored message
 
 **Compaction**:
-Replacing an older span of a Session's message history with one CompactSummary so a long conversation keeps fitting the context window. Compaction triggers after a completed turn once the estimated history leaves at most 16k tokens of the assumed 200k window (`estimate >= window − 16_000`), or on demand (`/compact` in the TUI, `compact_now` on the SDK); it keeps the most recent 16k tokens (~8% of the window) and asks the provider for a structured summary (merging any previous summary). A failed compaction leaves the history untouched.
+Replacing an older span of a Session's message history with one CompactSummary so a long conversation keeps fitting the context window. Compaction triggers after a completed turn once the estimated history leaves at most 16k tokens of the assumed 200k window (`estimate >= window − 16_000`), or on demand (`/compact` in the TUI, `compact_now` on the SDK); it keeps the most recent 16k tokens (~8% of the window) as the Kept tail and asks the provider for a structured summary (merging any previous summary). A failed compaction leaves the history untouched.
 _Avoid_: summarization (the LLM step inside compaction), truncation, pruning
 
 **CompactSummary**:
-The session-only `AgentMessage` variant a compaction writes: the structured summary text, the estimated tokens before compaction, and the summary it supersedes (if any). It is persisted in the session log and restored on load, but never sent to the provider directly. Loading a session drops every record before the newest CompactSummary (the span it replaced); `ContextBuilder` then injects its text as a `user` message at that position.
+The session-only `AgentMessage` variant a compaction writes: the structured summary text, the estimated tokens before compaction, and the summary it supersedes (if any). It is persisted in the session log and restored on load, but never sent to the provider directly. Loading a session keeps the newest CompactSummary, its Kept tail, and everything appended after it — dropping the older span the summary replaced — so a resumed session matches the live one; `ContextBuilder` then injects its text as a `user` message at that position.
 _Avoid_: compaction entry (ambiguous with the boundary position), summary message
+
+**Kept tail**:
+The recent messages a compaction deliberately preserves alongside its CompactSummary, so the turn right after a compaction still has exact recent context. It precedes the checkpoint in the append-only log and is recorded by the checkpoint so it survives a resume.
+_Avoid_: recent window, kept messages (verbose), tail (bare — collides with a torn log tail)
 
 **Message history**:
 The conversation messages of a Session (`session.messages`), restorable through the Session picker. The system prompt is not part of it: it is assembled per request and never stored.

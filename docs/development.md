@@ -302,8 +302,14 @@ provider config seam 见 ADR-0016，hook seam 见 ADR-0015）。折入自 ticket
     用 pi 的 `SUMMARIZATION_SYSTEM_PROMPT` + `SUMMARIZATION_PROMPT`/`UPDATE_SUMMARIZATION_PROMPT`
     请求一次摘要（`with_cache(false)` + `max_tokens=2048`，有旧摘要时合并而非重写），
     返回 `[CompactSummary, ...kept]`；失败/取消/空摘要返回 `Err`，调用方保留原历史；
-  - 持久化：`CompactSummary` 作为普通 message 记录追加到 .jsonl；load 把**最新** checkpoint 之前
-    的消息记录丢弃，所以恢复的 Session 与模型看到的一致（ADR-0020 D2）；
+  - 保留边界：checkpoint 记录它保留了多少条紧邻其前的近期消息（Kept tail，`kept_count`），
+    `compact_messages` 产出 checkpoint 与保留尾部时一并写入；旧日志的 checkpoint 无此字段，
+    serde 取默认 `0`＝"丢弃之前一切"，向后兼容；
+  - 持久化：`CompactSummary` 作为普通 message 记录追加到 .jsonl（磁盘上是 `…kept, compact, …new`）；
+    load 定位**最新** checkpoint，向前收集 `kept_count` 条非-checkpoint 记录（跳过更旧的
+    已取代 checkpoint），重建为 `[checkpoint] ++ Kept tail ++ [其后记录]`，使恢复的 Session 与实时
+    一致、Kept tail 跨 resume 存活（ADR-0025，修订 ADR-0020 D2）；tool-batch 悬空修复在裁剪之后
+    只对存活历史进行，被丢弃的旧区段不计入 `repaired_tool_calls`；
 - `context_files`：`AGENTS.md` 上下文文件的发现与渲染（对齐 pi 的项目上下文加载）：
   先读全局 `<home>/AGENTS.md`（scope `global`）；project 只判定两个位置——cwd 自身
   与 **git 仓库根**（最近的含 `.git` 条目的祖先目录，`.git` 可以是目录或

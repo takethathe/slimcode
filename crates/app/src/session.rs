@@ -513,10 +513,14 @@ impl SessionStore {
         }
 
         let mut skipped_records = 0usize;
-        let mut repaired_tool_calls = 0usize;
         let mut title: Option<String> = None;
         let mut messages: Vec<AgentMessage> = Vec::new();
-        let mut batch: Option<OpenBatch> = None;
+        // The ids the currently-open tool batch requested, kept only to drop
+        // orphan results during replay. Dangling batches are NOT repaired here:
+        // that runs after the compaction boundary trim, so a record the trim
+        // drops never gets a spurious `Error: interrupted` result and never
+        // inflates the repair count (ADR-0025).
+        let mut open_ids: Option<Vec<String>> = None;
 
         for line in record_lines {
             let record = match parse_record(line) {
@@ -535,55 +539,120 @@ impl SessionStore {
                         continue;
                     }
                     if message.role() == &Role::Assistant && !message.tool_calls().is_empty() {
-                        // A new tool batch starts; any previous dangling batch
-                        // closes first (later results cannot repair it). The
-                        // requested ids stay in tool_calls order (a Vec) so a
-                        // dangling batch is repaired deterministically
-                        // (ADR-0009 D3); the HashSet is only a membership test.
-                        close_batch(&mut batch, &mut messages, &mut repaired_tool_calls);
-                        let ids: Vec<String> = message
-                            .tool_calls()
-                            .iter()
-                            .map(|tc| tc.id.clone())
-                            .collect();
-                        let matched: HashSet<String> = HashSet::new();
-                        batch = Some(OpenBatch { ids, matched });
+                        // A new tool batch replaces any dangling one: results
+                        // arriving after the boundary cannot belong to the
+                        // abandoned batch.
+                        open_ids = Some(
+                            message
+                                .tool_calls()
+                                .iter()
+                                .map(|tc| tc.id.clone())
+                                .collect(),
+                        );
                         messages.push(message);
                     } else if message.role() == &Role::Tool {
                         // A result belongs to the open batch only when its id
                         // was actually requested; anything else is an orphan
                         // and is dropped (ADR-0009 D3).
-                        let belongs = batch.as_ref().is_some_and(|b| {
+                        let belongs = open_ids.as_ref().is_some_and(|ids| {
                             message
                                 .tool_call_id()
-                                .is_some_and(|id| b.ids.iter().any(|x| x == id))
+                                .is_some_and(|id| ids.iter().any(|x| x == id))
                         });
                         if belongs {
-                            let id = message.tool_call_id().unwrap().to_string();
-                            batch.as_mut().unwrap().matched.insert(id);
                             messages.push(message);
                         }
                     } else {
                         // Any other message (user text, or an assistant message
-                        // without tool calls) closes a dangling batch, then
-                        // passes through.
-                        close_batch(&mut batch, &mut messages, &mut repaired_tool_calls);
+                        // without tool calls) ends the open batch, then passes
+                        // through.
+                        open_ids = None;
                         messages.push(message);
                     }
                 }
                 Record::Title(t) => title = Some(t),
             }
         }
-        close_batch(&mut batch, &mut messages, &mut repaired_tool_calls);
 
-        // A compaction checkpoint is a boundary (ADR-0020 D2): the records
-        // before the newest one were replaced by its summary. The append-only
-        // log keeps them, but the restored Session must not — it holds the
-        // effective history the next `ContextBuilder::build()` assembles, so
-        // a reloaded session never sends a compacted-away span to the model.
-        if let Some(index) = messages.iter().rposition(AgentMessage::is_compact_summary) {
-            messages.drain(..index);
+        // A compaction checkpoint is a boundary (ADR-0025): the records before
+        // the Kept tail it preserved were replaced by its summary. The
+        // append-only log keeps every record, but the restored Session must
+        // hold the effective history the next `ContextBuilder::build()`
+        // assembles — the checkpoint first, then exactly the `kept_count`
+        // messages compaction kept, then everything appended after it — so a
+        // resumed session matches the live one and never re-sends a
+        // compacted-away span. Kept messages are collected walking back from
+        // the checkpoint, skipping any older (superseded) checkpoints that sit
+        // physically between them and the newest one. A `kept_count` of zero
+        // (any checkpoint written before ADR-0025) degenerates to dropping
+        // every record before the boundary, the old behaviour.
+        if let Some(ci) = messages.iter().rposition(AgentMessage::is_compact_summary) {
+            let kept_count = match &messages[ci] {
+                AgentMessage::CompactSummary { kept_count, .. } => *kept_count,
+                _ => 0,
+            };
+            // `kept` can never exceed the records physically before the
+            // checkpoint (`ci`), so bound the pre-allocation by it: a corrupt
+            // log with an absurd `kept_count` then degrades to collecting what
+            // is there instead of panicking on a huge reservation.
+            let mut kept: Vec<AgentMessage> = Vec::with_capacity(kept_count.min(ci));
+            let mut i = ci;
+            while kept.len() < kept_count && i > 0 {
+                i -= 1;
+                if !messages[i].is_compact_summary() {
+                    kept.push(messages[i].clone());
+                }
+            }
+            kept.reverse();
+            let checkpoint = messages[ci].clone();
+            let after = messages[ci + 1..].to_vec();
+            let mut rebuilt = Vec::with_capacity(1 + kept.len() + after.len());
+            rebuilt.push(checkpoint);
+            rebuilt.extend(kept);
+            rebuilt.extend(after);
+            messages = rebuilt;
         }
+
+        // Repair dangling tool batches over the surviving history only
+        // (ADR-0009 D3): every requested call whose result was lost is patched
+        // in memory with an `Error: interrupted` result, in history order after
+        // the results that did arrive and in tool_calls order (deterministic).
+        // Because this runs after the boundary trim, records the trim dropped
+        // are never repaired, so `repaired_tool_calls` counts only real
+        // repairs (ADR-0025). A repaired batch always has its assistant and
+        // arrived results adjacent — the Kept tail never starts on a tool
+        // result (compact_messages advances the boundary past them), so no
+        // batch spans the trim.
+        let mut repaired_tool_calls = 0usize;
+        let mut batch: Option<OpenBatch> = None;
+        let mut repaired: Vec<AgentMessage> = Vec::with_capacity(messages.len());
+        for message in messages {
+            if message.role() == &Role::Assistant && !message.tool_calls().is_empty() {
+                close_batch(&mut batch, &mut repaired, &mut repaired_tool_calls);
+                let ids: Vec<String> = message
+                    .tool_calls()
+                    .iter()
+                    .map(|tc| tc.id.clone())
+                    .collect();
+                let matched: HashSet<String> = HashSet::new();
+                batch = Some(OpenBatch { ids, matched });
+                repaired.push(message);
+            } else if message.role() == &Role::Tool {
+                // Orphans were dropped during replay, so a surviving result
+                // always belongs to the open batch.
+                if let Some(b) = batch.as_mut()
+                    && let Some(id) = message.tool_call_id()
+                {
+                    b.matched.insert(id.to_string());
+                }
+                repaired.push(message);
+            } else {
+                close_batch(&mut batch, &mut repaired, &mut repaired_tool_calls);
+                repaired.push(message);
+            }
+        }
+        close_batch(&mut batch, &mut repaired, &mut repaired_tool_calls);
+        let messages = repaired;
 
         Ok(LoadOutcome {
             session: Session {
@@ -1365,6 +1434,213 @@ mod tests {
         assert_eq!(messages.len(), 2, "{messages:?}");
         assert_eq!(messages[0], last);
         assert_eq!(messages[1].text_content(), "kept after second");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_reconstructs_a_kept_tail_that_spans_an_older_checkpoint() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let path = store.session_path("slimcode-1").unwrap();
+        // Two compactions. The newest checkpoint kept three messages, but on
+        // disk a superseded checkpoint sits physically between them, so walking
+        // back for the Kept tail must skip it (ADR-0025). The superseded span
+        // before the older checkpoint still drops out.
+        let superseded = AgentMessage::text(Role::User, "deepest old");
+        let first_cp = AgentMessage::compact_summary("first summary", 1, None);
+        let k1 = AgentMessage::text(Role::Assistant, "kept before old cp");
+        let k2 = AgentMessage::text(Role::Assistant, "kept just before new cp");
+        let last_cp = AgentMessage::compact_summary_with_kept("latest summary", 2, None, 3);
+        let newer = AgentMessage::text(Role::Assistant, "appended after");
+        write_raw(
+            &path,
+            &[
+                &raw_header("slimcode-1", "2026-08-29T00:00:00Z"),
+                &msg_line(&superseded),
+                &msg_line(&first_cp),
+                &msg_line(&k1),
+                &msg_line(&k2),
+                &msg_line(&last_cp),
+                &msg_line(&newer),
+            ],
+        );
+        let messages = store.load("slimcode-1").unwrap().session.messages;
+        // Newest checkpoint leads, then its three kept messages (walking back
+        // past `first_cp`, which is skipped), then everything appended after.
+        assert_eq!(messages, vec![last_cp, superseded, k1, k2, newer]);
+        // Only the newest checkpoint survives; the superseded one is gone.
+        assert_eq!(
+            messages.iter().filter(|m| m.is_compact_summary()).count(),
+            1
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_truncates_a_keep_count_larger_than_the_available_records() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let path = store.session_path("slimcode-1").unwrap();
+        // A (corrupt or over-eager) checkpoint claims it kept five messages,
+        // but only two non-checkpoint records precede it. The walk-back stops
+        // at the head of the log: it collects what is there, never panics, and
+        // still keeps everything appended after (ADR-0025).
+        let k1 = AgentMessage::text(Role::Assistant, "only kept 1");
+        let k2 = AgentMessage::text(Role::Assistant, "only kept 2");
+        let checkpoint = AgentMessage::compact_summary_with_kept("## Goal\nover-claim", 9, None, 5);
+        let after = AgentMessage::text(Role::Assistant, "after");
+        write_raw(
+            &path,
+            &[
+                &raw_header("slimcode-1", "2026-08-29T00:00:00Z"),
+                &msg_line(&k1),
+                &msg_line(&k2),
+                &msg_line(&checkpoint),
+                &msg_line(&after),
+            ],
+        );
+        let outcome = store.load("slimcode-1").unwrap();
+        assert_eq!(outcome.session.messages, vec![checkpoint, k1, k2, after]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_reconstructs_the_kept_tail_recorded_on_the_checkpoint() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let path = store.session_path("slimcode-1").unwrap();
+        // A checkpoint that kept the two immediately-preceding messages
+        // (ADR-0025): on reload the Kept tail survives, the older span does
+        // not, and the checkpoint leads — exactly the live session's shape.
+        let checkpoint =
+            AgentMessage::compact_summary_with_kept("## Goal\nkeep the tail", 117_760, None, 2);
+        let u1 = AgentMessage::text(Role::User, "old prompt");
+        let a1 = AgentMessage::text(Role::Assistant, "old reply");
+        let u2 = AgentMessage::text(Role::User, "kept prompt");
+        let a2 = AgentMessage::text(Role::Assistant, "kept reply");
+        let after = AgentMessage::text(Role::Assistant, "post-checkpoint reply");
+        write_raw(
+            &path,
+            &[
+                &raw_header("slimcode-1", "2026-08-29T00:00:00Z"),
+                &msg_line(&u1),
+                &msg_line(&a1),
+                &msg_line(&u2),
+                &msg_line(&a2),
+                &msg_line(&checkpoint),
+                &msg_line(&after),
+            ],
+        );
+        let outcome = store.load("slimcode-1").unwrap();
+        // [checkpoint, kept tail (u2, a2), after] — the two oldest dropped.
+        assert_eq!(outcome.session.messages, vec![checkpoint, u2, a2, after]);
+        assert_eq!(outcome.skipped_records, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_drops_everything_before_a_legacy_checkpoint_without_a_keep_count() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let path = store.session_path("slimcode-1").unwrap();
+        // A pre-ADR-0025 checkpoint record has no `kept_count`; serde default
+        // reads it as 0, so reload keeps the old behaviour: drop everything
+        // before the boundary.
+        let legacy_checkpoint = r#"{"type":"message","message":{"kind":"compact_summary","summary":"old","tokens_before":5}}"#;
+        write_raw(
+            &path,
+            &[
+                &raw_header("slimcode-1", "2026-08-29T00:00:00Z"),
+                &msg_line(&AgentMessage::text(Role::User, "hi")),
+                &msg_line(&AgentMessage::text(Role::Assistant, "hello")),
+                legacy_checkpoint,
+                &msg_line(&AgentMessage::text(Role::User, "later")),
+            ],
+        );
+        let outcome = store.load("slimcode-1").unwrap();
+        assert_eq!(outcome.skipped_records, 0);
+        assert_eq!(outcome.session.messages.len(), 2);
+        assert!(outcome.session.messages[0].is_compact_summary());
+        assert_eq!(outcome.session.messages[1].text_content(), "later");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_keeps_a_tool_batch_whose_assistant_starts_the_kept_tail() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let path = store.session_path("slimcode-1").unwrap();
+        // The Kept tail begins on an assistant that calls a tool and carries
+        // its result inside the window (compact_messages advances the boundary
+        // past tool results, so the pair is never split). On reload the
+        // `call_x` id still has its result, and nothing is repaired.
+        let mut call = Message::text(Role::Assistant, "running a tool");
+        call.tool_calls = vec![ToolCall {
+            id: "call_x".to_string(),
+            name: "t".to_string(),
+            arguments: "{}".to_string(),
+        }];
+        let asst_call = AgentMessage::Llm(call);
+        let tool_x = AgentMessage::tool_result("call_x", "x ok");
+        let checkpoint =
+            AgentMessage::compact_summary_with_kept("## Goal\ntail on a tool batch", 9, None, 2);
+        let after = AgentMessage::text(Role::Assistant, "after");
+        write_raw(
+            &path,
+            &[
+                &raw_header("slimcode-1", "2026-08-29T00:00:00Z"),
+                &msg_line(&AgentMessage::text(Role::User, "old prompt")),
+                &msg_line(&AgentMessage::text(Role::Assistant, "old reply")),
+                &msg_line(&asst_call),
+                &msg_line(&tool_x),
+                &msg_line(&checkpoint),
+                &msg_line(&after),
+            ],
+        );
+        let outcome = store.load("slimcode-1").unwrap();
+        // [checkpoint, asst_call, tool_x, after] — the Kept tail (the pair) lives.
+        assert_eq!(
+            outcome.session.messages,
+            vec![checkpoint, asst_call, tool_x, after]
+        );
+        assert_eq!(outcome.repaired_tool_calls, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_does_not_count_repairs_for_a_dropped_dangling_batch() {
+        let dir = temp_dir();
+        let store = store(&dir);
+        let path = store.session_path("slimcode-1").unwrap();
+        // A dangling tool batch sits in the span the checkpoint replaces. The
+        // boundary trims it before the repair pass runs, so its missing result
+        // is never patched in and never counted (ADR-0025) — the repair count
+        // reflects only the surviving history.
+        let mut call = Message::text(Role::Assistant, "interrupted tool call");
+        call.tool_calls = vec![ToolCall {
+            id: "call_gone".to_string(),
+            name: "t".to_string(),
+            arguments: "{}".to_string(),
+        }];
+        let dangling = AgentMessage::Llm(call);
+        let checkpoint =
+            AgentMessage::compact_summary_with_kept("## Goal\nnothing kept", 9, None, 0);
+        write_raw(
+            &path,
+            &[
+                &raw_header("slimcode-1", "2026-08-29T00:00:00Z"),
+                &msg_line(&AgentMessage::text(Role::User, "old prompt")),
+                &msg_line(&dangling),
+                &msg_line(&checkpoint),
+                &msg_line(&AgentMessage::text(Role::Assistant, "after")),
+            ],
+        );
+        let outcome = store.load("slimcode-1").unwrap();
+        // The dangling batch is dropped with the superseded span; nothing left
+        // to repair.
+        assert_eq!(outcome.repaired_tool_calls, 0);
+        assert_eq!(outcome.session.messages.len(), 2);
+        assert!(outcome.session.messages[0].is_compact_summary());
         let _ = fs::remove_dir_all(&dir);
     }
 

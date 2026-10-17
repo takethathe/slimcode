@@ -56,6 +56,15 @@ pub enum AgentMessage {
         /// incremental update rather than from scratch.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         previous_summary: Option<String>,
+        /// How many non-checkpoint messages immediately before this checkpoint
+        /// compaction kept — the Kept tail boundary (ADR-0025). `load` keeps
+        /// exactly this many records ahead of the checkpoint (walking back and
+        /// skipping any older superseded checkpoints) and drops the rest, so a
+        /// resumed session matches the live one. `#[serde(default)]`: a
+        /// checkpoint written before this field kept nothing beyond the
+        /// boundary, so an older log reloads unchanged.
+        #[serde(default)]
+        kept_count: usize,
     },
 }
 
@@ -75,16 +84,31 @@ impl AgentMessage {
         Self::Llm(Message::tool_result(id, content))
     }
 
-    /// A compaction checkpoint convenience constructor.
+    /// A compaction checkpoint convenience constructor. It records no Kept
+    /// tail (`kept_count = 0`), the shape an old checkpoint had: callers that
+    /// compact and keep a recent tail use [`Self::compact_summary_with_kept`].
     pub fn compact_summary(
         summary: impl Into<String>,
         tokens_before: usize,
         previous_summary: Option<String>,
     ) -> Self {
+        Self::compact_summary_with_kept(summary, tokens_before, previous_summary, 0)
+    }
+
+    /// A compaction checkpoint recording how many immediately-preceding
+    /// messages it kept (the Kept tail boundary the `load` path replays from,
+    /// ADR-0025).
+    pub fn compact_summary_with_kept(
+        summary: impl Into<String>,
+        tokens_before: usize,
+        previous_summary: Option<String>,
+        kept_count: usize,
+    ) -> Self {
         Self::CompactSummary {
             summary: summary.into(),
             tokens_before,
             previous_summary,
+            kept_count,
         }
     }
 
@@ -216,6 +240,30 @@ mod tests {
             let json = serde_json::to_string(&m).unwrap();
             let back: AgentMessage = serde_json::from_str(&json).unwrap();
             assert_eq!(back, m);
+        }
+    }
+
+    #[test]
+    fn compact_summary_serializes_and_restores_kept_count() {
+        let m = AgentMessage::compact_summary_with_kept("## Goal\nkeep", 1024, None, 3);
+        let v: serde_json::Value = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["kept_count"], 3, "{v}");
+        // Round-trips losslessly.
+        let json = serde_json::to_string(&m).unwrap();
+        let back: AgentMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, m);
+    }
+
+    #[test]
+    fn a_checkpoint_without_kept_count_loads_as_zero() {
+        // A pre-ADR-0025 checkpoint record has no `kept_count` field; serde
+        // default gives it 0, so it reloads with the old "drop everything
+        // before the boundary" behaviour.
+        let legacy = r#"{"kind":"compact_summary","summary":"old","tokens_before":5}"#;
+        let back: AgentMessage = serde_json::from_str(legacy).unwrap();
+        match back {
+            AgentMessage::CompactSummary { kept_count, .. } => assert_eq!(kept_count, 0),
+            other => panic!("expected a checkpoint, got {other:?}"),
         }
     }
 

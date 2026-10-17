@@ -164,19 +164,24 @@ pub fn compact_messages<P: Provider>(
         &to_summarize,
         previous_summary.as_deref(),
     )?;
-    // Keep the recent tail, dropping any superseded checkpoint from it.
-    let mut compacted = Vec::with_capacity(messages.len() - start + 1);
-    compacted.push(AgentMessage::compact_summary(
+    // Keep the recent tail, dropping any superseded checkpoint from it. The
+    // number of kept messages rides the checkpoint as the Kept tail boundary,
+    // so `load` reconstructs the same `[checkpoint, ...kept]` the live session
+    // holds after a resume (ADR-0025).
+    let kept: Vec<AgentMessage> = messages[start..]
+        .iter()
+        .filter(|m| !m.is_compact_summary())
+        .cloned()
+        .collect();
+    let kept_count = kept.len();
+    let mut compacted = Vec::with_capacity(kept_count + 1);
+    compacted.push(AgentMessage::compact_summary_with_kept(
         summary,
         tokens_before,
         previous_summary,
+        kept_count,
     ));
-    compacted.extend(
-        messages[start..]
-            .iter()
-            .filter(|m| !m.is_compact_summary())
-            .cloned(),
-    );
+    compacted.extend(kept);
     Ok(compacted)
 }
 
@@ -578,10 +583,13 @@ mod tests {
                 summary,
                 tokens_before: recorded,
                 previous_summary,
+                kept_count,
             } => {
                 assert_eq!(summary, "## Goal\nfinish");
                 assert_eq!(*recorded, tokens_before);
                 assert_eq!(previous_summary, &None);
+                // The checkpoint records exactly the kept tail it carries.
+                assert_eq!(*kept_count, compacted.len() - 1);
             }
             other => panic!("expected a checkpoint, got {other:?}"),
         }
@@ -750,6 +758,12 @@ mod tests {
             compact_messages(&mut provider, &test_config(), &CancelToken::new(), &history).unwrap();
         assert_eq!(compacted.len(), 1, "{compacted:?}");
         assert!(compacted[0].is_compact_summary());
+        // Zero kept tail: the checkpoint records `kept_count = 0`, and reload
+        // then drops everything before it (a legitimate "summarize all" case).
+        match &compacted[0] {
+            AgentMessage::CompactSummary { kept_count, .. } => assert_eq!(*kept_count, 0),
+            other => panic!("expected a checkpoint, got {other:?}"),
+        }
     }
 
     // --- serialization ----------------------------------------------------

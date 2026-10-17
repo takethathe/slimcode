@@ -1,5 +1,11 @@
 # Compaction replaces old history with a session-only summary
 
+> **Amended by ADR-0025**: D2's known cost — the recent-keep tail written before the checkpoint
+> being dropped on reload — is resolved. `CompactSummary` now carries a `kept_count` and `load`
+> reconstructs `[checkpoint] ++ Kept tail ++ [after]`, so the tail survives a resume and the repair
+> pass runs after the boundary trim. D1, D3, D4, D5, D6 stand; D2's in-place injection in
+> `ContextBuilder::build()` is unchanged.
+
 Long sessions eventually overflow a model's context window. pi solves this with *compaction*:
 walk back to a recent-keep boundary, summarize the older span with an LLM, append a
 `CompactionEntry` carrying a `firstKeptEntryId`, and rebuild every later request as `summary +
@@ -49,11 +55,14 @@ The conversation history before this point was compacted into the following summ
 A later checkpoint naturally supersedes an earlier one because only records from the newest one
 onward survive the load. Putting the drop on the load path (and leaving `build()` a
 position-preserving substitution) means the live session, the resumed session and the assembled
-request all agree, and the model never sees a compacted span. The known cost is that the
+request all agree, and the model never sees a compacted span. ~~The known cost is that the
 recent-keep tail written *before* the checkpoint in the append-only log is treated as part of the
-replaced span on reload: it survives the live session but not a resume. Rewriting the log at
+replaced span on reload: it survives the live session but not a resume.~~ That cost has since been
+resolved by ADR-0025: the checkpoint records a `kept_count` and `load` rebuilds
+`[checkpoint] ++ Kept tail ++ [after]`, so the tail survives a resume. Rewriting the log at
 compaction was rejected (ADR-0009), and re-deriving the tail from the keep heuristic on load would
-couple the reader to a policy that may change.
+couple the reader to a policy that may change — so the boundary is persisted as a count, not a
+message id (ADR-0009 D1) nor a recomputed heuristic.
 
 ### D3 — The frontend decides when; the app module decides what
 
@@ -86,7 +95,7 @@ empty summary returns `Err` and leaves the caller's history untouched; the front
 the next turn tries again with the full history.
 
 Keeping a tail is deliberate: it gives the turn right after a compaction exact recent context
-instead of only the summary. (It does not survive a reload — see D2.)
+instead of only the summary. (Since ADR-0025 the tail also survives a reload — see D2.)
 
 ### D5 — Out of scope for v1
 

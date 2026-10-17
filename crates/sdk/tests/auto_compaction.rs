@@ -195,13 +195,13 @@ fn completed_turn_crossing_the_threshold_compacts_and_replays_the_checkpoint() {
     };
     assert!(summary.contains("finish the sdk"), "{summary}");
 
-    // The log replays with the checkpoint as the head and none of the span it
-    // replaced: the load drops records before the newest checkpoint
-    // (ADR-0020 D2 — the kept tail written before the checkpoint does not
-    // survive a reload, by design).
+    // The log replays to the live session's effective history exactly: the
+    // checkpoint head plus the Kept tail it recorded, and none of the span the
+    // summary replaced. A resume no longer drops the kept tail — the live and
+    // reloaded sessions agree (ADR-0025).
     let store = store_for(&home, &cwd);
     let outcome = store.load(session.session_id()).expect("load");
-    assert_eq!(outcome.session.messages, vec![checkpoint.clone()]);
+    assert_eq!(outcome.session.messages, live);
 }
 
 #[test]
