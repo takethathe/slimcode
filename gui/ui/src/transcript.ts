@@ -52,6 +52,13 @@ export function newBlockSeq(): void {
   blockSeq = 0;
 }
 
+/** A standalone token-usage block, appended on demand for the `/usage`
+ *  command (mirrors the TUI's `show_usage`). Carries the session's cumulative
+ *  usage, read from the current snapshot. */
+export function usageNotice(usage: TokenUsage): Block {
+  return { id: nextId(), kind: "usage", usage };
+}
+
 function reduceBlock(state: Block[], event: GuiWireEvent): Block[] {
   const blocks = [...state];
   switch (event.kind) {

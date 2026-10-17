@@ -164,7 +164,9 @@ provider config seam 见 ADR-0016，hook seam 见 ADR-0015）。折入自 ticket
 前端无关的 `/` 命令定义与预测逻辑（纯数据 + 纯函数，无 I/O、无依赖）：
 
 - `Command`：规范名 `name`、别名 `aliases`、用法串 `usage`（含参数占位，如
-  `/!N`）、描述 `description`、匹配种类 `kind`；
+  `/!N`）、描述 `description`、匹配种类 `kind`、`gui_applicable`（该命令是否有对应的前端
+  动作，`false` 者如 `/history`、`/install-skill`、`/!!`、`/!` 不进 GUI 候选池，见 ADR-0026 D2；
+  builder `not_gui()` 置否）；
 - `CommandKind::Exact`（按规范名/别名精确或前缀匹配）与
   `CommandKind::Numbered`（如 `/!N`：`name` 后跟数字序列，匹配 `/!3`）；
 - `COMMANDS`：命令注册表的单一事实来源（`/help`、启动 banner、未知命令提示均由此生成）；
@@ -246,6 +248,14 @@ provider config seam 见 ADR-0016，hook seam 见 ADR-0015）。折入自 ticket
   与裸 `/name` 两种拼写，补全池统一用 `/skill:name`；`skill_for_read_path` /
   `skill_for_read_args` 解析 `read` 工具的路径/JSON 参数，命中 skill 自身 `SKILL.md` 时把这次
   读取当成 skill 激活（payload 文件如 references/scripts 不算）；
+- prompt preprocessing（ADR-0026，前端共用）：纯函数 `prepare_user_prompt(input, skills, history) ->
+  `PreparedPrompt`（`Prompt(String)` 普通文本 / 未识别前导 `/xxx` 归一化后原样送模型；`Skill
+  { name, model_text, display }` 命中 `/skill:name` 时 `model_text` 为展开的 `<skill>` XML 块送
+  模型、`display` 供前端展示、`already_loaded` 由 `context::skill_loaded_in(history, skill)` 从历史
+  算得），取代 CLI 原有的两份私有副本；候选池按作用域过滤：`complete_in(scope, input, skills)` +
+  `CompletionScope::{All, Gui}`（`Gui` 依 `Command::gui_applicable` 剔除非 GUI 命令），`complete`
+  委托 `All`；GUI 宿主（`gui/src-tauri`）内嵌 `SkillStore` 快照、暴露 `complete(input)` IPC，`prompt`
+  路径跑 `prepare_user_prompt`；
 - 显示层（cli `render.rs` / tui `app.rs`）：skill 激活统一显示为专用的 `[skill] <name>`
   块（pi `SkillInvocationMessageComponent` 样式，`customMessageBg` 背景），而非 read 工具块或
   普通用户输入。TUI 块默认**折叠**为一行 `[skill] <name> (Ctrl+O to expand)`（不显示 skill

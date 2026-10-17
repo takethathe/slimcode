@@ -23,12 +23,12 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use slimcode_ai::{ProviderConfig, TokenUsage};
-use slimcode_app::context::skill_loaded_in;
 use slimcode_app::history::{HISTORY_DISPLAY, HistoryStore, render_history, resolve_replay_index};
 use slimcode_app::render::usage_summary;
 use slimcode_app::session::{SessionStore, format_minute, unix_secs};
 use slimcode_app::skills::{
-    Skill, SkillScope, SkillStore, find_skill, is_builtin_command, parse_install_args, skill_prompt,
+    PreparedPrompt, Skill, SkillScope, SkillStore, is_builtin_command, parse_install_args,
+    prepare_user_prompt,
 };
 use slimcode_sdk::{
     AgentSession, AgentSessionOptions, Provider, SdkEvent, Tool, create_agent_session,
@@ -492,25 +492,33 @@ impl<'a> TuiSession<'a> {
         if let Some(n) = parse_replay_index(name) {
             return self.replay(n, emit);
         }
-        // Skill trigger: `/skill-name` or the canonical `/skill:name`.
+        // Skill trigger: `/skill:name` or the canonical `/{name}`, expanded
+        // through the shared Prompt preprocessing seam (ADR-0026) so the
+        // one-shot, the GUI and the TUI inject a skill identically. The seam
+        // dedups against this session's messages; a leading `/`-form that names
+        // no installed skill falls through to the unknown-command notice below.
         let skills = self.skills_snapshot();
-        if let Some(skill) = find_skill(&skills, name) {
-            let already_loaded = skill_loaded_in(&self.session().messages(), skill);
+        let input = match arg {
+            Some(arg) => format!("{name} {arg}"),
+            None => name.to_string(),
+        };
+        if let PreparedPrompt::Skill {
+            name,
+            model_text,
+            display,
+        } = prepare_user_prompt(&input, &skills, &self.session().messages())
+        {
             // The skill active block is shown as its own display unit before
-            // the turn starts, like the replay path shows the boxed prompt.
-            // The display block carries the inner content (name/`location`
-            // split off), matching pi's `ParsedSkillBlock`; the TUI shows only
-            // the name until Ctrl+O expands it.
-            let text = skill_prompt(skill, arg, already_loaded);
-            let content = slimcode_app::skills::parse_skill_block(&text)
-                .map(|(_, inner)| inner.to_string())
-                .unwrap_or_default();
+            // the turn starts, like the replay path shows the boxed prompt. The
+            // seam's `display` carries the inner content (name/`location` split
+            // off), matching pi's `ParsedSkillBlock`; the TUI shows only the
+            // name until Ctrl+O expands it.
             emit(RenderItem::Skill {
-                name: skill.name.clone(),
-                content,
+                name,
+                content: display,
             });
             return ControlFlow::Submit(Prompt {
-                text,
+                text: model_text,
                 record: false,
             });
         }

@@ -1,5 +1,11 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
-import type { GuiSettings, GuiWireEvent, SessionInfo, SessionSnapshot } from "./types";
+import type {
+  CompletionItem,
+  GuiSettings,
+  GuiWireEvent,
+  SessionInfo,
+  SessionSnapshot,
+} from "./types";
 
 function errorMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -11,6 +17,9 @@ export const api = {
   deleteSession: (id: string): Promise<void> => invoke("delete_session", { id }),
   listSessions: (): Promise<SessionInfo[]> => invoke("list_sessions"),
   getSession: (): Promise<SessionSnapshot> => invoke("get_session"),
+  /** Ranked `/` completion candidates for the leading token (ADR-0026). */
+  complete: (input: string): Promise<CompletionItem[]> =>
+    invoke("complete", { input }),
   cancel: (): Promise<void> => invoke("cancel"),
   getSettings: (): Promise<GuiSettings> => invoke("get_settings"),
   setSettings: (settings: GuiSettings): Promise<void> =>

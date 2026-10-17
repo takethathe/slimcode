@@ -223,12 +223,27 @@ A Prompt entered across multiple lines in the TUI input box (Shift+Enter or Ctrl
 _Avoid_: block, paste
 
 **Completion popup**:
-The fuzzy candidate list shown above the TUI input box while a partial `/` command is typed (whatever the CLI's injected CompletionProvider offers: commands + installed skills, ranked best-first); it renders as bare SelectList rows (no box) directly above the input so the input box stays put when it opens/closes. `↑`/`↓` move the selection, `Tab` commits it to the buffer, `Enter` executes it, `Esc` cancels. Distinct from the post-submit "did you mean" notice.
+The fuzzy candidate list a Frontend shows while a partial `/` command is typed (commands + installed skills, ranked best-first from the shared `complete()` source); it sits directly above the input so the input box stays put when it opens/closes. `↑`/`↓` move the selection, `Tab` commits it to the buffer, `Esc` cancels; the TUI binds `Enter` to execute the selection, while the GUI 前端 binds `Enter` to the same commit-to-buffer as `Tab`. Distinct from the post-submit "did you mean" notice.
 _Avoid_: autocomplete box, suggestion popup, picker
 
 **Commit to buffer**:
-The action of accepting a Completion popup selection with `Tab`: the selected `/` spelling is written into the input buffer with a trailing space and the cursor placed after it, ready for an argument; the command is **not** submitted. `Enter` commits without the trailing space and submits immediately.
+The action of accepting a Completion popup selection: the selected `/` spelling is written into the input buffer with a trailing space and the cursor placed after it, ready for an argument; the command is **not** submitted. `Tab` always commits this way; the TUI's `Enter` commits without the trailing space and submits immediately, while the GUI's `Enter` commits exactly like `Tab` (a later `Enter`, with the popup closed, submits).
 _Avoid_: 上屏, fill, autofill, insert completion
+
+**Prompt preprocessing**:
+The shared `slimcode-app` seam (`prepare_user_prompt`) that turns raw user input into what a turn
+sends: a plain Prompt, or a Skill trigger's rendered `<skill>` block (deduped against the message
+history) plus its display unit. Every Frontend consumes it, so skill-injection logic is written once
+(supersedes the "skill semantics stay on the CLI side" half of ADR-0013 D3; ADR-0026). Command
+dispatch is **not** part of it — commands become frontend effects, not a prompt.
+_Avoid_: input parsing, prompt normalization (a sub-step, not the seam)
+
+**Command chip**:
+The highlighted badge a Frontend wraps around a committed `/` command or `/skill:name` sitting at the
+start of the input, to emphasise that the leading token is a Command rather than prompt text; it shows
+only while that token is an exact, recognised candidate spelling (the popup closed). A display-only
+overlay — the buffer stays editable plain text.
+_Avoid_: pill, tag, token (bare — collides with LLM tokens)
 
 **Frontend**:
 One of slimcode's user-facing entry surfaces: the `slimcode` CLI (one entry point driving one-shot text and the interactive TUI, ADR-0022) and the GUI 前端 (a Tauri desktop app). Each frontend owns its display adapters, `/` command semantics, input history and session picker, and drives turns through the SDK.

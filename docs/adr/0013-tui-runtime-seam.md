@@ -1,5 +1,11 @@
 # TUI runtime seam: terminal lifecycle in the library, application lifecycle in the CLI
 
+> **Superseded in part by [ADR-0026](./0026-shared-skill-injection-preprocessing.md)**: the "skill
+> semantics stay on the CLI side" half of D3 no longer holds — skill-trigger → model-prompt
+> preprocessing moved into a shared `slimcode_app::skills::prepare_user_prompt` seam consumed by every
+> frontend (CLI one-shot, CLI TUI, GUI). Command *dispatch* still stays on the CLI/frontend side, so
+> the rest of D3 and D1/D2 are unchanged.
+
 > **Implementation note (ticket 05)**: two details of the sketched trait changed once it met the
 > borrow checker. `submit` and `cancel` take `&self` (and `UiHandler: Sync`), because a turn runs on
 > the library's worker thread while the frame loop still has to reach `cancel` on Esc — one `&mut`

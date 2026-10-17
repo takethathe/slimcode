@@ -67,6 +67,13 @@ export type ContextInfo = {
   window: number;
 };
 
+/** One row of the `/` Completion popup: the exact spelling to commit and its
+ *  short description (mirrors the Rust `CompletionItem`, ADR-0026). */
+export type CompletionItem = {
+  value: string;
+  description: string;
+};
+
 export type SessionInfo = {
   id: string;
   title: string | null;

@@ -18,6 +18,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use slimcode_commands::{COMMANDS, fuzzy::fuzzy_match, suggest};
+use slimcode_core::session::AgentMessage;
 
 /// Where a skill was discovered from (or installed into).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -326,6 +327,61 @@ pub fn leading_skill_ref(prompt: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((name, arg))
+}
+
+/// What one submitted turn actually sends, produced by the shared Prompt
+/// preprocessing seam (ADR-0026 D1). Every frontend consumes it so a
+/// `/skill:name` trigger expands identically in the CLI one-shot, the TUI, and
+/// the GUI.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PreparedPrompt {
+    /// Plain prompt text. An unrecognised leading `/xxx` is normalized to the
+    /// `/{name}` spelling (the `/skill:` prefix dropped) before it reaches the
+    /// model.
+    Prompt(String),
+    /// A leading skill trigger resolved to an installed skill and expanded into
+    /// its `<skill>` block.
+    Skill {
+        /// The skill's canonical name.
+        name: String,
+        /// The full `<skill>` block (plus task argument) to hand to the SDK
+        /// `prompt`.
+        model_text: String,
+        /// The block's inner content (the name/`location` line stripped) for a
+        /// frontend's own display.
+        display: String,
+    },
+}
+
+/// Lift a raw user input into what a turn sends (ADR-0026 D1): a leading
+/// `/skill:name` / `/{name}` trigger that resolves to an installed skill
+/// becomes its `<skill>` block — deduped against `history` through
+/// [`crate::context::skill_loaded_in`] so an already-loaded skill degrades to
+/// the already-loaded notice — and anything else is a plain prompt, with an
+/// unrecognised leading `/skill:` normalized to the `/{name}` text form. An
+/// empty `history` reproduces the one-shot's prior no-dedup behaviour; the
+/// interactive/GUI paths pass the session's messages. Command recognition is
+/// deliberately out of scope — commands become frontend effects, not a prompt.
+pub fn prepare_user_prompt(
+    input: &str,
+    skills: &[Skill],
+    history: &[AgentMessage],
+) -> PreparedPrompt {
+    if let Some((name, arg)) = leading_skill_ref(input)
+        && let Some(skill) = find_skill(skills, name)
+    {
+        let already_loaded = crate::context::skill_loaded_in(history, skill);
+        let model_text = skill_prompt(skill, (!arg.is_empty()).then_some(arg), already_loaded);
+        let display = parse_skill_block(&model_text)
+            .map(|(_, inner)| inner.to_string())
+            .unwrap_or_default();
+        return PreparedPrompt::Skill {
+            name: skill.name.clone(),
+            model_text,
+            display,
+        };
+    }
+    PreparedPrompt::Prompt(normalize_skill_trigger(input))
 }
 
 /// Format auto-invokable skills (those without `disable-model-invocation:
@@ -656,15 +712,40 @@ pub struct CompletionItem {
     pub description: String,
 }
 
-/// Ranked completion candidates for a partial `/` input: every command
-/// spelling (canonical name and aliases) plus every installed skill, fuzzy
-/// matched and sorted best-first. A bare `/` yields every candidate in
-/// registry order (commands first, then skills); a non-`/` input yields none.
-/// Skills are matched on their bare name only — the `/skill:` trigger prefix
-/// is never scored, so its letters cannot match every skill — and advertised
-/// under their canonical `/skill:name` spelling (a typed `/skill:name`
-/// trigger is likewise matched by its name part).
+/// Which frontend a `complete*` call serves, deciding which commands the
+/// candidate pool keeps (ADR-0026 D2). `All` (the TUI) offers every command;
+/// `Gui` drops the commands with no GUI backing (`gui_applicable == false`) so
+/// the GUI popup never offers something it cannot do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompletionScope {
+    /// The full registry — every command spelling survives.
+    All,
+    /// The GUI pool — commands without a GUI backing are filtered out.
+    Gui,
+}
+
+/// Ranked completion candidates for a partial `/` input against the full
+/// command registry (the TUI's entry point): every command spelling plus every
+/// installed skill. Delegates to [`complete_in`] with [`CompletionScope::All`].
 pub fn complete<S: SkillView>(input: &str, skills: &[S]) -> Vec<CompletionItem> {
+    complete_in(CompletionScope::All, input, skills)
+}
+
+/// Ranked completion candidates for a partial `/` input, scoped to a frontend:
+/// every surviving command spelling (canonical name and aliases) plus every
+/// installed skill, fuzzy matched and sorted best-first. A bare `/` yields
+/// every candidate in registry order (commands first, then skills); a non-`/`
+/// input yields none. Skills are matched on their bare name only — the
+/// `/skill:` trigger prefix is never scored, so its letters cannot match every
+/// skill — and advertised under their canonical `/skill:name` spelling (a typed
+/// `/skill:name` trigger is likewise matched by its name part). `scope` decides
+/// which commands the pool keeps (ADR-0026 D2); the bare-name skill scoring,
+/// canonical values, and ranking are identical across scopes.
+pub fn complete_in<S: SkillView>(
+    scope: CompletionScope,
+    input: &str,
+    skills: &[S],
+) -> Vec<CompletionItem> {
     let trimmed = input.trim();
     if !trimmed.starts_with('/') {
         return Vec::new();
@@ -674,9 +755,13 @@ pub fn complete<S: SkillView>(input: &str, skills: &[S]) -> Vec<CompletionItem> 
     // Candidate pool: every command spelling (canonical + alias) then every
     // skill, as `skill:name`. Commands first keeps the registry order for the
     // bare-`/` case; aliases are real spellings, so `/qu` completes to
-    // `/quit` which `find` resolves back to `/exit`.
+    // `/quit` which `find` resolves back to `/exit`. The GUI scope drops the
+    // commands with no GUI backing.
     let mut pool: Vec<(&str, &'static str)> = Vec::new();
     for command in COMMANDS {
+        if scope == CompletionScope::Gui && !command.gui_applicable {
+            continue;
+        }
         for spelling in command.spellings() {
             // Command spellings already carry the leading `/`; store the bare
             // name so the final `/name` value is not doubled.
@@ -755,6 +840,7 @@ mod tests {
     /// A typed empty skill slice: the prediction helpers are generic over the
     /// caller's skill view, so an untyped `&[]` cannot infer `S`.
     const NO_SKILLS: &[Skill] = &[];
+    use crate::Role;
     use crate::testutil::unique_temp_dir;
 
     fn skill_md(extra: &str) -> String {
@@ -1386,6 +1472,116 @@ mod tests {
         assert!(got.contains(&"/skill:histo".to_string()), "got: {got:?}");
     }
 
+    // --- shared prompt preprocessing seam (ADR-0026) ----------------------
+
+    /// The demo skill, located on disk so `skill_prompt` renders its
+    /// `<location>`.
+    fn located_demo_skill() -> Skill {
+        parse_skill(&skill_md(""), SkillScope::User).unwrap().at(
+            PathBuf::from("/home/u/skills/demo"),
+            PathBuf::from("/home/u/skills/demo/SKILL.md"),
+        )
+    }
+
+    #[test]
+    fn prepare_user_prompt_expands_skill_trigger_with_argument() {
+        let skills = [located_demo_skill()];
+        let got = prepare_user_prompt("/skill:demo do the thing", &skills, &[]);
+        let PreparedPrompt::Skill {
+            name,
+            model_text,
+            display,
+        } = got
+        else {
+            panic!("expected a skill, got {got:?}");
+        };
+        assert_eq!(name, "demo");
+        assert!(
+            model_text.starts_with("<skill name=\"demo\""),
+            "model_text: {model_text}"
+        );
+        assert!(
+            model_text.contains("Do the demo."),
+            "model_text: {model_text}"
+        );
+        // The task argument is appended after the block.
+        assert!(
+            model_text.ends_with("</skill>\n\ndo the thing"),
+            "model_text: {model_text}"
+        );
+        // display is the inner content (the name/location line stripped).
+        assert!(!display.contains("<skill"), "display: {display}");
+        assert!(display.contains("Do the demo."), "display: {display}");
+    }
+
+    #[test]
+    fn prepare_user_prompt_expands_bare_name_trigger_without_argument() {
+        let skills = [located_demo_skill()];
+        // The bare `/{name}` spelling resolves the same way, with no argument.
+        let PreparedPrompt::Skill { model_text, .. } = prepare_user_prompt("/demo", &skills, &[])
+        else {
+            panic!("expected a skill");
+        };
+        assert!(
+            model_text.starts_with("<skill name=\"demo\""),
+            "model_text: {model_text}"
+        );
+        assert!(model_text.ends_with("</skill>"), "model_text: {model_text}");
+        // A fresh skill (empty history) injects the full body and appends no
+        // task argument.
+        assert!(
+            model_text.contains("Do the demo."),
+            "model_text: {model_text}"
+        );
+    }
+
+    #[test]
+    fn prepare_user_prompt_dedups_an_already_loaded_skill_against_history() {
+        let skills = [located_demo_skill()];
+        // Fresh (empty history): the full body is injected.
+        let PreparedPrompt::Skill {
+            model_text: fresh, ..
+        } = prepare_user_prompt("/demo", &skills, &[])
+        else {
+            panic!("expected a skill")
+        };
+        assert!(fresh.contains("Do the demo."), "fresh: {fresh}");
+        // Already loaded (an earlier message carries the skill block): the body
+        // is replaced by the already-loaded notice.
+        let history = vec![AgentMessage::text(Role::User, &fresh)];
+        let PreparedPrompt::Skill {
+            model_text: dedup, ..
+        } = prepare_user_prompt("/demo", &skills, &history)
+        else {
+            panic!("expected a skill")
+        };
+        assert!(!dedup.contains("Do the demo."), "dedup: {dedup}");
+        assert!(dedup.contains("already loaded"), "dedup: {dedup}");
+    }
+
+    #[test]
+    fn prepare_user_prompt_plain_input_is_a_prompt() {
+        let skills = [located_demo_skill()];
+        let got = prepare_user_prompt("review this diff", &skills, &[]);
+        assert_eq!(got, PreparedPrompt::Prompt("review this diff".to_string()));
+    }
+
+    #[test]
+    fn prepare_user_prompt_unrecognised_slash_is_normalized_into_a_prompt() {
+        let skills = [located_demo_skill()];
+        // A leading `/skill:` that names no installed skill falls through to
+        // the `/{name}` text form (normalized), not a skill.
+        assert_eq!(
+            prepare_user_prompt("/skill:nope hi", &skills, &[]),
+            PreparedPrompt::Prompt("/nope hi".to_string())
+        );
+        // A bare unknown `/xxx` passes through unchanged.
+        assert_eq!(
+            prepare_user_prompt("/nope", &skills, &[]),
+            PreparedPrompt::Prompt("/nope".to_string())
+        );
+    }
+
     // --- completion popup candidates --------------------------------------
 
     #[test]
@@ -1538,6 +1734,57 @@ mod tests {
         assert_eq!(
             items[0].description,
             "install a skill (user or project scope)"
+        );
+    }
+
+    #[test]
+    fn complete_in_gui_scope_drops_the_non_applicable_commands() {
+        let gui = complete_in(CompletionScope::Gui, "/", NO_SKILLS);
+        let values: Vec<&str> = gui.iter().map(|i| i.value.as_str()).collect();
+        // The four GUI-unbacked commands never appear for the GUI.
+        for gone in ["/history", "/install-skill", "/!!", "/!"] {
+            assert!(
+                !values.contains(&gone),
+                "GUI pool leaked {gone}: {values:?}"
+            );
+        }
+        // The GUI-applicable set still does.
+        for kept in ["/help", "/new", "/usage", "/compact", "/skills", "/exit"] {
+            assert!(
+                values.contains(&kept),
+                "GUI pool dropped {kept}: {values:?}"
+            );
+        }
+        // The `All` (TUI) scope keeps the full registry, so it is strictly
+        // larger than the GUI pool.
+        let all = complete("/", NO_SKILLS);
+        let all_values: Vec<&str> = all.iter().map(|i| i.value.as_str()).collect();
+        assert!(all_values.contains(&"/history"));
+        assert!(all_values.contains(&"/install-skill"));
+        assert!(all.len() > gui.len(), "all: {all:?} vs gui: {gui:?}");
+    }
+
+    #[test]
+    fn complete_in_gui_scope_offers_skills_and_keeps_registry_order() {
+        let s = parse_skill(
+            "---\nname: grill\ndescription: stress-test a plan\n---\nb\n",
+            SkillScope::User,
+        )
+        .unwrap();
+        // A skill still surfaces under its canonical trigger in the GUI pool.
+        let items = complete_in(CompletionScope::Gui, "/gr", std::slice::from_ref(&s));
+        let values: Vec<&str> = items.iter().map(|i| i.value.as_str()).collect();
+        assert!(values.contains(&"/skill:grill"), "got: {values:?}");
+        // Bare `/`: the surviving commands keep registry order (commands first,
+        // then skills), identical to the `All` scope minus the filtered ones.
+        let gui = complete_in(CompletionScope::Gui, "/", std::slice::from_ref(&s));
+        assert_eq!(gui.first().unwrap().value, "/help");
+        assert_eq!(
+            *gui.last().unwrap(),
+            CompletionItem {
+                value: "/skill:grill".to_string(),
+                description: "stress-test a plan".to_string(),
+            }
         );
     }
 }

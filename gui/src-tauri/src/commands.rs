@@ -7,7 +7,7 @@
 use tauri::State;
 use tauri::ipc::Channel;
 
-use crate::controller::{AppController, SessionInfo, SessionSnapshot};
+use crate::controller::{AppController, CompletionItem, SessionInfo, SessionSnapshot};
 use crate::settings::GuiSettings;
 use crate::wire::GuiWireEvent;
 
@@ -41,6 +41,14 @@ pub fn list_sessions(state: State<'_, AppController>) -> Result<Vec<SessionInfo>
 #[tauri::command]
 pub fn get_session(state: State<'_, AppController>) -> Result<SessionSnapshot, String> {
     state.get_session()
+}
+
+/// Ranked `/` completion candidates (Commands + installed Skills, filtered to
+/// the GUI-applicable set) for the frontend's Completion popup, fetched per
+/// keystroke (ADR-0026).
+#[tauri::command]
+pub fn complete(state: State<'_, AppController>, input: String) -> Vec<CompletionItem> {
+    state.complete(&input)
 }
 
 /// Run one whole turn for `text`, streaming `GuiWireEvent`s over `channel`.

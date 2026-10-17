@@ -58,6 +58,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             commands::delete_session,
             commands::list_sessions,
             commands::get_session,
+            commands::complete,
             commands::prompt,
             commands::cancel,
             commands::compact_now,

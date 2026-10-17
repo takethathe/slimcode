@@ -1,12 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { api, errorMessage } from "./api";
 import {
   blocksFromHistory,
   newBlockSeq,
   reduceTranscript,
+  usageNotice,
   type Block,
 } from "./transcript";
 import type {
+  CompletionItem,
   ContextInfo,
   GuiSettings,
   GuiWireEvent,
@@ -17,6 +20,7 @@ import { TopBar } from "./components/TopBar";
 import { Transcript } from "./components/Transcript";
 import { InputBox } from "./components/InputBox";
 import { SettingsModal } from "./components/SettingsModal";
+import { HelpModal } from "./components/HelpModal";
 
 export default function App() {
   const [blocks, setBlocks] = useState<Block[]>([]);
@@ -29,6 +33,8 @@ export default function App() {
   const [running, setRunning] = useState(false);
   const [busy, setBusy] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
+  const [helpItems, setHelpItems] = useState<CompletionItem[]>([]);
   const [settings, setSettings] = useState<GuiSettings | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -218,6 +224,37 @@ export default function App() {
     }
   }
 
+  // `/help` lists the GUI's applicable Commands + Skills, read from the same
+  // `complete("/")` IPC that feeds the popup (single source of truth).
+  async function showHelp(): Promise<void> {
+    try {
+      setHelpItems(await api.complete("/"));
+      setHelpOpen(true);
+    } catch (e) {
+      setError(errorMessage(e));
+    }
+  }
+
+  // `/usage` reports the current session's cumulative token usage as a usage
+  // line in the transcript (mirrors the TUI's `show_usage`), read fresh from
+  // the host snapshot rather than starting a model turn.
+  async function showUsage(): Promise<void> {
+    try {
+      const snapshot = await api.getSession();
+      setBlocks((prev) => [...prev, usageNotice(snapshot.usage)]);
+    } catch (e) {
+      setError(errorMessage(e));
+    }
+  }
+
+  // `/exit` closes the window (ADR-0026 D3): the frontend command set fires the
+  // GUI's own actions rather than starting a model turn.
+  function exit(): void {
+    void getCurrentWindow()
+      .close()
+      .catch((e) => setError(errorMessage(e)));
+  }
+
   return (
     <div className="flex h-screen bg-slate-100 font-sans text-slate-800">
       <Sidebar
@@ -260,8 +297,14 @@ export default function App() {
           onSend={(t) => void send(t)}
           onStop={() => void stop()}
           disabled={busy}
+          onNewSession={() => void newSession()}
+          onCompact={() => void compact()}
+          onUsage={() => void showUsage()}
+          onExit={exit}
+          onHelp={() => void showHelp()}
         />
       </main>
+      {helpOpen ? <HelpModal items={helpItems} onClose={() => setHelpOpen(false)} /> : null}
       {settingsOpen ? (
         <SettingsModal
           settings={settings}

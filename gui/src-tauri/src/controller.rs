@@ -30,6 +30,9 @@ use slimcode_app::compaction;
 use slimcode_app::config;
 use slimcode_app::context_files::resolve_project_home;
 use slimcode_app::session::{SessionStore, project_key};
+use slimcode_app::skills::{
+    CompletionScope, PreparedPrompt, SkillStore, complete_in, prepare_user_prompt,
+};
 use slimcode_app::{AgentMessage, TokenUsage};
 use slimcode_sdk::{AgentSession, AgentSessionOptions, create_agent_session};
 
@@ -85,6 +88,16 @@ pub struct SessionSnapshot {
     pub warning: Option<String>,
 }
 
+/// One row of the GUI `/` Completion popup: the exact spelling to commit to the
+/// input buffer and its short description. The GUI's own serializable mirror of
+/// `slimcode_app::skills::CompletionItem` (ADR-0024 D3: the wire types are the
+/// GUI's, not a shared import).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CompletionItem {
+    pub value: String,
+    pub description: String,
+}
+
 /// The mutable controller state, guarded by [`AppController::inner`]. All
 /// mutations happen briefly under the lock; the worker only touches it once,
 /// at turn end, to flip `Running` → `Idle` (see [`finish_worker`]).
@@ -104,6 +117,9 @@ struct ControllerInner {
     session_settings_version: u64,
     /// The project-scoped store sharing the CLI/TUI repository.
     store: SessionStore,
+    /// The user + project skill registry backing the `/` completion popup
+    /// (mirrors the CLI completion provider's skills snapshot, ADR-0026).
+    skills: SkillStore,
     home: PathBuf,
     cwd: PathBuf,
     /// A non-fatal startup warning (unreadable `gui.toml` and the like).
@@ -137,6 +153,7 @@ impl AppController {
             Err(message) => (GuiSettings::default(), Some(message)),
         };
         let store = build_store(&home, &cwd);
+        let skills = SkillStore::new(&home, &cwd);
         Self {
             inner: Arc::new(Mutex::new(ControllerInner {
                 state: SessionState::Idle,
@@ -147,6 +164,7 @@ impl AppController {
                 settings_version: 1,
                 session_settings_version: 1,
                 store,
+                skills,
                 home,
                 cwd,
                 warning,
@@ -249,7 +267,14 @@ impl AppController {
         }
         let session = Arc::clone(inner.session.as_ref().expect("session ensured"));
         let shared = Arc::clone(&self.inner);
-        let text = text.to_string();
+        // Prompt preprocessing (ADR-0026): a leading `/skill:name` trigger is
+        // expanded into the skill's `<skill>` block before the model sees it;
+        // plain text and un-mapped Commands pass through unchanged.
+        let skills = inner.skills.list().unwrap_or_default();
+        let text = match prepare_user_prompt(text, &skills, &session.messages()) {
+            PreparedPrompt::Skill { model_text, .. } => model_text,
+            PreparedPrompt::Prompt(text) => text,
+        };
         let worker = spawn_worker(session, shared, sink, move |session| {
             session.prompt(&text).map(|_| ())
         });
@@ -360,6 +385,23 @@ impl AppController {
             usage: session.usage(),
             warning: inner.warning.clone(),
         })
+    }
+
+    /// Ranked `/` completion candidates for the GUI popup (ADR-0026): the
+    /// shared fuzzy, best-first source (commands + installed skills), filtered
+    /// to the GUI-applicable commands. A leading `/` returns the GUI pool; any
+    /// other input returns none. The skill pool is read fresh so it always
+    /// tracks what is actually installed.
+    pub fn complete(&self, input: &str) -> Vec<CompletionItem> {
+        let inner = self.lock();
+        let skills = inner.skills.list().unwrap_or_default();
+        complete_in(CompletionScope::Gui, input, &skills)
+            .into_iter()
+            .map(|item| CompletionItem {
+                value: item.value,
+                description: item.description,
+            })
+            .collect()
     }
 
     /// The GUI settings (model / base_url / cache / optional api_key).
@@ -658,6 +700,9 @@ mod tests {
         cancels_on: Option<usize>,
         /// `(base_url, model, cache)` seen per call, appended by `chat`.
         seen: SeenOverrides,
+        /// The user-prompt text (last assembled message) handed to each
+        /// `chat` call, so tests can assert what reached the provider.
+        prompts: Arc<Mutex<Vec<String>>>,
     }
 
     impl FakeProvider {
@@ -668,14 +713,20 @@ mod tests {
                 calls: 0,
                 cancels_on: None,
                 seen: Arc::new(Mutex::new(Vec::new())),
+                prompts: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        /// The prompt texts recorded across this provider's `chat` calls.
+        fn prompts(&self) -> Vec<String> {
+            self.prompts.lock().expect("prompts lock").clone()
         }
     }
 
     impl Provider for FakeProvider {
         fn chat(
             &mut self,
-            _messages: &[Message],
+            messages: &[Message],
             _tools: &[ToolSpec],
             config: &ProviderConfig,
             cancel: &CancelToken,
@@ -690,6 +741,15 @@ mod tests {
                 config.model.clone(),
                 config.cache,
             ));
+            // The user prompt is the last assembled context message (ADR-0012);
+            // record its text so skill-expansion tests can read what the
+            // provider was handed.
+            if let Some(last) = messages.last() {
+                self.prompts
+                    .lock()
+                    .expect("prompts lock")
+                    .push(last.text_content());
+            }
             let batch = self.script.get(self.calls - 1).cloned().unwrap_or_default();
             for delta in batch {
                 on_delta(delta)?;
@@ -908,6 +968,104 @@ mod tests {
         // (the same `DEFAULT_MODEL` the CLI uses).
         assert_eq!(snapshot.model, slimcode_app::config::DEFAULT_MODEL);
         assert_eq!(controller.state(), SessionState::Idle);
+    }
+
+    /// Install a user-scope skill (`<home>/skills/<name>/SKILL.md`) so the
+    /// completion popup can see it.
+    fn write_user_skill(home: &Path, name: &str, description: &str) {
+        let dir = home.join("skills").join(name);
+        fs::create_dir_all(&dir).expect("skill dir");
+        fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {description}\n---\nbody\n"),
+        )
+        .expect("skill file");
+    }
+
+    #[test]
+    fn complete_returns_the_gui_pool_with_the_four_commands_excluded() {
+        let scratch = Scratch::new("complete-gui-pool");
+        write_user_skill(&scratch.home, "grill", "stress-test a plan");
+        let controller = AppController::new(scratch.home.clone(), scratch.cwd.clone());
+
+        let values: Vec<String> = controller
+            .complete("/")
+            .into_iter()
+            .map(|i| i.value)
+            .collect();
+
+        // The four GUI-unbacked commands never surface.
+        for gone in ["/history", "/install-skill", "/!!", "/!"] {
+            assert!(
+                !values.iter().any(|v| v == gone),
+                "GUI pool leaked {gone}: {values:?}"
+            );
+        }
+        // The effect-mapped and pass-through commands still do.
+        for kept in ["/help", "/new", "/usage", "/compact", "/skills", "/exit"] {
+            assert!(
+                values.iter().any(|v| v == kept),
+                "GUI pool dropped {kept}: {values:?}"
+            );
+        }
+        // The installed skill surfaces under its canonical trigger.
+        assert!(
+            values.iter().any(|v| v == "/skill:grill"),
+            "skill missing: {values:?}"
+        );
+        // A non-`/` input yields nothing.
+        assert!(controller.complete("hello").is_empty());
+    }
+
+    #[test]
+    fn submitting_a_skill_trigger_sends_the_expanded_block_to_the_provider() {
+        let scratch = Scratch::new("skill-inject");
+        write_user_skill(&scratch.home, "grill", "stress-test a plan");
+        let provider = FakeProvider::text_turn("ok");
+        let controller = scratch.controller(provider.clone());
+        let recorder = Recorder::new();
+
+        controller
+            .prompt("/skill:grill be thorough", recorder.sink())
+            .expect("prompt accepted");
+        wait_until(|| controller.state() == SessionState::Idle);
+
+        let sent = provider.prompts();
+        assert_eq!(sent.len(), 1, "provider saw exactly one prompt");
+        // The model gets the expanded `<skill>` block, not the literal trigger.
+        assert!(
+            sent[0].contains("<skill name=\"grill\""),
+            "provider did not receive the skill block: {:?}",
+            sent[0]
+        );
+        assert!(
+            !sent[0].contains("/skill:grill"),
+            "the literal slash trigger leaked to the provider: {:?}",
+            sent[0]
+        );
+        // The trailing argument rides along after the block.
+        assert!(
+            sent[0].contains("be thorough"),
+            "argument dropped: {:?}",
+            sent[0]
+        );
+    }
+
+    #[test]
+    fn a_plain_prompt_reaches_the_provider_unchanged() {
+        let scratch = Scratch::new("plain-prompt");
+        let provider = FakeProvider::text_turn("ok");
+        let controller = scratch.controller(provider.clone());
+        let recorder = Recorder::new();
+
+        controller
+            .prompt("hello there", recorder.sink())
+            .expect("prompt accepted");
+        wait_until(|| controller.state() == SessionState::Idle);
+
+        let sent = provider.prompts();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0], "hello there");
     }
 
     #[test]
@@ -1471,6 +1629,7 @@ mod tests {
             calls: 0,
             cancels_on: None,
             seen: Arc::clone(&seen),
+            prompts: Arc::new(Mutex::new(Vec::new())),
         };
         (provider, seen)
     }

@@ -31,9 +31,7 @@ use slimcode_app::context_files::resolve_project_home;
 use slimcode_app::history::HistoryStore;
 use slimcode_app::render::Renderer;
 use slimcode_app::session::{SessionStore, project_key};
-use slimcode_app::skills::{
-    Skill, SkillStore, find_skill, leading_skill_ref, normalize_skill_trigger, skill_prompt,
-};
+use slimcode_app::skills::{PreparedPrompt, Skill, SkillStore, prepare_user_prompt};
 use slimcode_sdk::{AgentSession, AgentSessionOptions, SdkEvent, create_agent_session};
 
 fn usage() -> String {
@@ -93,12 +91,17 @@ fn run_once_with(
     out: Box<dyn Write + Send + Sync>,
     create: impl FnOnce(AgentSessionOptions) -> Result<AgentSession, String>,
 ) -> Result<i32, String> {
-    // The CLI one-shot path has no command parser, so a leading skill trigger
+    // The shared Prompt preprocessing seam (ADR-0026): a leading skill trigger
     // (`/skill:{name}` or `/{name}` for an installed skill) injects the skill
     // active block as the user prompt — the same content the TUI's `/`-command
     // path embeds, so the model sees the skill instructions either way. Any
-    // other leading `/`-form is normalized to the `/{name}` text form.
-    let prompt = normalize_skill_trigger_prompt(prompt, skills);
+    // other leading `/`-form is normalized to the `/{name}` text form. The
+    // one-shot has no prior history, so it passes an empty slice (its prior
+    // no-dedup behaviour). Runs before the prompt reaches the SDK.
+    let prompt = match prepare_user_prompt(prompt, skills, &[]) {
+        PreparedPrompt::Skill { model_text, .. } => model_text,
+        PreparedPrompt::Prompt(text) => text,
+    };
     // One-shot: a `persist: false` AgentSession (ADR-0009 D5), the resolved
     // home pinned (so the session reads the same root startup resolved), the
     // frozen config re-applied as the highest-precedence overrides (spec
@@ -148,21 +151,6 @@ fn one_shot_options(
         .with_api_key(config.api_key.clone())
         .with_cache(config.cache)
         .with_skills(skills.to_vec())
-}
-
-/// The one-shot's leading-skill-trigger normalization (frontend semantics,
-/// spec Decision 2): `/skill:{name}` / `/{name}` for an installed skill
-/// becomes the skill active block, any other leading `/`-form is normalized to
-/// the `/{name}` text form. Runs before the prompt reaches the SDK.
-fn normalize_skill_trigger_prompt(prompt: &str, skills: &[Skill]) -> String {
-    if let Some((name, arg)) = leading_skill_ref(prompt) {
-        match find_skill(skills, name) {
-            Some(skill) => skill_prompt(skill, (!arg.is_empty()).then_some(arg), false),
-            None => normalize_skill_trigger(prompt),
-        }
-    } else {
-        normalize_skill_trigger(prompt)
-    }
 }
 
 /// Interactive TUI (ADR-0003). The session (provider, tools, store, skills,
@@ -941,22 +929,40 @@ mod tests {
 
     #[test]
     fn one_shot_skill_trigger_injects_the_skill_block() {
-        // A leading `/skill:name` trigger injects the skill active block.
-        let prompt = normalize_skill_trigger_prompt("/skill:grill stress my plan", &[test_skill()]);
-        assert!(prompt.contains("<skill name=\"grill\""), "prompt: {prompt}");
-        assert!(prompt.contains("stress my plan"), "prompt: {prompt}");
-        // A bare `/{name}` trigger works the same way.
-        let prompt = normalize_skill_trigger_prompt("/grill stress my plan", &[test_skill()]);
-        assert!(prompt.contains("<skill name=\"grill\""), "prompt: {prompt}");
-        // An unknown skill falls back to the `/{name}` text form.
-        assert_eq!(
-            normalize_skill_trigger_prompt("/skill:nope hi", &[test_skill()]),
-            "/nope hi"
+        // The one-shot routes its prompt through the shared seam (ADR-0026): a
+        // leading `/skill:name` trigger becomes the skill active block.
+        let PreparedPrompt::Skill { model_text, .. } =
+            prepare_user_prompt("/skill:grill stress my plan", &[test_skill()], &[])
+        else {
+            panic!("expected the trigger to expand into a skill")
+        };
+        assert!(
+            model_text.contains("<skill name=\"grill\""),
+            "model_text: {model_text}"
         );
-        // A plain prompt passes through unchanged.
+        assert!(
+            model_text.contains("stress my plan"),
+            "model_text: {model_text}"
+        );
+        // A bare `/{name}` trigger works the same way.
+        let PreparedPrompt::Skill { model_text, .. } =
+            prepare_user_prompt("/grill stress my plan", &[test_skill()], &[])
+        else {
+            panic!("expected the bare trigger to expand into a skill")
+        };
+        assert!(
+            model_text.contains("<skill name=\"grill\""),
+            "model_text: {model_text}"
+        );
+        // An unknown skill falls back to the `/{name}` text form (a plain
+        // prompt), and a plain prompt passes through unchanged.
         assert_eq!(
-            normalize_skill_trigger_prompt("hello", &[test_skill()]),
-            "hello"
+            prepare_user_prompt("/skill:nope hi", &[test_skill()], &[]),
+            PreparedPrompt::Prompt("/nope hi".to_string())
+        );
+        assert_eq!(
+            prepare_user_prompt("hello", &[test_skill()], &[]),
+            PreparedPrompt::Prompt("hello".to_string())
         );
     }
 

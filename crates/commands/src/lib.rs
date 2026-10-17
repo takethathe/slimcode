@@ -32,10 +32,15 @@ pub struct Command {
     pub usage: &'static str,
     pub description: &'static str,
     pub kind: CommandKind,
+    /// Whether this command has a GUI backing. The GUI `/` completion pool
+    /// drops the commands that are `false` (the input-history replay set and
+    /// `/install-skill`, which the GUI frontend does not implement); the TUI
+    /// keeps every command regardless of this flag (ADR-0026 D2).
+    pub gui_applicable: bool,
 }
 
 impl Command {
-    /// An exact command with no aliases.
+    /// An exact command with no aliases, applicable to every frontend.
     pub const fn new(name: &'static str, usage: &'static str, description: &'static str) -> Self {
         Self {
             name,
@@ -43,10 +48,11 @@ impl Command {
             usage,
             description,
             kind: CommandKind::Exact,
+            gui_applicable: true,
         }
     }
 
-    /// An exact command with aliases.
+    /// An exact command with aliases, applicable to every frontend.
     pub const fn aliased(
         name: &'static str,
         aliases: &'static [&'static str],
@@ -59,6 +65,7 @@ impl Command {
             usage,
             description,
             kind: CommandKind::Exact,
+            gui_applicable: true,
         }
     }
 
@@ -74,6 +81,16 @@ impl Command {
             usage,
             description,
             kind: CommandKind::Numbered,
+            gui_applicable: true,
+        }
+    }
+
+    /// Mark this command as having no GUI backing, so the GUI `/` completion
+    /// pool drops it (the TUI still offers it). Chain on a constructor.
+    pub const fn not_gui(self) -> Self {
+        Self {
+            gui_applicable: false,
+            ..self
         }
     }
 
@@ -95,15 +112,18 @@ pub const COMMANDS: &[Command] = &[
         "/compact",
         "summarize older messages to free context",
     ),
-    Command::new("/history", "/history", "list input history"),
+    // The GUI frontend persists no input history, so the replay set and
+    // `/install-skill` have no GUI backing and drop out of its completion pool.
+    Command::new("/history", "/history", "list input history").not_gui(),
     Command::new("/skills", "/skills", "list installed skills"),
     Command::new(
         "/install-skill",
         "/install-skill <path> --user|--project",
         "install a skill (user or project scope)",
-    ),
-    Command::new("/!!", "/!!", "rerun the most recent prompt"),
-    Command::numbered("/!", "/!N", "rerun history entry N (1 = newest)"),
+    )
+    .not_gui(),
+    Command::new("/!!", "/!!", "rerun the most recent prompt").not_gui(),
+    Command::numbered("/!", "/!N", "rerun history entry N (1 = newest)").not_gui(),
     Command::aliased("/exit", &["/quit"], "/exit", "quit the TUI"),
 ];
 
@@ -253,5 +273,26 @@ mod tests {
             assert!(c.usage.starts_with('/'), "bad usage: {}", c.usage);
             assert!(!c.description.is_empty(), "no description for {}", c.name);
         }
+    }
+
+    #[test]
+    fn gui_applicable_drops_the_replay_and_install_commands() {
+        // Exactly the four GUI-unbacked commands are false; the GUI frontend
+        // persists no input history and writes no skill store.
+        let non_gui: Vec<&str> = COMMANDS
+            .iter()
+            .filter(|c| !c.gui_applicable)
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(non_gui, vec!["/history", "/install-skill", "/!!", "/!"]);
+        // Everything else — including `/exit` (aliased) and the effect-mapped
+        // set — is offered to the GUI.
+        for name in ["/help", "/new", "/usage", "/compact", "/skills", "/exit"] {
+            assert!(
+                find(name).unwrap().gui_applicable,
+                "{name} must apply to the GUI"
+            );
+        }
+        assert!(!find("/!!").unwrap().gui_applicable);
     }
 }

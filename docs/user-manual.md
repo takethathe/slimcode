@@ -342,6 +342,16 @@ cd /path/to/repo
 带运行中 / 成功 / 失败状态且可展开看结果、token 用量行、压缩提示），底部是输入框（`Enter` 发送、
 `Shift+Enter` 换行，运行中可中止当前回合）。
 
+输入框以 `/` 开头会弹出与 TUI 同一来源的 **`/` 命令补全弹框**（ADR-0026）：随敲入实时刷新、
+按相关性排序的候选（内置命令 + 已安装 skill），每行显示候选值与描述；`↑`/`↓` 选择（纯敲字时自动
+跟随最佳项，手动移动后按值粘住），`Tab` 或弹框打开时的 `Enter` 把选中的拼写**提交到输入缓冲**（补一个
+尾随空格、不发送），`Esc` 只关弹框不清空输入，弹框关闭后的 `Enter` 才发送。已提交且被识别的前导
+token（命令或 `/skill:name`）在框上方渲染为一枚 **Command chip**（纯展示，底下仍是可编辑的普通文本）。
+GUI 只收录有对应动作的命令——`/history`、`/install-skill`、`/!!`、`/!` 不出现在候选里。提交时
+前端拦截并直接执行 `/new`（新会话）、`/compact`（压缩当前会话）、`/exit`（关闭窗口）、`/help`（显示
+命令列表），不触发起模型回合；其余提交都走宿主 `prompt`，经共享的 prompt preprocessing 展开，因此
+`/skill:name` 把 skill 正文（而非斜杠字面）交给模型（`/usage`、`/skills` 暂作普通 prompt 透传）。
+
 配置：与 CLI/TUI 共享会话仓库和配置的其余三层，但 GUI 的设置面板（右上角齿轮）只写
 `slimcode_home/gui.toml`（默认 `~/.slimcode/gui.toml`，`SLIMCODE_HOME` 可覆盖目录），
 **不碰**共享的 `config.toml`，因此 GUI 里改配置不影响 CLI/TUI：
