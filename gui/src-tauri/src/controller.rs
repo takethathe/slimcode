@@ -524,7 +524,11 @@ where
             sink_for_listener(GuiWireEvent::from(&event));
         });
         let result = op(&session);
-        drop(unsubscribe);
+        // Call the returned `Unsubscribe` to remove this turn's listener: it
+        // is a `Box<dyn FnOnce()>`, so `drop` would only deallocate it and
+        // leave the listener subscribed, duplicating every later turn's
+        // events once per accumulated listener.
+        unsubscribe();
         if let Err(message) = result {
             sink(GuiWireEvent::Error { message });
         }
@@ -964,6 +968,68 @@ mod tests {
             assistant_texts.iter().any(|t| t.contains("hello world")),
             "{assistant_texts:?}"
         );
+    }
+
+    /// Regression: each `prompt` must unsubscribe its listener when the turn
+    /// ends. A leaked listener makes every later turn deliver its events once
+    /// per accumulated listener, so the frontend renders each block N times
+    /// (turn 1 clean, turn 2 doubled, ...). Two prompts over one recorder must
+    /// therefore see exactly one user-message event per turn.
+    #[test]
+    fn successive_prompts_do_not_duplicate_events() {
+        let scratch = Scratch::new("no-dup");
+        let (provider, _seen) = fake_provider(
+            vec![
+                vec![text_delta("reply one"), done_stop()],
+                vec![text_delta("reply two"), done_stop()],
+            ],
+            usage(10, 5),
+        );
+        let controller = scratch.controller(provider);
+        let recorder = Recorder::new();
+
+        controller
+            .prompt("first", recorder.sink())
+            .expect("first prompt starts");
+        wait_until(|| {
+            recorder
+                .events()
+                .iter()
+                .any(|e| matches!(e, GuiWireEvent::TurnFinished { .. }))
+        });
+        wait_until(|| controller.state() == SessionState::Idle);
+
+        controller
+            .prompt("second", recorder.sink())
+            .expect("second prompt starts");
+        // Wait for the second turn's own end: a second `TurnFinished`.
+        wait_until(|| {
+            recorder
+                .events()
+                .iter()
+                .filter(|e| matches!(e, GuiWireEvent::TurnFinished { .. }))
+                .count()
+                >= 2
+        });
+        wait_until(|| controller.state() == SessionState::Idle);
+
+        let events = recorder.events();
+        let user_msgs = events
+            .iter()
+            .filter(|e| {
+                matches!(e, GuiWireEvent::Message { message, .. } if message.role() == &Role::User)
+            })
+            .count();
+        assert_eq!(
+            user_msgs, 2,
+            "one user-message event per prompt (a leaked listener doubles \
+             the second turn): {events:?}"
+        );
+        let turn_ends = events
+            .iter()
+            .filter(|e| matches!(e, GuiWireEvent::TurnFinished { .. }))
+            .count();
+        assert_eq!(turn_ends, 2, "one turn_finished per prompt: {events:?}");
     }
 
     /// A tool-calling turn streams the card's two events in order
