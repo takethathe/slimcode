@@ -748,3 +748,51 @@ bash crates/ffi/demo/run.sh
 `compact_now` 不在 Node demo 里（由 `crates/ffi/tests/compact_now.rs` 覆盖）；ABI 的各条行为路径
 （文本回合 / 工具回合 / 失败回合 / 单飞 / 取消 / 持久化 / 并发句柄）由 Rust 集成测试用一个
 stdlib-only 的 mock SSE 端点覆盖，`cargo test` 因此离线、无需 key。
+
+### gui/ Tauri 桌面 GUI（`slimcode-gui`）
+
+第三个前端（ADR-0024）：一个 Tauri v2 桌面应用，UI 是 Web 技术（React + Vite + Tailwind，浅色
+现代风格），Rust 后端（**Tauri 宿主**）直接 path 依赖 `slimcode-sdk` 与 `slimcode-app`，内嵌
+agent 能力——不走 FFI（FFI 是给非 Rust 宿主的，Tauri 后端本身就是 Rust），不 spawn `slimcode`
+二进制。
+
+目录结构（独立于 cargo workspace，自己的 Cargo.toml / Cargo.lock / package.json）：
+
+```
+gui/
+├── src-tauri/            # Tauri 宿主
+│   ├── src/
+│   │   ├── main.rs       # bin：调用 lib.rs 的 run()
+│   │   ├── lib.rs        # tauri::Builder + commands 注册（注入 slimcode home 与 cwd）
+│   │   ├── wire.rs       # GUI wire 事件：SdkEvent → 扁平 JSON 的穷尽映射（镜像 FFI wire.rs）
+│   │   ├── controller.rs # AppController：会话注册表 + worker 线程 + 状态机（Idle/Running/Disposed）
+│   │   ├── settings.rs   # gui.toml 读写（api_key 写入 0600）
+│   │   └── commands.rs   # #[tauri::command] 面（薄壳转发，无逻辑）
+│   └── tauri.conf.json   # 标识符 slimcode-gui
+└── ui/                   # React + Vite + Tailwind 前端
+```
+
+宿主逻辑收敛在纯 Rust 的 `AppController`（`controller.rs`）上，Tauri command 只是它的薄壳转发层
+——所有可测逻辑不依赖 Tauri 运行时。
+
+要点：
+
+- **会话**：v1 单活跃会话（对齐 TUI 的"当前会话"心智）；`prompt` 在 worker 线程上跑（SDK 同步、
+  单飞），`cancel` 只调 `abort()`（跨线程、只碰取消令牌、不等会话锁，连在途 `bash` 一起杀）；
+- **事件桥**：每次 `prompt` 一个 Tauri v2 `Channel<GuiWireEvent>`；worker 线程把每个 `SdkEvent`
+  `encode` 成扁平 JSON 后 `channel.send()`；`SdkEvent` / `DisplayItem` 不加 `Serialize`
+  （internally-tagged 装不下 newtype-in-primitive，ADR-0023 D3），所以 GUI 有自己的 wire 枚举，
+  穷尽 match（无 `_` 分支），`DisplayItem` 新增变体即编译失败；
+- **会话共享**：与 CLI/TUI 共用同一 slimcode_home 下的 JSONL 会话仓库（同一个
+  `SessionStore.entries()` 出列表，`with_session_id` 续会），CLI 建的会话 GUI 能恢复、反之亦然；
+- **设置**：`gui.toml`（slimcode_home 下）存 `model` / `base_url` / `cache` / 可选 `api_key`，
+  启动读出作为 SDK overrides 传入；**绝不写 `config.toml`**（那是 CLI/TUI/GUI 共享的第三层，
+  GUI 写它会静默改变其它前端行为）；api_key v1 明文 + 0600，Keychain 为 v2 增强；
+- **门禁**：`gui/` 不是 workspace member，workspace 的 `cargo test` / clippy / `architecture.rs`
+  矩阵不受影响；GUI 自己的 Rust 测试在 `gui/src-tauri` 内跑（FakeProvider + `with_home(scratch)`
+  注入，沿用 `crates/sdk/tests/` 模式，离线无 key），前端 v1 手动验收；
+  - Rust 门禁：在 `gui/src-tauri` 里 `cargo fmt` / `cargo clippy --all-targets --all-features -- -D warnings` / `cargo test`；
+  - 前端门禁：在 `gui/ui` 里 `npx tsc --noEmit` / `npm run build`；
+  - 开发运行：在 `gui/` 里 `npx tauri dev`（`tauri.conf.json` 的 `beforeDevCommand` 路径相对它解析，
+    在 `gui/src-tauri` 里跑会把 `../ui` 解析到仓库上级）；
+- **规格**：`.scratch/gui/spec.md`（Tauri command 面、wire 事件表、验收标准）。

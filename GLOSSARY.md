@@ -227,7 +227,7 @@ The action of accepting a Completion popup selection with `Tab`: the selected `/
 _Avoid_: 上屏, fill, autofill, insert completion
 
 **Frontend**:
-The user-facing entry surface of slimcode: the `slimcode` CLI, and the presentation mode it drives (one-shot text or the interactive TUI). There is one entry point, not one per presentation mode.
+One of slimcode's user-facing entry surfaces: the `slimcode` CLI (one entry point driving one-shot text and the interactive TUI, ADR-0022) and the GUI 前端 (a Tauri desktop app). Each frontend owns its display adapters, `/` command semantics, input history and session picker, and drives turns through the SDK.
 _Avoid_: UI, client
 
 **CLI**:
@@ -238,8 +238,12 @@ _Avoid_: binary, main, entrypoint
 slimcode's terminal graphics library (ratatui + crossterm): transcript model, components, input reducer, and frame loop. Entered by the CLI; holds no argv, config, provider, session or command semantics, and depends on no other slimcode crate.
 _Avoid_: REPL, frontend, UI
 
+**GUI 前端**:
+slimcode's web-based frontend: a Tauri v2 desktop app (the third entry surface, after the CLI and the TUI) whose UI is built on web technology (React + Vite + Tailwind) and runs in a native window. Its Rust backend (the Tauri 宿主) embeds slimcode-sdk directly, runs one active AgentSession at a time on a worker thread, and streams events to the webview as GUI wire 事件. Lives outside the cargo workspace at `gui/`.
+_Avoid_: desktop app, web app, GUI client
+
 **Renderer**:
-The component that turns DisplayItems into frontend output. Both implementations live in the CLI: the text renderer (terminal lines for one-shot output) and the TUI adapter (RenderItems for the interactive TUI). The TUI itself does not implement it.
+The component that turns DisplayItems into frontend output. The implementations live in the CLI (the text renderer for one-shot output and the TUI adapter for the interactive TUI); the GUI 前端 renders DisplayItems itself from GUI wire 事件. The TUI itself does not implement it.
 _Avoid_: printer, formatter
 
 **DisplayItem**:
@@ -309,6 +313,10 @@ _Avoid_: cache header, cache tag, cache annotation
 **config.toml**:
 The user-level config file at `~/.slimcode/config.toml` (or `$SLIMCODE_HOME/config.toml`): a TOML `[ai]` table with optional `base_url` / `model` / `cache` / `api_key`. Edited by hand or interactively via `slimcode config`. Distinct from credentials management.
 _Avoid_: config directory, rc file
+
+**gui.toml**:
+The GUI-only settings file under slimcode_home (next to `config.toml`): `model` / `base_url` / `cache`, and optionally a plaintext `api_key` written with 0600 permissions. Read at GUI startup and passed to every AgentSession as SDK overrides (the highest-precedence layer, ADR-0021); deliberately never `config.toml`, so GUI settings cannot change CLI/TUI behavior.
+_Avoid_: settings file, gui config, options file
 
 **API key / credential**:
 A secret (e.g. `DASHSCOPE_API_KEY` / `[ai] api_key`) with source precedence `--api-key` > env > `config.toml`, distinct from non-secret Config. When stored in `config.toml` it is plaintext on disk, so slimcode suggests `chmod 600` on loose permissions and `slimcode config` tightens to 0600 after writing a key.
@@ -406,3 +414,11 @@ blocked when `dispose` closes the queue wakes with `NULL` and an empty `last_err
 ended, not a failure), and dispose drops the unconsumed events. The C side never calls back into
 the host language, so any language and thread model can pump it.
 _Avoid_: callback, channel, subscription
+
+**Tauri 宿主 (Tauri host)**:
+The Rust process behind the GUI 前端: a Tauri v2 app whose backend embeds slimcode-sdk plus the app layer's SessionStore (shared with the CLI/TUI, ADR-0011 D2), owns the session registry (one current AgentSession, single active session), runs each `prompt` on a worker thread, bridges SdkEvents to the webview as GUI wire 事件, and persists GUI settings to gui.toml (read as SDK overrides). Never writes `config.toml`.
+_Avoid_: backend, core process, GUI core
+
+**GUI wire 事件 (GUI wire event)**:
+The flat JSON event enum the GUI frontend consumes, produced by the Tauri 宿主 from each SdkEvent with an exhaustive match (mirroring the FFI 模块's wire enum, ADR-0023 D3 — `SdkEvent` / `DisplayItem` cannot derive `Serialize`), and delivered per `prompt` over a Tauri `Channel`. The frontend never sees an `SdkEvent`.
+_Avoid_: GUI event, wire payload, channel event

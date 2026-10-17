@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default capability: the main window may call every command this app registers.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

@@ -1,0 +1,30 @@
+# slimcode-gui: the Tauri host behind the GUI frontend (ADR-0024).
+#
+# Deliberately NOT a member of the workspace at the repo root: Tauri drags in
+# hundreds of dependencies, and the workspace gates (fmt / clippy / `cargo
+# test`, the `architecture.rs` dependency matrix) must keep covering only the
+# agent core. This crate has its own gates instead (D3). The empty `[workspace]`
+# table opts it out of the parent workspace.
+[package]
+name = "slimcode-gui"
+version = "0.1.0"
+edition = "2024"
+description = "The Tauri host of the slimcode GUI frontend (ADR-0024)"
+license = "MIT"
+
+# The GUI's own lockfile lives here; the workspace lockfile stays untouched.
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+slimcode-app = { path = "../../crates/app" }
+slimcode-sdk = { path = "../../crates/sdk" }
+
+[dev-dependencies]
+tempfile = "3"

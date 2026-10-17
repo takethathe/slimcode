@@ -1,0 +1,12 @@
+# Rust (host crate — built from gui/src-tauri)
+src-tauri/target/
+
+# Tauri generated schemas
+src-tauri/gen/
+
+# Frontend
+ui/node_modules/
+ui/dist/
+
+# macOS
+.DS_Store
