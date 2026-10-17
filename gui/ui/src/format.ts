@@ -8,3 +8,12 @@ export function formatTokens(n: number): string {
   }
   return String(n);
 }
+
+// Collapse text onto one line and clip it to `max` chars with a trailing
+// ellipsis, for block titles that preview longer content (mirrors the Rust
+// side's 48-char truncation).
+export function truncateLine(text: string, max: number): string {
+  const oneLine = text.replace(/\s+/g, " ").trim();
+  if (oneLine.length <= max) return oneLine;
+  return `${oneLine.slice(0, max)}…`;
+}

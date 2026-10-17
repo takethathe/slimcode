@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { ToolStatus } from "../transcript";
+import { truncateLine } from "../format";
 
 // A tool invocation card: name + status badge, with the raw JSON arguments
 // and the tool's result collapsed by default (spec user stories 5-6).
@@ -38,6 +39,68 @@ function prettyJson(raw: string): string {
   }
 }
 
+// Extract the shell command from a bash tool's JSON arguments, or `null`
+// when the payload doesn't carry one.
+function bashCommand(argumentsRaw: string): string | null {
+  try {
+    const parsed = JSON.parse(argumentsRaw) as { command?: unknown };
+    return typeof parsed.command === "string" && parsed.command.length > 0
+      ? parsed.command
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+type ToolArgs = Record<string, unknown>;
+
+function str(args: ToolArgs, key: string): string | null {
+  const value = args[key];
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+// The header's content preview per tool: bash shows the command, file
+// tools (read/write/edit/ls) the path, grep/find pattern + path; unknown
+// tools have no preview and keep the bare name as the title.
+function titlePreview(
+  name: string,
+  argumentsRaw: string,
+): string | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(argumentsRaw);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const args = parsed as ToolArgs;
+  switch (name) {
+    case "bash":
+      return str(args, "command");
+    case "read":
+    case "write":
+    case "edit":
+    case "ls":
+      return str(args, "path");
+    case "grep": {
+      const pattern = str(args, "pattern");
+      if (!pattern) return str(args, "path");
+      const path = str(args, "path");
+      return path ? `"${pattern}" in ${path}` : `"${pattern}"`;
+    }
+    case "find": {
+      const parts: string[] = [];
+      const path = str(args, "path");
+      if (path) parts.push(path);
+      const pattern = str(args, "pattern");
+      if (pattern) parts.push(`"${pattern}"`);
+      return parts.length > 0 ? parts.join(" ") : null;
+    }
+    default:
+      return null;
+  }
+}
+
 export function ToolCard({
   name,
   status,
@@ -50,6 +113,10 @@ export function ToolCard({
   result: string;
 }) {
   const [expanded, setExpanded] = useState(false);
+  // The header titles the tool's key argument (truncated); the full
+  // arguments stay available in the expanded view.
+  const command = name === "bash" ? bashCommand(argumentsRaw) : null;
+  const preview = titlePreview(name, argumentsRaw);
   const border =
     status === "error"
       ? "border-red-200"
@@ -64,9 +131,20 @@ export function ToolCard({
         onClick={() => setExpanded((e) => !e)}
         className="flex w-full items-center gap-2 px-3 py-2 text-left"
       >
-        <span className="font-mono text-sm font-medium text-slate-800">
-          {name}
-        </span>
+        {preview ? (
+          <>
+            <span className="shrink-0 font-mono text-xs font-medium uppercase tracking-wide text-slate-500">
+              {name}
+            </span>
+            <span className="min-w-0 truncate font-mono text-sm font-medium text-slate-800">
+              {truncateLine(preview, 60)}
+            </span>
+          </>
+        ) : (
+          <span className="font-mono text-sm font-medium text-slate-800">
+            {name}
+          </span>
+        )}
         <StatusBadge status={status} />
         <span className="ml-auto text-slate-400">
           <svg
@@ -84,7 +162,16 @@ export function ToolCard({
       </button>
       {expanded ? (
         <div className="border-t border-slate-100 px-3 py-2 space-y-2">
-          {argumentsRaw ? (
+          {command ? (
+            <div>
+              <div className="text-xs font-medium text-slate-500 mb-1">
+                Command
+              </div>
+              <pre className="overflow-x-auto whitespace-pre-wrap rounded bg-slate-50 px-2 py-1.5 font-mono text-xs text-slate-700">
+                {command}
+              </pre>
+            </div>
+          ) : argumentsRaw ? (
             <div>
               <div className="text-xs font-medium text-slate-500 mb-1">
                 Arguments
