@@ -129,7 +129,7 @@ fn cache_hit_percent(u: &TokenUsage) -> String {
 }
 
 /// The per-frontend component that turns `DisplayItem`s into frontend output —
-/// text lines for the CLI, widget state for the TUI (CONTEXT.md: Renderer).
+/// text lines for the CLI, widget state for the TUI (GLOSSARY.md: Renderer).
 ///
 /// Errors stay `String`, matching the existing agent error style (ADR-0004).
 pub trait Renderer {

@@ -7,7 +7,7 @@ slimcode：Rust 实现的 coding agent。
 每步的完成判据（gate）过了才进下一步：
 
 1. **需求分析** — 写清问题、边界、验收标准。
-2. **计划** — 读 `CONTEXT.md` 与涉及的 `docs/adr/`，列出步骤与影响范围。
+2. **计划** — 读 `GLOSSARY.md` 与涉及的 `docs/adr/`，列出步骤与影响范围。
 3. **TDD** — red → green → refactor。
 4. **测试** — `cargo test` 全绿。
 5. **文档** — 影响架构 / 接口 / 用法的改动，同步更新 `docs/` 里对应的文档（索引 `docs/index.md`）。
@@ -50,7 +50,7 @@ Default triage roles. See `docs/agents/triage-labels.md`.
 
 ### Domain docs
 
-Single-context: root `CONTEXT.md` + `docs/adr/`. See `docs/agents/domain.md`.
+Single-context: root `GLOSSARY.md` + `docs/adr/`. See `docs/agents/domain.md`.
 
 <!-- CODEGRAPH_START -->
 ## CodeGraph

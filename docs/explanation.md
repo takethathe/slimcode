@@ -25,7 +25,7 @@ tool → …）。这组消息在交给运行时之前，由前端无关的 `Con
 仓库根，无 git 时回退到 OS 用户主目录），渲染为 `## Environment` 章节放在基础
 提示之后、上下文文件之前，让模型无需探测文件系统就知道平台与全局/项目根目录。
 
-关键区分（见 `CONTEXT.md` 词条）：**Context** 是一次构建的产物；**message
+关键区分（见 `GLOSSARY.md` 词条）：**Context** 是一次构建的产物；**message
 history**（`session.messages`）是会话中已发生的消息，可被当作 Context 的
 `with_history` 输入继续构建；**input history**（前端输入历史）与上下文组装
 无关。

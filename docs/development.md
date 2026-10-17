@@ -224,7 +224,7 @@ provider config seam 见 ADR-0016，hook seam 见 ADR-0015）。折入自 ticket
   `cleanup_empty` 在启动时静默清理当前项目内重放不到任何 assistant 消息的 `.jsonl`；
 - `history`：`HistoryStore`（`~/.slimcode/history.json`，JSON 数组，上限 500 条丢最旧）
   记录 `input history`（仅普通 prompt，不含 `/` 命令），与会话 `message history` 严格区分
-  （见 CONTEXT.md）；
+  （见 GLOSSARY.md）；
 - `skills`：`Skill` 模型 + `SkillStore`（前端无关）：`SKILL.md` 的 YAML 风格
   frontmatter（`name` / `description` / `disable-model-invocation`）解析、
   user（`<home>/skills/`）与 project（`<cwd>/.slimcode/skills/`）两 scope 的**递归深搜**
