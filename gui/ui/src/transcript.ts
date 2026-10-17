@@ -11,7 +11,13 @@
 //   - `compacted` renders a collapsible notice;
 //   - a user `message` opens a user block; an assistant `message` closes the
 //     current assistant block.
+// Skill / command emphasis is derived from message text (ADR-0027), not the
+// wire: a user message starting with a `<skill>` block becomes a user block
+// carrying a skill Transcript chip (its XML hidden), a leading `/{token}`
+// carries a command chip, and a `read` whose result starts with `<skill>` is
+// replaced in place by a Skill active block. Live and resume share these rules.
 
+import type { Chip } from "./chip";
 import type {
   AgentMessage,
   GuiWireEvent,
@@ -20,8 +26,12 @@ import type {
 
 export type ToolStatus = "running" | "ok" | "error";
 
+// The chip types live in the shared chip module (used by both the transcript
+// and the input box); re-exported here so the block model reads self-contained.
+export type { Chip, ChipCategory } from "./chip";
+
 export type Block =
-  | { id: string; kind: "user"; text: string }
+  | { id: string; kind: "user"; text: string; chip: Chip | null }
   | {
       id: string;
       kind: "assistant";
@@ -38,6 +48,10 @@ export type Block =
       status: ToolStatus;
       result: string;
     }
+  // Skill active block: shown in place of the `read` tool card when the model
+  // activates a skill by reading its `SKILL.md` (the read result is a `<skill>`
+  // block). The user-trigger path instead surfaces a skill chip in a user block.
+  | { id: string; kind: "skill"; name: string }
   | { id: string; kind: "usage"; usage: TokenUsage }
   | { id: string; kind: "compacted"; before: number; after: number | null }
   | { id: string; kind: "error"; text: string };
@@ -66,7 +80,7 @@ function reduceBlock(state: Block[], event: GuiWireEvent): Block[] {
       const message = event.message;
       if (message.kind !== "llm") break;
       if (message.role === "user") {
-        blocks.push({ id: nextId(), kind: "user", text: textOf(message) });
+        blocks.push(userBlock(nextId(), textOf(message)));
       } else if (message.role === "assistant") {
         // Close the in-progress assistant block (if any).
         const last = blocks[blocks.length - 1];
@@ -129,11 +143,21 @@ function reduceBlock(state: Block[], event: GuiWireEvent): Block[] {
         (b) => b.kind === "tool" && b.callId === event.tool_call_id,
       );
       if (index >= 0) {
-        blocks[index] = {
-          ...(blocks[index] as Extract<Block, { kind: "tool" }>),
-          status: event.ok ? "ok" : "error",
-          result: event.result,
-        };
+        const tool = blocks[index] as Extract<Block, { kind: "tool" }>;
+        // Only a `read` is a skill-activation candidate (mirrors the CLI
+        // renderer, which suppresses the card only for a skill-serving read).
+        const skill = tool.name === "read" ? parseSkillBlock(event.result) : null;
+        if (skill) {
+          // A skill-serving `read` becomes a Skill active block in place, so
+          // the activation is not shown twice (spec: asymmetric rendering).
+          blocks[index] = { id: tool.id, kind: "skill", name: skill.name };
+        } else {
+          blocks[index] = {
+            ...tool,
+            status: event.ok ? "ok" : "error",
+            result: event.result,
+          };
+        }
       }
       break;
     }
@@ -186,6 +210,79 @@ function textOf(message: Extract<AgentMessage, { kind: "llm" }>): string {
   return message.parts.map((part) => part.text).join("");
 }
 
+/** Parse a `<skill>` activation block. Mirrors `slimcode_app::skills::parse_skill_block`:
+ *  only when `text` *starts with* `<skill name="…"` does it yield the skill's
+ *  `name` and inner `content`; anything else (a mid-text mention, an
+ *  unterminated tag, plain prose) yields `null`. A trailing task argument after
+ *  `</skill>` stays outside the returned content. */
+export function parseSkillBlock(text: string): { name: string; content: string } | null {
+  const rest = stripPrefix(text, '<skill name="');
+  if (rest === null) return null;
+  const atQuote = rest.indexOf('" location="');
+  if (atQuote < 0) return null;
+  const name = rest.slice(0, atQuote);
+  const afterLoc = stripPrefix(rest.slice(atQuote), '" location="');
+  if (afterLoc === null) return null;
+  const atTag = afterLoc.indexOf('">\n');
+  if (atTag < 0) return null;
+  const body = afterLoc.slice(atTag + '">\n'.length);
+  const atClose = body.indexOf("\n</skill>");
+  if (atClose < 0) return null;
+  return { name, content: body.slice(0, atClose) };
+}
+
+function stripPrefix(text: string, prefix: string): string | null {
+  return text.startsWith(prefix) ? text.slice(prefix.length) : null;
+}
+
+/** Extract the leading command token (`/{token}`) from user text, if present.
+ *  A bare `/` or `/` followed by whitespace is not a token. Returns the token
+ *  (slash included) and the remaining body. */
+function leadingCommandToken(
+  text: string,
+): { token: string; rest: string } | null {
+  const trimmed = text.replace(/^\s+/, "");
+  if (!trimmed.startsWith("/")) return null;
+  const after = trimmed.slice(1);
+  if (after.length === 0 || /^\s/.test(after)) return null;
+  const space = after.search(/\s/);
+  if (space < 0) return { token: `/${after}`, rest: "" };
+  return {
+    token: `/${after.slice(0, space)}`,
+    rest: after.slice(space).replace(/^\s+/, ""),
+  };
+}
+
+/** Build a user block from raw message text: detect a skill trigger first, then
+ *  a command token, else plain text. Skill triggers hide the XML and show a
+ *  `/{name}` chip plus any trailing task argument. */
+function userBlock(id: string, text: string): Block {
+  const skill = parseSkillBlock(text);
+  if (skill) {
+    // Slice the trailing task argument at the same boundary the parser uses
+    // (`\n</skill>`), so an inline `</skill>` inside the skill body never leaks
+    // the XML tail into the block.
+    const close = text.indexOf("\n</skill>");
+    const arg = close < 0 ? "" : text.slice(close + "\n</skill>".length).trim();
+    return {
+      id,
+      kind: "user",
+      chip: { category: "skill", token: `/${skill.name}` },
+      text: arg,
+    };
+  }
+  const command = leadingCommandToken(text);
+  if (command) {
+    return {
+      id,
+      kind: "user",
+      chip: { category: "command", token: command.token },
+      text: command.rest,
+    };
+  }
+  return { id, kind: "user", chip: null, text };
+}
+
 /** Build the transcript from a resumed session's history. */
 export function blocksFromHistory(messages: AgentMessage[]): Block[] {
   const blocks: Block[] = [];
@@ -205,7 +302,7 @@ export function blocksFromHistory(messages: AgentMessage[]): Block[] {
       continue;
     }
     if (message.role === "user") {
-      blocks.push({ id: nextId(), kind: "user", text: textOf(message) });
+      blocks.push(userBlock(nextId(), textOf(message)));
       continue;
     }
     if (message.role === "assistant") {
@@ -240,11 +337,20 @@ export function blocksFromHistory(messages: AgentMessage[]): Block[] {
       if (callId) {
         const index = pending.get(callId);
         if (index !== undefined && blocks[index] && blocks[index].kind === "tool") {
-          blocks[index] = {
-            ...(blocks[index] as Extract<Block, { kind: "tool" }>),
-            status: "ok",
-            result: textOf(message),
-          };
+          const tool = blocks[index] as Extract<Block, { kind: "tool" }>;
+          const result = textOf(message);
+          const skill = tool.name === "read" ? parseSkillBlock(result) : null;
+          if (skill) {
+            // Same rule as the live stream: a skill-serving read is replaced
+            // in place by a Skill active block.
+            blocks[index] = { id: tool.id, kind: "skill", name: skill.name };
+          } else {
+            blocks[index] = {
+              ...tool,
+              status: "ok",
+              result,
+            };
+          }
           pending.delete(callId);
         }
       }

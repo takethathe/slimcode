@@ -42,6 +42,20 @@ references, scripts, …) so the model finds the instructions in the earlier mes
 instead of reloading.
 _Avoid_: plugin, extension
 
+**Skill active block**:
+The display unit a Frontend shows when a Skill is activated, standing in for the raw
+`<skill>` text so the reader sees an activation, not an XML dump. It has two arrival
+paths that render distinctly: a **user-triggered** skill (a leading `/skill:name` or
+`/{name}`) is a Prompt, so it lands in the Transcript as the user's own message with
+its trigger token emphasised (a Transcript chip); a **model-activated** skill (the model
+`read`s the skill's own `SKILL.md`, which the SDK serves as the `<skill>` block) has no
+user message, so it renders as its own dedicated block — a `[skill] <name>` line in the
+TUI, a `Skill "<name>" activated` notice in the GUI. A Frontend tells the two paths apart
+by detecting the `<skill>` block in the message/tool-result text (a skill-reading tool
+result and a skill-trigger prompt both start with it), so live streaming and a session
+replay render the same skill block; no separate activation event crosses the wire.
+_Avoid_: skill invocation message, skill card, skill notice (a specific GUI spelling)
+
 **Session**:
 A conversation with a stable id, timestamp, message history, optional title, and its own in-memory
 token usage; persisted as an append-only session log and restorable through the Session picker
@@ -244,6 +258,15 @@ start of the input, to emphasise that the leading token is a Command rather than
 only while that token is an exact, recognised candidate spelling (the popup closed). A display-only
 overlay — the buffer stays editable plain text.
 _Avoid_: pill, tag, token (bare — collides with LLM tokens)
+
+**Transcript chip**:
+The inline badge a Frontend renders inside an already-submitted Transcript block to emphasise
+a leading `/` token as a Command or Skill rather than prose — the submitted-side sibling of the
+input-side Command chip. It decorates a user message whose text starts with `/{token}`: a
+Skill-trigger token (reconstructed from a leading `<skill>` block) and a Command token read
+distinct colours; ordinary prompt text gets no chip. A display-only styling of the message's
+own leading token, not a separate Transcript block.
+_Avoid_: pill, tag, badge (bare), Command chip (the input-side twin)
 
 **Frontend**:
 One of slimcode's user-facing entry surfaces: the `slimcode` CLI (one entry point driving one-shot text and the interactive TUI, ADR-0022) and the GUI 前端 (a Tauri desktop app). Each frontend owns its display adapters, `/` command semantics, input history and session picker, and drives turns through the SDK.

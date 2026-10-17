@@ -4,6 +4,7 @@ import { ToolCard } from "./ToolCard";
 import { ReasoningBlock } from "./ReasoningBlock";
 import { CompactNotice } from "./CompactNotice";
 import { UsageLine } from "./UsageLine";
+import { ChipBadge } from "./Chip";
 
 // The transcript area: renders the block list with auto-follow scrolling —
 // it sticks to the bottom while the user is near it and pauses while the
@@ -71,36 +72,42 @@ export function Transcript({
   );
 }
 
+// Transcript chip: an inline rounded badge wrapping a leading `/{token}`, the
+// submitted-side sibling of the input-side Command chip. Colour comes from the
+// shared ChipBadge (skill teal, command amber).
 function BlockView({ block }: { block: Block }) {
   switch (block.kind) {
     case "user":
       return (
-        <div className="flex gap-3">
-          <div className="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-full bg-indigo-100 text-xs font-semibold text-indigo-700">
-            You
-          </div>
-          <div className="min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-3 py-2 shadow-sm">
-            <pre className="whitespace-pre-wrap break-words font-mono text-sm leading-relaxed text-slate-800">
-              {block.text}
-            </pre>
-          </div>
+        <div className="rounded-lg bg-indigo-50 px-3 py-2">
+          <p className="whitespace-pre-wrap break-words font-mono text-sm font-bold leading-relaxed text-indigo-900">
+            {block.chip ? (
+              <ChipBadge
+                category={block.chip.category}
+                token={block.chip.token}
+                className="mr-1.5 align-middle"
+              />
+            ) : null}
+            {block.text}
+          </p>
         </div>
       );
     case "assistant":
       return (
-        <div className="flex gap-3">
-          <div className="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-full bg-slate-200 text-xs font-semibold text-slate-600">
-            AI
-          </div>
-          <div className="min-w-0 flex-1">
-            <ReasoningBlock text={block.reasoning} />
-            {block.text ? (
-              <pre className="whitespace-pre-wrap break-words font-mono text-sm leading-relaxed text-slate-800">
-                {block.text}
-                {block.complete ? "" : "▌"}
-              </pre>
-            ) : null}
-          </div>
+        <div className="min-w-0">
+          <ReasoningBlock text={block.reasoning} />
+          {block.text ? (
+            <pre className="whitespace-pre-wrap break-words font-mono text-sm leading-relaxed text-slate-800">
+              {block.text}
+              {block.complete ? "" : "▌"}
+            </pre>
+          ) : null}
+        </div>
+      );
+    case "skill":
+      return (
+        <div className="ml-9 border-l-4 border-indigo-400 bg-slate-100 px-3 py-2 font-mono text-sm text-slate-700">
+          Skill "{block.name}" activated
         </div>
       );
     case "tool":

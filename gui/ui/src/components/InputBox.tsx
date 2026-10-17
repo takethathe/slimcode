@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api";
 import { INTERCEPTED_COMMANDS } from "../commands";
+import { chipCategoryForCommitted, CHIP_TONE } from "../chip";
 import type { CompletionItem } from "../types";
 
 // The bottom input bar: a multi-line textarea with Enter-to-send and
@@ -45,6 +46,7 @@ export function InputBox({
   const [dismissedToken, setDismissedToken] = useState<string | null>(null);
   const [selectedValue, setSelectedValue] = useState<string | null>(null);
   const ref = useRef<HTMLTextAreaElement>(null);
+  const mirrorRef = useRef<HTMLDivElement>(null);
 
   // The leading `/` token: the first run of non-whitespace, but only when the
   // buffer starts with `/`. An empty string means no completion context.
@@ -91,12 +93,21 @@ export function InputBox({
     return 0;
   }, [candidates, selectedValue]);
 
-  // The Command chip: a recognised, committed token shown while the popup is
-  // closed (display-only; the buffer stays plain text).
+  // The Command chip: a recognised, committed token, emphasised *inline* in the
+  // input via a highlight mirror behind the (transparent-text) textarea — the
+  // same teal/amber reading as the Transcript chip. It shows only while the
+  // popup is closed and the token is an exact candidate spelling; the buffer
+  // stays plain editable text.
   const chip = useMemo(() => {
     if (!token || popupOpen) return null;
     const match = candidates.find((c) => c.value === token);
-    return match ? { value: match.value, description: match.description } : null;
+    return match
+      ? {
+          value: match.value,
+          description: match.description,
+          category: chipCategoryForCommitted(match.value),
+        }
+      : null;
   }, [token, popupOpen, candidates]);
 
   // Focus the input on mount and whenever the send path re-enables after a
@@ -126,6 +137,13 @@ export function InputBox({
     if (candidates.length === 0) return;
     const next = (trackedIndex + delta + candidates.length) % candidates.length;
     setSelectedValue(candidates[next].value);
+  }
+
+  // Keep the highlight mirror aligned when the textarea scrolls internally.
+  function onScroll(e: React.UIEvent<HTMLTextAreaElement>): void {
+    if (mirrorRef.current) {
+      mirrorRef.current.scrollTop = e.currentTarget.scrollTop;
+    }
   }
 
   function submit(): void {
@@ -202,27 +220,42 @@ export function InputBox({
           </ul>
         </div>
       ) : null}
-      {chip ? (
-        <div className="pointer-events-none absolute bottom-full left-4 z-10 mb-1 flex items-center gap-2">
-          <span className="rounded-md bg-indigo-100 px-2 py-0.5 font-mono text-xs font-medium text-indigo-700 ring-1 ring-inset ring-indigo-200">
-            {chip.value}
-          </span>
-          {chip.description ? (
-            <span className="text-xs text-slate-400">{chip.description}</span>
-          ) : null}
-        </div>
-      ) : null}
       <div className="mx-auto flex max-w-3xl items-end gap-2">
-        <textarea
-          ref={ref}
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          onKeyDown={onKeyDown}
-          rows={1}
-          placeholder="Type a prompt… (/ for commands, Enter to send, Shift+Enter for a newline)"
-          disabled={disabled}
-          className="max-h-48 min-h-10 flex-1 resize-none rounded-lg border border-slate-200 bg-white px-3 py-2 font-mono text-sm text-slate-800 shadow-sm outline-none placeholder:font-sans placeholder:text-slate-400 focus:border-indigo-300 focus:ring-2 focus:ring-indigo-100 disabled:opacity-50"
-        />
+        <div className="relative flex-1 overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm focus-within:border-indigo-300 focus-within:ring-2 focus-within:ring-indigo-100">
+          {/* Highlight mirror: identical metrics to the textarea, sitting behind
+              its transparent text so the recognised leading token reads as a
+              chip inline. The token span adds no horizontal padding, so glyph
+              advance (monospace) matches the caret exactly. */}
+          <div
+            ref={mirrorRef}
+            aria-hidden
+            className="pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words px-3 py-2 font-mono text-sm leading-relaxed text-slate-800"
+          >
+            {chip ? (
+              <>
+                <span
+                  className={`rounded ring-1 ring-inset ${CHIP_TONE[chip.category]}`}
+                >
+                  {chip.value}
+                </span>
+                {text.slice(chip.value.length)}
+              </>
+            ) : (
+              text
+            )}
+          </div>
+          <textarea
+            ref={ref}
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            onScroll={onScroll}
+            onKeyDown={onKeyDown}
+            rows={1}
+            placeholder="Type a prompt… (/ for commands, Enter to send, Shift+Enter for a newline)"
+            disabled={disabled}
+            className="relative z-10 block max-h-48 min-h-10 w-full resize-none overflow-y-auto bg-transparent px-3 py-2 font-mono text-sm leading-relaxed text-transparent caret-slate-800 shadow-sm outline-none placeholder:font-sans placeholder:text-slate-400 disabled:opacity-50"
+          />
+        </div>
         {running ? (
           <button
             type="button"

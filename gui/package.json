@@ -7,6 +7,7 @@
     "postinstall": "npm --prefix ui install --no-audit --no-fund",
     "dev": "tauri dev",
     "build": "tauri build",
+    "test": "npm --prefix ui run test",
     "tauri": "tauri"
   },
   "devDependencies": {

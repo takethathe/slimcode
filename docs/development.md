@@ -812,7 +812,7 @@ gui/
   矩阵不受影响；GUI 自己的 Rust 测试在 `gui/src-tauri` 内跑（FakeProvider + `with_home(scratch)`
   注入，沿用 `crates/sdk/tests/` 模式，离线无 key），前端 v1 手动验收；
   - Rust 门禁：在 `gui/src-tauri` 里 `cargo fmt` / `cargo clippy --all-targets --all-features -- -D warnings` / `cargo test`；
-  - 前端门禁：在 `gui/ui` 里 `npx tsc --noEmit` / `npm run build`；
+  - 前端门禁：在 `gui/ui` 里 `npx tsc --noEmit` / `npm run build`；reducer 单测（Vitest，ADR-0027 D3）在 `gui/ui` 里 `npm test`（或从 `gui/` 聚合 `npm test`），渲染层仍手动验收；
   - 开发运行：`cd gui && npm install && npm run dev`（= `tauri dev`）；打包 `npm run build`（= `tauri build`，
     在 macOS 产出 `src-tauri/target/release/bundle/` 下的 .app 与 .dmg）。Tauri CLI 把**含 `package.json`
     的那层**（`gui/`，即 app root）当项目根，`beforeDevCommand` / `beforeBuildCommand` 的 CWD 也是它，
