@@ -15,6 +15,12 @@ pub mod controller;
 pub mod settings;
 pub mod wire;
 
+/// The debug-only webview screenshot watcher: built into debug macOS builds
+/// only, so release bundles and other platforms carry none of it (see the
+/// module docs and `docs/development.md`).
+#[cfg(all(debug_assertions, target_os = "macos"))]
+pub mod devshot;
+
 use std::path::PathBuf;
 
 use slimcode_app::config;
@@ -36,6 +42,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     tauri::Builder::default()
         .manage(controller)
+        .setup(|app| {
+            // Start the debug screenshot watcher before the window is drawn;
+            // it is a background thread that only reacts to a trigger file.
+            #[cfg(all(debug_assertions, target_os = "macos"))]
+            devshot::spawn(app.handle().clone());
+            // Where the watcher is not compiled in, setup has no work left.
+            #[cfg(not(all(debug_assertions, target_os = "macos")))]
+            let _ = app;
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::new_session,
             commands::resume_session,

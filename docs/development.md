@@ -802,4 +802,16 @@ gui/
     的那层**（`gui/`，即 app root）当项目根，`beforeDevCommand` / `beforeBuildCommand` 的 CWD 也是它，
     所以脚本写 `npm --prefix ui ...`；在 `gui/ui` 里跑 CLI 会报 “Couldn't recognize the current folder
     as a Tauri project”，在 `gui/src-tauri` 里跑则会把 `../ui` 解析到仓库上级；
+- **调试截图（仅 macOS 的 debug 构建）**：Tauri 自身没有截图 API（`WebviewWindow` 只有窗口/图标/主题类
+  方法），macOS WKWebView 的 Web Inspector 协议里也没有截图命令（那是 Chrome DevTools Protocol / Windows
+  WebView2 的东西）。唯一真实通路是 `WKWebView takeSnapshotWithConfiguration:completionHandler:`，经 Tauri
+  的官方逃生舱 `with_webview` 拿到裸指针，实现在 `gui/src-tauri/src/devshot.rs`。宿主起一个 watcher 线程，
+  约定目录 `/tmp/slimcode-gui-dev`（`SLIMCODE_DEVSHOT_DIR` 可覆盖）与三个文件：`trigger`（出现即请求一次截图）、
+  `shot.png`（结果，先写 tmp 再 rename，原子发布）、`shot.error`（失败原因）。取图：
+  `rm -f /tmp/slimcode-gui-dev/shot.png /tmp/slimcode-gui-dev/shot.error; touch /tmp/slimcode-gui-dev/trigger`，
+  然后等 `shot.png` 出现（存在即成功，`shot.error` 即失败）。这段代码在 release 构建与非 macOS 上完全不存在
+  （`cfg(all(debug_assertions, target_os = "macos"))`）；前端与 agent 的工具面都碰不到它 —— 图是给开发
+  harness 看的，slimcode 的 wire 消息只有文本 part（`slimcode-ai` 的 `Part::Text`），模型看不到图。
+  注：objc2 那几个依赖无法同样按 `debug_assertions` 门控（Cargo 的 `target.'cfg(..)'.dependencies` 不接受该
+  值），所以 macOS release 构建仍会编译这些绑定，只是模块被 dead-strip。
 - **规格**：`.scratch/gui/spec.md`（Tauri command 面、wire 事件表、验收标准）。

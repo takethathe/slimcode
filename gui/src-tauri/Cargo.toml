@@ -26,5 +26,47 @@ toml = "0.8"
 slimcode-app = { path = "../../crates/app" }
 slimcode-sdk = { path = "../../crates/sdk" }
 
+# Debug-only webview screenshot of the GUI frontend (docs/development.md).
+# The code is compiled only into debug macOS builds (`cfg(all(debug_assertions,
+# target_os = "macos"))` in lib.rs); the dependencies cannot be gated the same
+# way, because Cargo refuses `debug_assertions` in `target.'cfg(..)'.
+# dependencies`. Cost: a release macOS build compiles these bindings and
+# dead-strips the module. Features are an explicit allowlist
+# (default-features = false): these crates' defaults enable every generated
+# AppKit / WebKit class. Versions are pinned to what wry already resolved, so
+# nothing new enters the graph.
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2 = { version = "0.6", features = ["alloc"] }
+objc2-app-kit = {
+    version = "0.3",
+    default-features = false,
+    features = [
+        "std",
+        "objc2-core-foundation",
+        "NSBitmapImageRep",
+        "NSImageRep",
+        "NSGraphics",
+        "NSImage",
+    ],
+}
+objc2-foundation = {
+    version = "0.3",
+    default-features = false,
+    features = ["std", "NSData", "NSDictionary", "NSGeometry", "NSError"],
+}
+objc2-web-kit = {
+    version = "0.3",
+    default-features = false,
+    features = [
+        "std",
+        "objc2-core-foundation",
+        "objc2-app-kit",
+        "block2",
+        "WKWebView",
+        "WKSnapshotConfiguration",
+    ],
+}
+
 [dev-dependencies]
 tempfile = "3"
