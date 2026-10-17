@@ -1,0 +1,15 @@
+{
+  "name": "slimcode-gui",
+  "private": true,
+  "version": "0.1.0",
+  "description": "slimcode GUI: the Tauri desktop frontend (host at ./src-tauri, React UI at ./ui)",
+  "scripts": {
+    "postinstall": "npm --prefix ui install --no-audit --no-fund",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.12.3"
+  }
+}

@@ -303,8 +303,58 @@ token 的剩余上下文（即估算总量 ≥ 200k 窗口 − 16k），就在�
 - 完全无法匹配时提示运行 `/help`。
 
 `/help` 的命令列表、启动时的命令提示条也由同一注册表生成，保证单一事实来源；
-未来其它前端（Web / RPC 等）可复用同一套命令定义、补全与上下文组装逻辑。**Skill** 也以 `/` 触发，
+其它前端可复用同一套命令定义、补全与上下文组装逻辑（GUI v1 只有 prompt 输入，未接这套 `/`
+命令面）。**Skill** 也以 `/` 触发，
 未知 `/` 命令的预测提示与补全弹框都会把内置命令与已安装 skill 合并展示（见下节 Skills）。
+
+### 桌面 GUI
+
+除 TUI 外还有一个 Tauri 桌面应用（`gui/`，ADR-0024）：原生窗口 + Web 技术界面，直接内嵌
+`slimcode-sdk`，不依赖 `slimcode` 二进制。
+
+前置：Rust 与 cargo、Node.js（Vite 8 要求 `^20.19` 或 `>=22.12`）、macOS 需要 Xcode
+Command Line Tools。首次安装：
+
+```bash
+cd gui
+npm install     # 会一并装好 gui/ui 的前端依赖
+```
+
+启动：
+
+```bash
+npm run dev     # 开发模式：vite 在 localhost:1420 + 原生窗口，前端热重载
+npm run build   # 打包：macOS 产出 .app 与 .dmg 到 src-tauri/target/release/bundle/
+```
+
+GUI 以**启动进程的工作目录**作为项目目录（和 CLI 一样按项目分区），因此要在目标项目目录里
+启动它才能看到该项目的会话列表——打包后：
+
+```bash
+cd /path/to/repo
+"/path/to/gui/src-tauri/target/release/bundle/macos/slimcode GUI.app/Contents/MacOS/slimcode-gui"
+```
+
+（开发模式下宿主的工作目录是 `gui/src-tauri`，看到的是那个目录的项目空间。）
+
+界面：左侧是当前项目的已保存会话（标题 + 时间，点击恢复、可删除），顶部显示会话标题、模型名
+与上下文占用（如 `45.3%/200k`，随阈值变色），中间是转录（文本流式追加、推理可折叠、工具卡片
+带运行中 / 成功 / 失败状态且可展开看结果、token 用量行、压缩提示），底部是输入框（`Enter` 发送、
+`Shift+Enter` 换行，运行中可中止当前回合）。
+
+配置：与 CLI/TUI 共享会话仓库和配置的其余三层，但 GUI 的设置面板（右上角齿轮）只写
+`slimcode_home/gui.toml`（默认 `~/.slimcode/gui.toml`，`SLIMCODE_HOME` 可覆盖目录），
+**不碰**共享的 `config.toml`，因此 GUI 里改配置不影响 CLI/TUI：
+
+```toml
+model = "qwen-plus"                                               # 可选
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"   # 可选
+cache = true                                                     # 可选
+api_key = "sk-..."                                               # 可选，明文（写入后自动 chmod 600）
+```
+
+未设置的字段沿用四层优先级（env / `config.toml` / 默认值）；API key 缺省同样取
+`DASHSCOPE_API_KEY`。
 
 ### Skills（技能）
 

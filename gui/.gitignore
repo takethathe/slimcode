@@ -4,7 +4,8 @@ src-tauri/target/
 # Tauri generated schemas
 src-tauri/gen/
 
-# Frontend
+# Node
+node_modules/
 ui/node_modules/
 ui/dist/
 

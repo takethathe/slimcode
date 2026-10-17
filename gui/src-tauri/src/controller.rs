@@ -633,6 +633,10 @@ mod tests {
         }
     }
 
+    /// `(base_url, model, cache)` overrides seen per call, as `FakeProvider`
+    /// records them.
+    type SeenOverrides = Arc<Mutex<Vec<(String, String, bool)>>>;
+
     /// A scripted provider (the SDK's pattern): each `chat` returns the next
     /// delta batch, records the `ProviderConfig` it was handed (so tests can
     /// assert the settings overrides reached the provider), and optionally
@@ -646,7 +650,7 @@ mod tests {
         /// Cancel the shared token before the `n`-th `chat` call (1-based).
         cancels_on: Option<usize>,
         /// `(base_url, model, cache)` seen per call, appended by `chat`.
-        seen: Arc<Mutex<Vec<(String, String, bool)>>>,
+        seen: SeenOverrides,
     }
 
     impl FakeProvider {
@@ -1219,7 +1223,6 @@ mod tests {
                 base_url: Some("https://a.invalid/v1".into()),
                 cache: Some(true),
                 api_key: Some("sk-a".into()),
-                ..GuiSettings::default()
             })
             .expect("set settings");
 
@@ -1244,7 +1247,6 @@ mod tests {
                 base_url: Some("https://b.invalid/v1".into()),
                 cache: Some(false),
                 api_key: Some("sk-b".into()),
-                ..GuiSettings::default()
             })
             .expect("set settings");
 
@@ -1369,7 +1371,7 @@ mod tests {
     fn fake_provider(
         script: Vec<Vec<Delta>>,
         per_call: TokenUsage,
-    ) -> (FakeProvider, Arc<Mutex<Vec<(String, String, bool)>>>) {
+    ) -> (FakeProvider, SeenOverrides) {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let provider = FakeProvider {
             script,

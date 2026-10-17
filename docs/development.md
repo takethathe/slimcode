@@ -756,10 +756,11 @@ stdlib-only 的 mock SSE 端点覆盖，`cargo test` 因此离线、无需 key�
 agent 能力——不走 FFI（FFI 是给非 Rust 宿主的，Tauri 后端本身就是 Rust），不 spawn `slimcode`
 二进制。
 
-目录结构（独立于 cargo workspace，自己的 Cargo.toml / Cargo.lock / package.json）：
+目录结构（独立于 cargo workspace，自己的 Cargo.toml / Cargo.lock 与两个 package.json）：
 
 ```
 gui/
+├── package.json          # app root：Tauri CLI devDependency + dev/build 脚本（postinstall 装 ui 依赖）
 ├── src-tauri/            # Tauri 宿主
 │   ├── src/
 │   │   ├── main.rs       # bin：调用 lib.rs 的 run()
@@ -769,7 +770,7 @@ gui/
 │   │   ├── settings.rs   # gui.toml 读写（api_key 写入 0600）
 │   │   └── commands.rs   # #[tauri::command] 面（薄壳转发，无逻辑）
 │   └── tauri.conf.json   # 标识符 slimcode-gui
-└── ui/                   # React + Vite + Tailwind 前端
+└── ui/                   # React + Vite + Tailwind 前端（自己的 package.json / tsconfig / vite.config）
 ```
 
 宿主逻辑收敛在纯 Rust 的 `AppController`（`controller.rs`）上，Tauri command 只是它的薄壳转发层
@@ -785,6 +786,9 @@ gui/
   穷尽 match（无 `_` 分支），`DisplayItem` 新增变体即编译失败；
 - **会话共享**：与 CLI/TUI 共用同一 slimcode_home 下的 JSONL 会话仓库（同一个
   `SessionStore.entries()` 出列表，`with_session_id` 续会），CLI 建的会话 GUI 能恢复、反之亦然；
+- **项目目录**：宿主用启动时的 `std::env::current_dir()` 作为项目目录（`resolve_project_home` →
+  按项目分区的会话仓库），所以 `tauri dev` 下是 `gui/src-tauri`（Tauri 在那儿起 `cargo run`），
+  要验证真实项目空间就从目标目录直接跑打包后的二进制；v1 无目录选择器（规格未要求）；
 - **设置**：`gui.toml`（slimcode_home 下）存 `model` / `base_url` / `cache` / 可选 `api_key`，
   启动读出作为 SDK overrides 传入；**绝不写 `config.toml`**（那是 CLI/TUI/GUI 共享的第三层，
   GUI 写它会静默改变其它前端行为）；api_key v1 明文 + 0600，Keychain 为 v2 增强；
@@ -793,6 +797,9 @@ gui/
   注入，沿用 `crates/sdk/tests/` 模式，离线无 key），前端 v1 手动验收；
   - Rust 门禁：在 `gui/src-tauri` 里 `cargo fmt` / `cargo clippy --all-targets --all-features -- -D warnings` / `cargo test`；
   - 前端门禁：在 `gui/ui` 里 `npx tsc --noEmit` / `npm run build`；
-  - 开发运行：在 `gui/` 里 `npx tauri dev`（`tauri.conf.json` 的 `beforeDevCommand` 路径相对它解析，
-    在 `gui/src-tauri` 里跑会把 `../ui` 解析到仓库上级）；
+  - 开发运行：`cd gui && npm install && npm run dev`（= `tauri dev`）；打包 `npm run build`（= `tauri build`，
+    在 macOS 产出 `src-tauri/target/release/bundle/` 下的 .app 与 .dmg）。Tauri CLI 把**含 `package.json`
+    的那层**（`gui/`，即 app root）当项目根，`beforeDevCommand` / `beforeBuildCommand` 的 CWD 也是它，
+    所以脚本写 `npm --prefix ui ...`；在 `gui/ui` 里跑 CLI 会报 “Couldn't recognize the current folder
+    as a Tauri project”，在 `gui/src-tauri` 里跑则会把 `../ui` 解析到仓库上级；
 - **规格**：`.scratch/gui/spec.md`（Tauri command 面、wire 事件表、验收标准）。
