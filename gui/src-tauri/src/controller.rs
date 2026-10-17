@@ -564,7 +564,10 @@ fn inject_test_seams(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{
+        MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    };
     use std::time::Duration;
 
     use slimcode_app::testutil::unique_temp_dir;
@@ -833,17 +836,40 @@ mod tests {
         }
     }
 
+    /// `std::env` is process-global, so the tests that point `SLIMCODE_HOME` /
+    /// `DASHSCOPE_API_KEY` at a scratch directory must not overlap: while one
+    /// test's turn is in flight, another test's [`EnvGuard::drop`] restores the
+    /// pre-test value (frequently *removing* the key), and the config
+    /// resolution underneath the running turn then fails with "no API key
+    /// configured". One mutex, taken by `EnvGuard::set` and held for the
+    /// guard's whole life, serialises exactly those tests. Poisoning is
+    /// ignored: the restoring `drop` runs during unwinding, so the environment
+    /// is always handed back intact. No test nests two guards, so the
+    /// non-reentrant lock cannot self-deadlock.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_env() -> MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// An environment guard restoring a variable's previous value on drop.
     struct EnvGuard {
         pairs: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        /// Declared last so it releases after `Drop::drop` restored the
+        /// environment: no other test can observe the window in between.
+        _serial: MutexGuard<'static, ()>,
     }
 
     impl EnvGuard {
         fn set(name: &'static str, value: PathBuf) -> Self {
+            let _serial = lock_env();
             let old = std::env::var_os(name);
             unsafe { std::env::set_var(name, value) };
             EnvGuard {
                 pairs: vec![(name, old)],
+                _serial,
             }
         }
 
