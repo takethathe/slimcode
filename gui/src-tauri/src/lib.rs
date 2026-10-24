@@ -26,6 +26,29 @@ use std::path::PathBuf;
 use slimcode_app::config;
 
 use controller::AppController;
+use tauri::Url;
+
+/// Decide whether a webview navigation to `target` stays on the app's own
+/// origin and may proceed (ADR-0028 runtime backstop). `current` is the
+/// webview's URL at the moment of the decision (`None` before any document is
+/// loaded).
+///
+/// The check compares the scheme, host and port rather than `Url::origin()`:
+/// the bundled app is served from a custom protocol (`tauri://localhost` on
+/// macOS/Linux), whose scheme is non-special, so the `url` crate hands back a
+/// freshly-generated *opaque* origin that is only ever equal to itself. Two
+/// parses of the very same custom-protocol URL therefore never compare equal,
+/// which would cancel every navigation (including the initial page load) and
+/// leave a blank window. A tuple-origin comparison (`http://localhost:1420` in
+/// dev) hides this; the explicit scheme/host/port match is correct for both.
+pub fn navigation_allowed(current: Option<&Url>, target: &Url) -> bool {
+    let Some(current) = current else {
+        return false;
+    };
+    current.scheme() == target.scheme()
+        && current.host_str() == target.host_str()
+        && current.port() == target.port()
+}
 
 /// The app's entry: build the Tauri application with the controller as
 /// managed state and the command shell registered. Returns the Tauri
@@ -49,12 +72,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     // exposes `on_navigation` only through the webview/plugin builders, not the
     // app builder, and windows are declared in `tauri.conf.json`.
     let nav_guard = tauri::plugin::Builder::<tauri::Wry>::new("nav-guard")
-        .on_navigation(|webview, target| {
-            webview
-                .url()
-                .map(|current| current.origin() == target.origin())
-                .unwrap_or(false)
-        })
+        .on_navigation(|webview, target| navigation_allowed(webview.url().ok().as_ref(), target))
         .build();
 
     tauri::Builder::default()

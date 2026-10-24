@@ -88,6 +88,14 @@ because they leave through the opener plugin (D4), never as webview navigations.
 as a plugin because Tauri v2 exposes `on_navigation` only on the webview/plugin builders, while
 the window itself is declared in `tauri.conf.json`.
 
+"Shares the webview's own origin" is decided by comparing scheme, host and port — **not**
+`Url::origin()`. The bundled app is served from a custom protocol (`tauri://localhost` on
+macOS/Linux), a non-special scheme for which the `url` crate returns a freshly-generated *opaque*
+origin that is only equal to itself; two parses of the same `tauri://localhost` URL therefore never
+compare equal, so an origin-equality check cancels even the initial page load and ships a blank
+release window (dev hides it because `http://localhost` has a comparable tuple origin). The check
+lives in the pure `navigation_allowed` function, covered by `gui/src-tauri/tests/nav_guard.rs`.
+
 ## Considered Options
 
 - **Hand-rolled zero-dependency parser** — rejected: GFM tables, inline emphasis pairing and
