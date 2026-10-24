@@ -697,8 +697,13 @@ impl CardController {
             (system_prompt, runtime.store.snapshot())
         };
         let user_prompt = card_user_prompt(&snapshot, &transcript, trigger);
-        // A one-off call: no tools, no cache writes, bounded response (D5/D7).
-        let config = config.with_cache(false).with_max_tokens(CARD_MAX_TOKENS);
+        // A one-off call: no tools, no cache writes, bounded response, and no
+        // reasoning pass — thinking tokens would be spent on a chain of
+        // thought nobody renders and would delay the first patch (D5/D7).
+        let config = config
+            .with_cache(false)
+            .with_max_tokens(CARD_MAX_TOKENS)
+            .with_thinking(false);
         let token = CancelToken::new();
         let cards = self.clone();
         let generation_token = token.clone();
@@ -1591,13 +1596,19 @@ mod tests {
         );
     }
 
-    /// What `ConfigProbe` observed per call: the token ceiling, the cache
-    /// flag, and the number of tools it was offered.
-    type ProbedConfig = (Option<u32>, bool, usize);
+    /// What `ConfigProbe` observed per call: the flags and ceilings a Card
+    /// request is expected to carry, plus the number of tools it was offered.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct ProbedConfig {
+        max_tokens: Option<u32>,
+        cache: bool,
+        enable_thinking: bool,
+        tools: usize,
+    }
 
     /// A provider that parks inside `chat` until released: it hands back the
     /// configuration it was called with, so a test can pin the bounded,
-    /// tool-less, uncached shape of a Card request (D5/D7).
+    /// tool-less, uncached, thinking-free shape of a Card request (D5/D7).
     #[derive(Clone)]
     struct ConfigProbe {
         fragments: Vec<String>,
@@ -1613,10 +1624,12 @@ mod tests {
             _cancel: &CancelToken,
             on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
         ) -> Result<Option<TokenUsage>, String> {
-            self.seen
-                .lock()
-                .expect("seen")
-                .push((config.max_tokens, config.cache, tools.len()));
+            self.seen.lock().expect("seen").push(ProbedConfig {
+                max_tokens: config.max_tokens,
+                cache: config.cache,
+                enable_thinking: config.enable_thinking,
+                tools: tools.len(),
+            });
             for fragment in &self.fragments {
                 on_delta(Delta::Text(fragment.clone()))?;
             }
@@ -1625,7 +1638,7 @@ mod tests {
     }
 
     #[test]
-    fn a_card_request_is_bounded_toolless_and_uncached() {
+    fn a_card_request_is_bounded_toolless_uncached_and_without_thinking() {
         let cards = CardController::new();
         let (sink, events) = recorder();
         cards.subscribe(sink, Some("system".to_string()));
@@ -1655,7 +1668,12 @@ mod tests {
 
         assert_eq!(
             seen.lock().expect("seen").as_slice(),
-            &[(Some(CARD_MAX_TOKENS), false, 0)]
+            &[ProbedConfig {
+                max_tokens: Some(CARD_MAX_TOKENS),
+                cache: false,
+                enable_thinking: false,
+                tools: 0,
+            }]
         );
     }
 

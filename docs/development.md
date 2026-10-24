@@ -816,7 +816,7 @@ gui/
   - **op 原样过线**：宿主不解析、不改写 op，且**先**把 `card_op` 发给 webview、**再**自己 apply（先转发再镜像，录制方看到的就是它该看到的那一帧）。两端从同一段字节各自 apply：同一套六种 op 语义（`add` 自动建父路径、`replace` 目标缺失也写入、数组下标 splice 插入、`-` 追加、缺失的 `remove` 静默、`test` 失败则丢弃该行），逐字对齐；也都按 `\n` 切行、缓存残行、流结束时 flush。一致性由共享 fixture `gui/ui/src/fixtures/card-stream.json` 锁住：Rust 与 TS 两份测跑同一条流与同一份 expected spec。
   - **kind 行**：模型首行必须是 `{"op":"add","path":"/kind","value":"<kind>"}`。`Framing` 缓冲到第一个换行，识别出目标卡后才 `card_begin`；kind 行**不**转发、也不进 spec（首行不是 kind 行则回落到 `result`）。每轮从空 spec 重建，所以模型要逐字复现仍适用的旧内容（这就是“同一 kind 替换 + 跨轮累积”的落地方式）。
   - **提示词分界**：**系统提示由前端生成并透传**——`cardSystemPrompt()` 从 zod catalog（`ui/src/cardCatalog.ts`）现生成，组件词表只有这一份，宿主不留第二份描述；**user 提示由宿主拼装**——`card_user_prompt` = 会话摘要（`transcript_digest`：倒序 20 条 / 8000 字符，user 与 assistant 全文、工具调用只留名称、工具结果截断到 400 字符、更早的消息折成一行省略说明）+ 当前卡片快照 + 本次触发原因（回合完成 / 手动）。
-  - **用量**：卡片请求新建一个 provider 实例（不与会话共享），`with_cache(false).with_max_tokens(4000)`、空工具集、独立取消令牌与线程，所以既不计入会话 usage / HUD，也不占上下文。
+  - **用量**：卡片请求新建一个 provider 实例（不与会话共享），`with_cache(false).with_max_tokens(4000).with_thinking(false)`、空工具集、独立取消令牌与线程，所以既不计入会话 usage / HUD，也不占上下文。thinking 在 `ProviderConfig` 里默认开（wire 的 `enable_thinking` 为 `true` 时省略，普通回合字节形状不变），卡片这一次生成强制关：思考内容不会渲染进卡片，还会白花 token 并拖慢第一个 patch。
   - **前端**：`ui/src/cards.ts` 是纯函数 reducer（`applyFragments` / `reduceCards`，按 rAF 合批进 React），`ui/src/cardRegistry.tsx` 是九个组件的 registry（未知类型→`UnknownType` 占位、每张卡一个错误边界降级为 `Stub`），`ui/src/components/CardView.tsx` 是固定宽度的可折叠面板（DEV 构建多一个 `Preview` 按钮，用 `CARD_DEMO_OPS` 逐行回放，不花模型调用）。
 - **门禁**：`gui/` 不是 workspace member，workspace 的 `cargo test` / clippy / `architecture.rs`
   矩阵不受影响；GUI 自己的 Rust 测试在 `gui/src-tauri` 内跑（FakeProvider + `with_home(scratch)`

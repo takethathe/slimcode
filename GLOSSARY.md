@@ -494,7 +494,8 @@ _Avoid_: widget, panel, tile, result view (a Card kind, not the concept)
 The one-shot provider request the Tauri 宿主 issues when a turn completes: two messages (the
 system prompt generated from the TS catalog, the user prompt assembled in Rust from a session
 digest plus the current Cards), streamed as SpecStream ops into one Card. It uses its own
-worker thread, cancel token and `max_tokens` cap, is single-flight, and is cancelled as soon
+worker thread, cancel token and `max_tokens` cap, forces thinking off (a Card never renders a
+reasoning pass, and it would delay the first patch), is single-flight, and is cancelled as soon
 as the next Prompt starts. It is **not** an AgentSession: no tools, no turn loop, nothing
 enters Message history, and its token usage is not folded into the Session's usage or the
 Usage HUD.

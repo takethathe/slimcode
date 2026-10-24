@@ -76,7 +76,9 @@ A global `emit` + `listen` namespace was rejected: the existing contract is one 
 
 The generator calls `Provider::chat` directly with the two messages, an empty tool list, the
 current `ProviderConfig` (`config::load_app_config(settings.overrides())`), its own
-`CancelToken`, and a conservative `max_tokens` (4000). It runs on its own thread and is
+`CancelToken`, a conservative `max_tokens` (4000) and thinking forced off (`with_thinking(false)`;
+thinking is on by default, but reasoning is never rendered into a Card and would only spend
+tokens and delay the first patch). It runs on its own thread and is
 single-flight; `prompt` cancels it (without joining — a command thread must not block on a
 network read) because a new turn instantly makes the old Cards stale, and `dispose` joins it.
 It does **not** introduce a `SessionState`: `Running` keeps meaning "the main turn is running".
