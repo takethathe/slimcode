@@ -22,6 +22,15 @@ import { Transcript } from "./components/Transcript";
 import { InputBox } from "./components/InputBox";
 import { SettingsModal } from "./components/SettingsModal";
 import { HelpModal } from "./components/HelpModal";
+import { CardView } from "./components/CardView";
+import { CARD_DEMO_OPS, cardSystemPrompt } from "./cardCatalog";
+import {
+  emptyCardsState,
+  isGenerating,
+  reduceCards,
+  type CardEvent,
+  type CardsState,
+} from "./cards";
 
 export default function App() {
   const [blocks, setBlocks] = useState<Block[]>([]);
@@ -49,11 +58,26 @@ export default function App() {
   const [settings, setSettings] = useState<GuiSettings | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  // The Card view (spec .scratch/gui-cards, ADR-0030): its panel state comes
+  // from the host's one-time Card subscription, batched per animation frame
+  // like the transcript so a burst of ops is one React render. `cardPending`
+  // starts at the click and ends at the first `card_end`, so the panel shows
+  // feedback before the generator's kind line picks the target Card.
+  const [cards, setCards] = useState<CardsState>(emptyCardsState);
+  const [cardsCollapsed, setCardsCollapsed] = useState(false);
+  const [cardNotice, setCardNotice] = useState<string | null>(null);
+  const [cardPending, setCardPending] = useState(false);
+
   // The pending-turn event queue: events stream in via the Channel callback
   // (outside React), are reduced through a ref, and flushed into state on a
   // rAF so streaming stays smooth without re-rendering per fragment.
   const eventsRef = useRef<GuiWireEvent[]>([]);
   const flushScheduled = useRef(false);
+  // The Card channel's queue: same pattern, separate rAF so a Card op never
+  // waits on a transcript flush.
+  const cardEventsRef = useRef<CardEvent[]>([]);
+  const cardFlushScheduled = useRef(false);
+  const previewTimer = useRef<number | null>(null);
   // Monotonic fence for the cumulative HUD total: every local `usage` delta
   // bumps it, and a snapshot requested before that bump is discarded when it
   // lands — otherwise an older total would overwrite a newer one (spec D5).
@@ -146,6 +170,63 @@ export default function App() {
     setLatestUsage(null);
   }, []);
 
+  // A session swap empties the panel (ADR-0030 D2/D5): Cards describe one
+  // session, so the previous session's conclusions must never read as this
+  // one's. The host also pushes an empty snapshot; doing it locally keeps the
+  // panel correct even if that push lands late.
+  const resetCards = useCallback(() => {
+    setCards(emptyCardsState());
+    setCardNotice(null);
+    setCardPending(false);
+  }, []);
+
+  // Manual generation is the retry / refresh path (D1). Single-flight is the
+  // host's rule; the panel mirrors it so the user gets an immediate answer
+  // instead of a silent no-op.
+  async function generateCards(): Promise<void> {
+    if (isGenerating(cards) || cardPending) {
+      setCardNotice("Card generation is already running.");
+      return;
+    }
+    setCardNotice(null);
+    setCardPending(true);
+    try {
+      await api.regenerateCards(cardSystemPrompt());
+    } catch (e) {
+      setCardPending(false);
+      const message = errorMessage(e);
+      setCardNotice(
+        message.includes("already running")
+          ? "Card generation is already running."
+          : message,
+      );
+    }
+  }
+
+  // Debug entry (dev builds only): replay a synthetic op stream into the
+  // panel one line at a time, so the progressive growth is visible in a real
+  // webview without spending a model call.
+  function previewCards(): void {
+    if (previewTimer.current !== null) window.clearTimeout(previewTimer.current);
+    queueCardEvent({ kind: "card_begin", card_id: "result" });
+    let index = 0;
+    const step = (): void => {
+      if (index >= CARD_DEMO_OPS.length) {
+        queueCardEvent({ kind: "card_end", card_id: "result", ok: true });
+        previewTimer.current = null;
+        return;
+      }
+      queueCardEvent({
+        kind: "card_op",
+        card_id: "result",
+        op: `${CARD_DEMO_OPS[index]}\n`,
+      });
+      index += 1;
+      previewTimer.current = window.setTimeout(step, 120);
+    };
+    step();
+  }
+
   const queueEvent = useCallback(
     (event: GuiWireEvent) => {
       eventsRef.current.push(event);
@@ -156,6 +237,52 @@ export default function App() {
     },
     [flushEvents],
   );
+
+  const flushCardEvents = useCallback(() => {
+    cardFlushScheduled.current = false;
+    const pending = cardEventsRef.current;
+    if (pending.length === 0) return;
+    cardEventsRef.current = [];
+    setCards((prev) => reduceCards(prev, pending));
+    // A generation ended (this one or an automatic one): the pending hint is
+    // stale either way. A begin clears the previous failure notice.
+    if (pending.some((event) => event.kind === "card_end")) setCardPending(false);
+    if (pending.some((event) => event.kind === "card_begin")) setCardNotice(null);
+  }, []);
+
+  const queueCardEvent = useCallback(
+    (event: CardEvent) => {
+      cardEventsRef.current.push(event);
+      if (!cardFlushScheduled.current) {
+        cardFlushScheduled.current = true;
+        requestAnimationFrame(() => flushCardEvents());
+      }
+    },
+    [flushCardEvents],
+  );
+
+  // Subscribe to the Card channel once (ADR-0030 D4). The command returns the
+  // current snapshot, so a reloaded window restores the same Cards; every
+  // later change arrives on the same callback. The system prompt is generated
+  // from the catalog here and handed to the host, which keeps no second copy.
+  useEffect(() => {
+    let active = true;
+    void (async () => {
+      try {
+        const snapshot = await api.subscribeCards(queueCardEvent, cardSystemPrompt());
+        if (!active) return;
+        setCards((prev) =>
+          reduceCards(prev, [{ kind: "cards_snapshot", cards: snapshot }]),
+        );
+      } catch (e) {
+        // A dead side channel is not a failed conversation (ADR-0030 D8).
+        if (active) setCardNotice(errorMessage(e));
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [queueCardEvent]);
 
   // On mount: load the launch session (fresh empty) + the session list.
   useEffect(() => {
@@ -214,6 +341,7 @@ export default function App() {
     try {
       await api.newSession();
       resetUsage();
+      resetCards();
       const snapshot = await refreshSnapshot();
       if (snapshot) {
         newBlockSeq();
@@ -233,6 +361,7 @@ export default function App() {
     try {
       await api.resumeSession(id);
       resetUsage();
+      resetCards();
       const snapshot = await refreshSnapshot();
       if (snapshot) {
         newBlockSeq();
@@ -258,6 +387,7 @@ export default function App() {
       // If the deleted session was current, the host opened a fresh one.
       if (id === currentId) {
         resetUsage();
+        resetCards();
         const snapshot = await refreshSnapshot();
         if (snapshot) {
           newBlockSeq();
@@ -356,7 +486,18 @@ export default function App() {
             </button>
           </div>
         ) : null}
-        <Transcript blocks={blocks} running={running} />
+        <div className="flex min-h-0 min-w-0 flex-1">
+          <Transcript blocks={blocks} running={running} />
+          <CardView
+            cards={cards.cards}
+            generating={isGenerating(cards) || cardPending}
+            collapsed={cardsCollapsed}
+            notice={cardNotice}
+            onToggle={() => setCardsCollapsed((value) => !value)}
+            onGenerate={() => void generateCards()}
+            onPreview={previewCards}
+          />
+        </div>
         <InputBox
           running={running}
           onSend={(t) => void send(t)}

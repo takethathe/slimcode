@@ -15,6 +15,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "./App";
+import type { CardEvent, CardSnapshot } from "./cards";
 import type { GuiWireEvent, SessionSnapshot, TokenUsage } from "./types";
 
 // The host seam is stubbed wholesale: these tests hand-drive the wire events,
@@ -31,6 +32,8 @@ const host = vi.hoisted(() => ({
   setSettings: vi.fn(),
   prompt: vi.fn(),
   compactNow: vi.fn(),
+  subscribeCards: vi.fn(),
+  regenerateCards: vi.fn(),
 }));
 
 vi.mock("./api", () => ({
@@ -71,13 +74,22 @@ function snapshot(value: TokenUsage, percent = 0): SessionSnapshot {
 // The queue callback the host streams events on; captured from the Compact
 // button, which is the shortest path to `api.compactNow(onEvent)`.
 let emit: ((event: GuiWireEvent) => void) | null = null;
+// The Card channel's callback, captured from the mount-time subscription.
+let emitCard: ((event: CardEvent) => void) | null = null;
 
 beforeEach(() => {
   emit = null;
+  emitCard = null;
   for (const fn of Object.values(host)) fn.mockReset();
   host.getSession.mockResolvedValue(snapshot(usage(0, 0)));
   host.listSessions.mockResolvedValue([]);
   host.complete.mockResolvedValue([]);
+  host.subscribeCards.mockImplementation(
+    (onEvent: (event: CardEvent) => void) => {
+      emitCard = onEvent;
+      return Promise.resolve([] as CardSnapshot[]);
+    },
+  );
   host.compactNow.mockImplementation(
     (onEvent: (event: GuiWireEvent) => void) => {
       emit = onEvent;
@@ -100,6 +112,7 @@ afterEach(() => {
 async function mountApp(): Promise<void> {
   render(<App />);
   await waitFor(() => expect(host.getSession).toHaveBeenCalledTimes(1));
+  await waitFor(() => expect(emitCard).not.toBeNull());
   fireEvent.click(screen.getByRole("button", { name: "Compact" }));
   await waitFor(() => expect(emit).not.toBeNull());
 }
@@ -146,5 +159,74 @@ describe("Usage HUD recalibration", () => {
     });
     expect(screen.getByText("↑120")).toBeTruthy();
     expect(screen.getByText("↓12")).toBeTruthy();
+  });
+});
+
+describe("Card view", () => {
+  const spec = {
+    root: "root",
+    elements: {
+      root: { type: "Card", props: { title: "Result" }, children: ["body"] },
+      body: { type: "Text", props: { content: "The turn is done." }, children: [] },
+    },
+  };
+
+  it("grows a Card from the channel's begin / op / end events", async () => {
+    await mountApp();
+    act(() => emitCard?.({ kind: "card_begin", card_id: "result" }));
+    expect(
+      screen.getByRole("progressbar", { name: "Card generation progress" }),
+    ).toBeTruthy();
+
+    act(() =>
+      emitCard?.({
+        kind: "card_op",
+        card_id: "result",
+        op: `${JSON.stringify({ op: "add", path: "/root", value: "root" })}\n${JSON.stringify({
+          op: "add",
+          path: "/elements/root",
+          value: { type: "Card", props: { title: "Result" }, children: [] },
+        })}\n`,
+      }),
+    );
+    // A later fragment grows the Card: the body lands first, then the root
+    // points at it, so the tree never references a missing element.
+    act(() =>
+      emitCard?.({
+        kind: "card_op",
+        card_id: "result",
+        op: `${JSON.stringify({ op: "add", path: "/elements/body", value: spec.elements.body })}\n${JSON.stringify(
+          { op: "replace", path: "/elements/root/children", value: ["body"] },
+        )}\n`,
+      }),
+    );
+    act(() => emitCard?.({ kind: "card_end", card_id: "result", ok: true }));
+
+    await waitFor(() => expect(screen.getByText("The turn is done.")).toBeTruthy());
+    expect(screen.queryByRole("progressbar", { name: "Card generation progress" })).toBeNull();
+  });
+
+  it("restores the Cards the host's snapshot carries on subscribe", async () => {
+    host.subscribeCards.mockImplementation(
+      (onEvent: (event: CardEvent) => void) => {
+        emitCard = onEvent;
+        return Promise.resolve([
+          { id: "result", kind: "result", spec, updated: 1 } as CardSnapshot,
+        ]);
+      },
+    );
+    await mountApp();
+    await waitFor(() => expect(screen.getByText("The turn is done.")).toBeTruthy());
+  });
+
+  it("keeps a rejected generation inside the panel", async () => {
+    host.regenerateCards.mockRejectedValue(new Error("card generation already running"));
+    await mountApp();
+    fireEvent.click(screen.getByRole("button", { name: "Generate cards" }));
+    await waitFor(() =>
+      expect(screen.getByText("Card generation is already running.")).toBeTruthy(),
+    );
+    // The conversation's banner never learns about a Card failure (D8).
+    expect(screen.queryByText("card generation already running")).toBeNull();
   });
 });

@@ -33,9 +33,13 @@ use slimcode_app::session::{SessionStore, project_key};
 use slimcode_app::skills::{
     CompletionScope, PreparedPrompt, SkillStore, complete_in, prepare_user_prompt,
 };
-use slimcode_app::{AgentMessage, TokenUsage};
+use slimcode_app::{AgentMessage, StopReason, TokenUsage};
 use slimcode_sdk::{AgentSession, AgentSessionOptions, create_agent_session};
 
+use crate::cards::{
+    CardController, CardEvent, CardProviderFactory, CardSink, CardSnapshot, CardTrigger,
+    transcript_digest,
+};
 use crate::settings::GuiSettings;
 use crate::wire::GuiWireEvent;
 
@@ -98,6 +102,13 @@ pub struct CompletionItem {
     pub description: String,
 }
 
+/// Test seam: builds the provider one Card generation drives. Shared by
+/// `Arc` — unlike the generator's [`CardProviderFactory`], which is consumed
+/// once per generation, a test may drive several generations.
+#[cfg(test)]
+type CardProviderSeam =
+    Arc<dyn Fn() -> Result<Box<dyn slimcode_app::Provider + Send>, String> + Send + Sync>;
+
 /// The mutable controller state, guarded by [`AppController::inner`]. All
 /// mutations happen briefly under the lock; the worker only touches it once,
 /// at turn end, to flip `Running` → `Idle` (see [`finish_worker`]).
@@ -132,12 +143,22 @@ struct ControllerInner {
     /// (production) lets `create_agent_session` build the default tools.
     #[cfg(test)]
     tools_factory: Option<Box<dyn Fn() -> Vec<slimcode_app::Tool> + Send + Sync>>,
+    /// Test seam: the provider the Card generator drives (production builds a
+    /// fresh `BailianProvider`). The generator never shares the session's
+    /// provider, so a Card cannot bill the conversation (ADR-0030 D5).
+    #[cfg(test)]
+    card_provider_factory: Option<CardProviderSeam>,
 }
 
 /// The pure-Rust host controller. `Send + Sync`, so Tauri can manage it as
 /// app state.
 pub struct AppController {
     inner: Arc<Mutex<ControllerInner>>,
+    /// The Card view's channel (ADR-0030): its mirror, the webview's sink, and
+    /// the generation in flight. A separate lock from `inner`, because the
+    /// generator touches it on a stream of fragments while a turn may hold the
+    /// session lock.
+    cards: CardController,
 }
 
 impl AppController {
@@ -172,7 +193,10 @@ impl AppController {
                 provider_factory: None,
                 #[cfg(test)]
                 tools_factory: None,
+                #[cfg(test)]
+                card_provider_factory: None,
             })),
+            cards: CardController::new(),
         }
     }
 
@@ -192,11 +216,20 @@ impl AppController {
         if inner.state == SessionState::Running {
             return Err("a turn is already running".to_string());
         }
+        // A Card generation belongs to the paused conversation: starting a turn
+        // takes priority and cancels it (ADR-0030 D4). No join here — the
+        // caller must never block on a network read.
+        self.cards.cancel();
         if let Some(session) = inner.session.take() {
             session.dispose();
         }
         inner.session_settings_version = 0; // force recreation below
-        ensure_session_locked(&mut inner)
+        ensure_session_locked(&mut inner)?;
+        drop(inner);
+        // A Card describes one session: the previous session's conclusions
+        // must never read as this one's (D2/D5).
+        self.cards.reseed();
+        Ok(())
     }
 
     /// Resume a session by id from the shared repository
@@ -210,6 +243,10 @@ impl AppController {
         if inner.state == SessionState::Running {
             return Err("a turn is already running".to_string());
         }
+        // An in-flight generation belongs to the session being left: cancel it
+        // before the mirror is cleared, or its first line would open a Card in
+        // the new session (D4).
+        self.cards.cancel();
         if let Some(session) = inner.session.take() {
             session.dispose();
         }
@@ -219,6 +256,8 @@ impl AppController {
         inner.session = Some(Arc::new(session));
         inner.model = model;
         inner.session_settings_version = inner.settings_version;
+        drop(inner);
+        self.cards.reseed();
         Ok(())
     }
 
@@ -267,6 +306,16 @@ impl AppController {
         }
         let session = Arc::clone(inner.session.as_ref().expect("session ensured"));
         let shared = Arc::clone(&self.inner);
+        // A person talking to the agent wins over a background Card: the turn
+        // cancels any generation in flight (ADR-0030 D4), without joining it.
+        self.cards.cancel();
+        // The completion trigger (D1): a finished turn's Card is generated on
+        // the Card thread once `prompt` returns `Completed`. A cancelled or
+        // failed turn generates nothing; a config error only silences the side
+        // channel, never the turn (D8).
+        let cards = self.cards.clone();
+        let card_config = provider_config(&inner.settings).ok();
+        let card_factory = card_provider_factory(&inner);
         // Prompt preprocessing (ADR-0026): a leading `/skill:name` trigger is
         // expanded into the skill's `<skill>` block before the model sees it;
         // plain text and un-mapped Commands pass through unchanged.
@@ -276,7 +325,17 @@ impl AppController {
             PreparedPrompt::Prompt(text) => text,
         };
         let worker = spawn_worker(session, shared, sink, move |session| {
-            session.prompt(&text).map(|_| ())
+            let reason = session.prompt(&text)?;
+            if reason == StopReason::Completed
+                && let Some(config) = card_config
+            {
+                let transcript = transcript_digest(&session.messages());
+                // Single-flight is the Card channel's own rule: a manual
+                // generation still running is simply left alone.
+                let _ =
+                    cards.generate(card_factory, config, transcript, CardTrigger::TurnCompleted);
+            }
+            Ok(())
         });
         inner.worker = Some(worker);
         inner.state = SessionState::Running;
@@ -320,6 +379,40 @@ impl AppController {
         }
     }
 
+    /// Hand the webview the Card channel (ADR-0030 D4): the return value is the
+    /// snapshot a (re)loading window starts from, and every later change
+    /// arrives on `sink`. The system prompt is generated by the webview from
+    /// the catalog; the host keeps no second copy of that vocabulary (D6).
+    pub fn subscribe_cards(
+        &self,
+        sink: impl Fn(CardEvent) + Send + Sync + 'static,
+        system_prompt: String,
+    ) -> Vec<CardSnapshot> {
+        let sink: CardSink = Arc::new(sink);
+        self.cards.subscribe(sink, Some(system_prompt))
+    }
+
+    /// Generate (or refresh) the Cards from the current session history: the
+    /// manual trigger behind the panel's Generate / retry (D1/D7). Runs on the
+    /// Card thread; single-flight, so a live generation is rejected.
+    pub fn regenerate_cards(&self, system_prompt: String) -> Result<(), String> {
+        let mut inner = self.lock();
+        if inner.state == SessionState::Disposed {
+            return Err("controller is disposed".to_string());
+        }
+        if inner.session.is_none() {
+            ensure_session_locked(&mut inner)?;
+        }
+        let session = inner.session.as_ref().expect("session ensured");
+        let transcript = transcript_digest(&session.messages());
+        let config = provider_config(&inner.settings)?;
+        let factory = card_provider_factory(&inner);
+        drop(inner);
+        self.cards.set_system_prompt(system_prompt);
+        self.cards
+            .generate(factory, config, transcript, CardTrigger::Manual)
+    }
+
     /// List the shared repository's sessions, newest first.
     pub fn list_sessions(&self) -> Result<Vec<SessionInfo>, String> {
         let inner = self.lock();
@@ -354,11 +447,17 @@ impl AppController {
             fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         }
         // Deleting the current session switches to a fresh one.
-        if inner.session.as_ref().is_some_and(|s| s.session_id() == id) {
+        let switched = inner.session.as_ref().is_some_and(|s| s.session_id() == id);
+        if switched {
+            self.cards.cancel();
             if let Some(session) = inner.session.take() {
                 session.dispose();
             }
             ensure_session_locked(&mut inner)?;
+        }
+        drop(inner);
+        if switched {
+            self.cards.reseed();
         }
         Ok(())
     }
@@ -439,6 +538,8 @@ impl AppController {
         if let Some(worker) = worker {
             let _ = worker.join();
         }
+        // A Card generation outlives no teardown: cancel and join it too.
+        self.cards.dispose();
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, ControllerInner> {
@@ -497,6 +598,37 @@ fn build_options(
         None => options,
     };
     Ok((options, model))
+}
+
+/// The provider configuration one Card generation uses: the same four-layer
+/// resolution as a turn, with the GUI settings on top.
+fn provider_config(settings: &GuiSettings) -> Result<slimcode_app::ProviderConfig, String> {
+    config::load_app_config(settings.overrides()).map(|app| app.provider)
+}
+
+/// The production provider a Card generation drives: a fresh instance per
+/// generation, never the session's own, so a Card cannot bill the
+/// conversation (ADR-0030 D5).
+fn default_card_provider() -> Result<Box<dyn slimcode_app::Provider + Send>, String> {
+    Ok(Box::new(slimcode_app::BailianProvider::new()?))
+}
+
+/// Build the provider for one generation, honouring the tests' injected
+/// factory (no-op in production, where none exists).
+#[cfg(test)]
+fn card_provider_factory(inner: &ControllerInner) -> CardProviderFactory {
+    match &inner.card_provider_factory {
+        Some(factory) => {
+            let factory = Arc::clone(factory);
+            Box::new(move || factory())
+        }
+        None => Box::new(default_card_provider),
+    }
+}
+
+#[cfg(not(test))]
+fn card_provider_factory(_inner: &ControllerInner) -> CardProviderFactory {
+    Box::new(default_card_provider)
 }
 
 /// The project-scoped store mirroring `create_agent_session`'s, so the GUI
@@ -1691,5 +1823,380 @@ mod tests {
         assert!(row.get("title").is_some());
         assert!(row.get("modified").and_then(|v| v.as_u64()).is_some());
         assert!(row.get("messages").and_then(|v| v.as_u64()).is_some());
+    }
+
+    // --- the Card view (ADR-0030) -------------------------------------------
+
+    /// A recording Card sink: the webview channel's stand-in.
+    #[derive(Default)]
+    struct CardRecorder {
+        events: Arc<Mutex<Vec<CardEvent>>>,
+    }
+
+    impl CardRecorder {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn sink(&self) -> impl Fn(CardEvent) + Send + Sync + 'static {
+            let events = Arc::clone(&self.events);
+            move |event| events.lock().expect("card events").push(event)
+        }
+
+        fn events(&self) -> Vec<CardEvent> {
+            self.events.lock().expect("card events").clone()
+        }
+
+        fn ended(&self) -> bool {
+            self.events()
+                .iter()
+                .any(|event| matches!(event, CardEvent::CardEnd { .. }))
+        }
+    }
+
+    /// Inject the provider the Card generator drives (the tests' seam).
+    fn inject_card_provider<P>(controller: &AppController, provider: P)
+    where
+        P: Provider + Clone + Send + Sync + 'static,
+    {
+        controller
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .card_provider_factory = Some(Arc::new(move || Ok(Box::new(provider.clone()))));
+    }
+
+    /// A provider whose script position is shared across the generator's
+    /// per-generation instances: the second generation sees the second batch
+    /// (each `generate` builds a fresh `Box<dyn Provider>`).
+    #[derive(Clone)]
+    struct SharedProvider<P>(Arc<Mutex<P>>);
+
+    impl<P: Provider> Provider for SharedProvider<P> {
+        fn chat(
+            &mut self,
+            messages: &[Message],
+            tools: &[ToolSpec],
+            config: &ProviderConfig,
+            cancel: &CancelToken,
+            on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
+        ) -> Result<Option<TokenUsage>, String> {
+            self.0
+                .lock()
+                .expect("provider")
+                .chat(messages, tools, config, cancel, on_delta)
+        }
+    }
+
+    /// The one-line op stream a Card generation returns.
+    fn card_ops(kind: &str) -> String {
+        card_ops_titled(kind, "Card")
+    }
+
+    /// A Card generation that rebuilds the whole Card (a Card is always
+    /// rebuilt from an empty spec, so the kind line and the root come first).
+    fn card_ops_titled(kind: &str, title: &str) -> String {
+        format!(
+            "{{\"op\":\"add\",\"path\":\"/kind\",\"value\":\"{kind}\"}}\n\
+             {{\"op\":\"add\",\"path\":\"/root\",\"value\":\"root\"}}\n\
+             {{\"op\":\"add\",\"path\":\"/elements/root\",\"value\":{{\"type\":\"Card\",\"props\":{{\"title\":\"{title}\"}},\"children\":[\"body\"]}}}}\n\
+             {{\"op\":\"add\",\"path\":\"/elements/body\",\"value\":{{\"type\":\"Text\",\"props\":{{\"content\":\"done\"}},\"children\":[]}}}}\n"
+        )
+    }
+
+    #[test]
+    fn a_completed_turn_generates_one_card_for_the_session() {
+        let scratch = Scratch::new("card-turn");
+        let controller = scratch.controller(FakeProvider::text_turn("finished"));
+        let card_provider = FakeProvider::text_turn(&card_ops("result"));
+        inject_card_provider(&controller, card_provider.clone());
+        let recorder = CardRecorder::new();
+        assert!(
+            controller
+                .subscribe_cards(recorder.sink(), "system prompt".to_string())
+                .is_empty(),
+            "a fresh session has no Cards"
+        );
+
+        controller
+            .prompt("please fix it", Recorder::new().sink())
+            .expect("prompt");
+        wait_until(|| controller.state() == SessionState::Idle);
+        wait_until(|| recorder.ended());
+
+        let snapshot = controller.cards.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].kind, "result");
+        assert_eq!(snapshot[0].spec["root"], serde_json::json!("root"));
+        assert_eq!(
+            snapshot[0].spec["elements"]["root"]["type"],
+            serde_json::json!("Card")
+        );
+
+        // The generation saw the conversation...
+        let prompts = card_provider.prompts();
+        assert!(
+            prompts
+                .iter()
+                .any(|prompt| prompt.contains("please fix it")),
+            "{prompts:?}"
+        );
+        // ...and never billed it (D5): the session total is the turn's own.
+        let usage = controller.get_session().expect("session").usage;
+        assert_eq!(usage.total_tokens, 15);
+    }
+
+    #[test]
+    fn a_second_turn_updates_the_same_card() {
+        let scratch = Scratch::new("card-incremental");
+        let (main, _) = fake_provider(
+            vec![
+                vec![text_delta("one"), done_stop()],
+                vec![text_delta("two"), done_stop()],
+            ],
+            usage(1, 1),
+        );
+        let controller = scratch.controller(main);
+        // The second generation is told about the Card the first one produced
+        // and rebuilds it under the same kind, so it replaces rather than
+        // appends (D2/D3).
+        let card_state = Arc::new(Mutex::new(
+            fake_provider(
+                vec![
+                    vec![text_delta(&card_ops("task-board")), done_stop()],
+                    vec![
+                        text_delta(&card_ops_titled("task-board", "Second title")),
+                        done_stop(),
+                    ],
+                ],
+                usage(1, 1),
+            )
+            .0,
+        ));
+        inject_card_provider(&controller, SharedProvider(Arc::clone(&card_state)));
+        let recorder = CardRecorder::new();
+        controller.subscribe_cards(recorder.sink(), "system".to_string());
+
+        controller
+            .prompt("first", Recorder::new().sink())
+            .expect("first turn");
+        wait_until(|| controller.state() == SessionState::Idle);
+        // The first Card must be complete before the second turn cancels it.
+        wait_until(|| recorder.ended());
+        wait_until(|| {
+            controller
+                .cards
+                .snapshot()
+                .iter()
+                .any(|card| card.spec["elements"]["body"].is_object())
+        });
+
+        controller
+            .prompt("second", Recorder::new().sink())
+            .expect("second turn");
+        wait_until(|| controller.state() == SessionState::Idle);
+        wait_until(|| {
+            controller.cards.snapshot().iter().any(|card| {
+                card.spec["elements"]["root"]["props"]["title"] == serde_json::json!("Second title")
+            })
+        });
+
+        let snapshot = controller.cards.snapshot();
+        assert_eq!(snapshot.len(), 1, "the same kind replaces, never appends");
+        assert_eq!(snapshot[0].kind, "task-board");
+        // The second request carried the Card the first one produced.
+        let prompts = card_state.lock().expect("card provider").prompts();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[1].contains("Existing cards"), "{}", prompts[1]);
+        assert!(prompts[1].contains("task-board"), "{}", prompts[1]);
+        controller.dispose();
+    }
+
+    #[test]
+    fn a_cancelled_turn_generates_no_card() {
+        let scratch = Scratch::new("card-cancelled");
+        let (mut provider, _seen) = fake_provider(vec![vec![text_delta("partial")]], usage(1, 1));
+        provider.cancels_on = Some(1);
+        let controller = scratch.controller(provider);
+        inject_card_provider(&controller, FakeProvider::text_turn(&card_ops("result")));
+        let recorder = CardRecorder::new();
+        controller.subscribe_cards(recorder.sink(), "system".to_string());
+
+        controller
+            .prompt("hello", Recorder::new().sink())
+            .expect("prompt");
+        wait_until(|| controller.state() == SessionState::Idle);
+
+        assert!(controller.cards.snapshot().is_empty());
+        assert!(!recorder.ended());
+    }
+
+    #[test]
+    fn switching_sessions_empties_the_cards() {
+        let scratch = Scratch::new("card-switch");
+        let controller = scratch.controller(FakeProvider::text_turn("finished"));
+        inject_card_provider(&controller, FakeProvider::text_turn(&card_ops("result")));
+        let recorder = CardRecorder::new();
+        controller.subscribe_cards(recorder.sink(), "system".to_string());
+        controller
+            .prompt("hello", Recorder::new().sink())
+            .expect("prompt");
+        wait_until(|| controller.state() == SessionState::Idle);
+        wait_until(|| recorder.ended());
+        assert_eq!(controller.cards.snapshot().len(), 1);
+
+        controller.new_session().expect("new session");
+        assert!(controller.cards.snapshot().is_empty());
+        assert!(
+            recorder.events().iter().any(
+                |event| matches!(event, CardEvent::CardsSnapshot { cards } if cards.is_empty())
+            ),
+            "the webview is told to empty the panel"
+        );
+    }
+
+    #[test]
+    fn starting_a_turn_cancels_the_card_generation() {
+        let scratch = Scratch::new("card-cancel");
+        let turn_started = Arc::new(AtomicBool::new(false));
+        let controller = scratch.controller(CancelAwareBlockingProvider {
+            started: Arc::clone(&turn_started),
+        });
+        let card_started = Arc::new(AtomicBool::new(false));
+        inject_card_provider(
+            &controller,
+            CancelAwareBlockingProvider {
+                started: Arc::clone(&card_started),
+            },
+        );
+        let recorder = CardRecorder::new();
+        controller.subscribe_cards(recorder.sink(), "system".to_string());
+
+        controller
+            .regenerate_cards("system".to_string())
+            .expect("generation starts");
+        wait_until(|| card_started.load(Ordering::SeqCst));
+
+        controller
+            .prompt("hello", Recorder::new().sink())
+            .expect("turn");
+        wait_until(|| recorder.ended());
+        // The turn itself is untouched by the side channel.
+        assert_eq!(controller.state(), SessionState::Running);
+        assert!(
+            matches!(
+                recorder.events().last(),
+                Some(CardEvent::CardEnd { ok: false, .. })
+            ),
+            "{:?}",
+            recorder.events()
+        );
+        controller.dispose();
+    }
+
+    #[test]
+    fn a_live_card_generation_rejects_a_second_regenerate() {
+        let scratch = Scratch::new("card-single-flight");
+        let controller = scratch.controller(FakeProvider::text_turn("finished"));
+        let card_started = Arc::new(AtomicBool::new(false));
+        inject_card_provider(
+            &controller,
+            CancelAwareBlockingProvider {
+                started: Arc::clone(&card_started),
+            },
+        );
+        controller.subscribe_cards(CardRecorder::new().sink(), "system".to_string());
+
+        controller
+            .regenerate_cards("system".to_string())
+            .expect("first start");
+        wait_until(|| card_started.load(Ordering::SeqCst));
+        let error = controller
+            .regenerate_cards("system".to_string())
+            .expect_err("second start");
+        assert!(error.contains("already running"), "{error}");
+        controller.dispose();
+    }
+
+    #[test]
+    fn an_unsubscribed_host_generates_no_card() {
+        let scratch = Scratch::new("card-no-subscriber");
+        let controller = scratch.controller(FakeProvider::text_turn("finished"));
+        let card_provider = FakeProvider::text_turn(&card_ops("result"));
+        inject_card_provider(&controller, card_provider.clone());
+
+        // No window is listening, so nobody generated a system prompt: the
+        // side channel stays silent and the turn is unharmed (D8).
+        controller
+            .prompt("hello", Recorder::new().sink())
+            .expect("prompt");
+        wait_until(|| controller.state() == SessionState::Idle);
+
+        assert!(controller.cards.snapshot().is_empty());
+        assert!(card_provider.prompts().is_empty());
+    }
+
+    #[test]
+    fn dispose_joins_an_in_flight_card_generation() {
+        let scratch = Scratch::new("card-dispose");
+        let controller = scratch.controller(FakeProvider::text_turn("finished"));
+        let card_started = Arc::new(AtomicBool::new(false));
+        inject_card_provider(
+            &controller,
+            CancelAwareBlockingProvider {
+                started: Arc::clone(&card_started),
+            },
+        );
+        controller.subscribe_cards(CardRecorder::new().sink(), "system".to_string());
+        controller
+            .regenerate_cards("system".to_string())
+            .expect("generation starts");
+        wait_until(|| card_started.load(Ordering::SeqCst));
+
+        // Returns only once the Card thread has been cancelled and joined.
+        controller.dispose();
+    }
+
+    #[test]
+    fn the_host_forwards_an_op_before_it_mirrors_it() {
+        let cards = CardController::new();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mirror = cards.clone();
+        let seen = Arc::clone(&observed);
+        cards.subscribe(
+            Arc::new(move |event| {
+                if let CardEvent::CardOp { card_id, .. } = &event {
+                    let root = mirror
+                        .snapshot()
+                        .iter()
+                        .find(|card| &card.kind == card_id)
+                        .map(|card| card.spec["root"].clone())
+                        .unwrap_or(serde_json::Value::Null);
+                    seen.lock().expect("observed").push(root);
+                }
+            }),
+            Some("system".to_string()),
+        );
+        cards
+            .generate(
+                Box::new(|| {
+                    Ok(Box::new(FakeProvider::text_turn(
+                        "{\"op\":\"add\",\"path\":\"/root\",\"value\":\"root\"}\n",
+                    )))
+                }),
+                slimcode_app::ProviderConfig::new("k", "u", "m"),
+                String::new(),
+                CardTrigger::Manual,
+            )
+            .expect("start");
+        wait_until(|| {
+            cards
+                .snapshot()
+                .iter()
+                .any(|card| card.spec["root"] == serde_json::json!("root"))
+        });
+        let observed = observed.lock().expect("observed").clone();
+        // At the instant the op crossed the wire, the mirror had not applied it.
+        assert_eq!(observed.first(), Some(&serde_json::json!("")));
     }
 }

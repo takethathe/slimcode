@@ -6,6 +6,7 @@ import type {
   SessionInfo,
   SessionSnapshot,
 } from "./types";
+import type { CardEvent, CardSnapshot } from "./cards";
 
 function errorMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -37,6 +38,26 @@ export const api = {
     const channel = new Channel<GuiWireEvent>();
     channel.onmessage = onEvent;
     return invoke("compact_now", { channel }).then(() => undefined);
+  },
+
+  /**
+   * Subscribe to the Card channel once (ADR-0030 D4): the resolved value is
+   * the current full snapshot, and every later change arrives on `onEvent` as
+   * one of the four flat Card events. `systemPrompt` is the catalog-generated
+   * description the host uses for automatic generations too.
+   */
+  subscribeCards(
+    onEvent: (event: CardEvent) => void,
+    systemPrompt: string,
+  ): Promise<CardSnapshot[]> {
+    const channel = new Channel<CardEvent>();
+    channel.onmessage = onEvent;
+    return invoke("subscribe_cards", { channel, systemPrompt });
+  },
+
+  /** Ask the host for one Card generation (the retry / refresh path). */
+  regenerateCards(systemPrompt: string): Promise<void> {
+    return invoke("regenerate_cards", { systemPrompt });
   },
 };
 

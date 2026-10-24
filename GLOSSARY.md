@@ -472,3 +472,41 @@ _Avoid_: heading prefix, hash prefix, heading level indicator
 **Usage HUD**:
 The four resident badges in the GUI's top-right corner — `↑` cumulative prompt (input) tokens, `↓` cumulative completion (output) tokens, `CH` the most recent request's cache-hit rate, and the ContextUsage segment (e.g. `↑3.4k ↓101 CH98.2% 12.3%/200k`). All four stay shown, zero values included, so their position never jumps; hovering reveals the cache read/write counts and the full cumulative summary. It replaces the per-message usage row the GUI used to append to the transcript. `CH` reads the **latest** request while the tooltip's summary percentage is the **session cumulative** — a deliberate fork from the TUI footer and `/usage`, which report the cumulative rate (ADR-0029). The `usage_summary` wording the tooltip mirrors now serves only the TUI/CLI; the GUI reproduces it in the frontend rather than carrying it on the wire. Cumulative usage is not persisted, so a resumed session's HUD restarts at zero (ADR-0029).
 _Avoid_: usage line, usage bar, stats row, token gauge
+
+**Card view**:
+The GUI 前端's right-hand column that shows the Current session's Cards as json-render
+output: a fixed-width, collapsible panel beside the Transcript, empty until a Card exists.
+It renders whatever the Tauri 宿主 last produced, holds no authority over the Card data
+(Rust does), and is cleared when the Current session changes. Distinct from the Transcript
+(which shows Message history) and from the `usage` HUD.
+_Avoid_: sidebar (the left session list), dashboard, canvas, right pane
+
+**Card**:
+One generated view of the Current session — a json-render Spec under a fixed **Card kind**
+(`task-board` / `result` / `insight`) that plays the role of its identity, so re-generating
+a kind replaces that Card instead of adding a fourth. A Session holds at most three Cards
+(most-recently-updated first, the stalest evicted), only in the Tauri 宿主's memory — a Card
+is never part of Message history and never survives a session swap or a restart. Derived
+from the conversation, not authored by it: the main agent neither writes nor sees Cards.
+_Avoid_: widget, panel, tile, result view (a Card kind, not the concept)
+
+**Card generator**:
+The one-shot provider request the Tauri 宿主 issues when a turn completes: two messages (the
+system prompt generated from the TS catalog, the user prompt assembled in Rust from a session
+digest plus the current Cards), streamed as SpecStream ops into one Card. It uses its own
+worker thread, cancel token and `max_tokens` cap, is single-flight, and is cancelled as soon
+as the next Prompt starts. It is **not** an AgentSession: no tools, no turn loop, nothing
+enters Message history, and its token usage is not folded into the Session's usage or the
+Usage HUD.
+_Avoid_: json render agent, card agent (collides with AgentSession), summarizer
+
+**SpecStream op**:
+One line of RFC 6902 JSON Patch (`{"op":…,"path":…,"value":…}`) in json-render's streaming
+format, terminated by a newline; a Card is built by applying its ops in arrival order. Applied
+twice per line — in the webview by json-render's compiler (which paints the Card) and in the
+Tauri 宿主 by a tolerant mirror (which holds the authoritative Spec) — from the same bytes,
+with the same six-operation semantics and the same trailing-partial-line buffering, so the two
+specs agree once the stream ends. Granularity is one **element**, not one token: a Card's
+structure grows op by op, and a single op carrying the whole tree would stall the visible
+progression.
+_Avoid_: patch (bare), delta (the provider's text fragments), op command, JSONL line

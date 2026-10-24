@@ -10,6 +10,7 @@
 //! gates (`cargo fmt` / clippy / `cargo test`); the workspace gates and the
 //! `architecture.rs` dependency matrix stay untouched (ADR-0024 D3).
 
+pub mod cards;
 pub mod commands;
 pub mod controller;
 pub mod settings;
@@ -103,6 +104,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             commands::compact_now,
             commands::get_settings,
             commands::set_settings,
+            commands::subscribe_cards,
+            commands::regenerate_cards,
         ])
         .run(tauri::generate_context!())
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)

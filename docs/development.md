@@ -783,6 +783,7 @@ gui/
 │   │   ├── lib.rs        # tauri::Builder + commands 注册（注入 slimcode home 与 cwd）
 │   │   ├── wire.rs       # GUI wire 事件：SdkEvent → 扁平 JSON 的穷尽映射（镜像 FFI wire.rs）
 │   │   ├── controller.rs # AppController：会话注册表 + worker 线程 + 状态机（Idle/Running/Disposed）
+│   │   ├── cards.rs      # Card view 的旁路：宿主侧镜像 + Card generator（ADR-0030）
 │   │   ├── settings.rs   # gui.toml 读写（api_key 写入 0600）
 │   │   └── commands.rs   # #[tauri::command] 面（薄壳转发，无逻辑）
 │   └── tauri.conf.json   # 标识符 slimcode-gui
@@ -809,6 +810,14 @@ gui/
   启动读出作为 SDK overrides 传入；**绝不写 `config.toml`**（那是 CLI/TUI/GUI 共享的第三层，
   GUI 写它会静默改变其它前端行为）；api_key v1 明文 + 0600，Keychain 为 v2 增强；
 - **渲染**：assistant 正文走 markdown（CommonMark + GFM，ADR-0028）：单一 `Markdown` 组件（`react-markdown` + `remark-gfm`、`skipHtml`）在渲染时解析，Block 模型仍只存原始文本，所以直播与 resume 回放同构；标题保留 `#`×N 作为 Heading marker，字号只做两档；围栏代码块带语言标签、正文 sans / 代码 mono；`http(s)` 链接经 `tauri-plugin-opener`（宿主已注册；capability 只授 `opener:allow-open-url` 且 scope 限 `http(s)`，不含文件管理器 reveal）开系统浏览器，其余 target 调用 `preventDefault` 后不跳转；图片不渲染（`img` → alt 文本占位，避免 CSP 为 null 时模型输出引发远程请求）；GFM 的任务列表勾选框降级为 `☐`/`☑` 文本、脚注引用降级为字面 `[^id]` 并丢弃其定义（否则会出现模型没写过的 “Footnotes” 标题，破坏 marker 计数）；流式不再拼 `▌` 光标；
+- **卡片区（Card view，ADR-0030）**：`cards.rs` 承载这条旁路——`CardController`（自己的 `Arc<Mutex<CardRuntime>>`，与 `ControllerInner` 分开锁：生成在 fragment 流上跑，而回合可能持着会话锁）、`CardStore`（宿主侧镜像）、`Framing`（kind 行识别）与 `generate`：
+  - **触发**：worker 里 `session.prompt()` 返回 `Completed` 后调 `cards.generate(...)`；`Cancelled` / `Err` 不触发。下一次 `prompt` 开始即 `cards.cancel()`（只取消、不 join，绝不阻塞网络读），`dispose` 才 join 全部；单飞（已有生成在跑时 `regenerate_cards` 报 `already running`）。
+  - **事件表**：`card_begin{card_id}` / `card_op{card_id, op}` / `card_end{card_id, ok}` / `cards_snapshot{cards}`，统一以 `kind` 作 tag（snake_case）；`card_id` 就是 Card kind。`subscribe_cards(channel, system_prompt)` 返回 `Vec<CardSnapshot>`，所以窗口重载靠同一次订阅恢复；新/切/删会话后宿主 `reseed()` 并推空快照。
+  - **op 原样过线**：宿主不解析、不改写 op，且**先**把 `card_op` 发给 webview、**再**自己 apply（先转发再镜像，录制方看到的就是它该看到的那一帧）。两端从同一段字节各自 apply：同一套六种 op 语义（`add` 自动建父路径、`replace` 目标缺失也写入、数组下标 splice 插入、`-` 追加、缺失的 `remove` 静默、`test` 失败则丢弃该行），逐字对齐；也都按 `\n` 切行、缓存残行、流结束时 flush。一致性由共享 fixture `gui/ui/src/fixtures/card-stream.json` 锁住：Rust 与 TS 两份测跑同一条流与同一份 expected spec。
+  - **kind 行**：模型首行必须是 `{"op":"add","path":"/kind","value":"<kind>"}`。`Framing` 缓冲到第一个换行，识别出目标卡后才 `card_begin`；kind 行**不**转发、也不进 spec（首行不是 kind 行则回落到 `result`）。每轮从空 spec 重建，所以模型要逐字复现仍适用的旧内容（这就是“同一 kind 替换 + 跨轮累积”的落地方式）。
+  - **提示词分界**：**系统提示由前端生成并透传**——`cardSystemPrompt()` 从 zod catalog（`ui/src/cardCatalog.ts`）现生成，组件词表只有这一份，宿主不留第二份描述；**user 提示由宿主拼装**——`card_user_prompt` = 会话摘要（`transcript_digest`：倒序 20 条 / 8000 字符，user 与 assistant 全文、工具调用只留名称、工具结果截断到 400 字符、更早的消息折成一行省略说明）+ 当前卡片快照 + 本次触发原因（回合完成 / 手动）。
+  - **用量**：卡片请求新建一个 provider 实例（不与会话共享），`with_cache(false).with_max_tokens(4000)`、空工具集、独立取消令牌与线程，所以既不计入会话 usage / HUD，也不占上下文。
+  - **前端**：`ui/src/cards.ts` 是纯函数 reducer（`applyFragments` / `reduceCards`，按 rAF 合批进 React），`ui/src/cardRegistry.tsx` 是九个组件的 registry（未知类型→`UnknownType` 占位、每张卡一个错误边界降级为 `Stub`），`ui/src/components/CardView.tsx` 是固定宽度的可折叠面板（DEV 构建多一个 `Preview` 按钮，用 `CARD_DEMO_OPS` 逐行回放，不花模型调用）。
 - **门禁**：`gui/` 不是 workspace member，workspace 的 `cargo test` / clippy / `architecture.rs`
   矩阵不受影响；GUI 自己的 Rust 测试在 `gui/src-tauri` 内跑（FakeProvider + `with_home(scratch)`
   注入，沿用 `crates/sdk/tests/` 模式，离线无 key）；
@@ -831,4 +840,4 @@ gui/
   harness 看的，slimcode 的 wire 消息只有文本 part（`slimcode-ai` 的 `Part::Text`），模型看不到图。
   注：objc2 那几个依赖无法同样按 `debug_assertions` 门控（Cargo 的 `target.'cfg(..)'.dependencies` 不接受该
   值），所以 macOS release 构建仍会编译这些绑定，只是模块被 dead-strip。
-- **规格**：`.scratch/gui/spec.md`（Tauri command 面、wire 事件表、验收标准）。
+- **规格**：`.scratch/gui/spec.md`（Tauri command 面、wire 事件表、验收标准）；`.scratch/gui-cards/spec.md`（Card view：catalog/registry、SpecStream op 双端 apply、kind 词表与 LRU 上限、事件表、失败语义）。

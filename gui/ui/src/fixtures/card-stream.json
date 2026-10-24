@@ -1,0 +1,66 @@
+{
+  "name": "interleaved-with-split-and-bad-lines",
+  "description": "One op stream shared by the webview reducer and the host's mirror applier (ADR-0030 D4). Fragments arrive as raw provider text: a line can be split across two fragments, a malformed line can appear mid-stream, two Cards can interleave, and the last fragment can leave an unterminated line that only the end flush closes. Both sides must converge on `expected`.",
+  "stream": [
+    { "card": "task-board", "op": "{\"op\":\"add\",\"path\":\"/root\",\"value\":\"root\"}\n" },
+    { "card": "task-board", "op": "{\"op\":\"add\",\"path\":\"/elements/root\",\"value\":{\"type\":\"Card\",\"props\":{\"title\":\"Task board\"},\"children\":[\"a\"]}}\n" },
+    { "card": "result", "op": "{\"op\":\"add\",\"path\":\"/root\",\"value\":\"root\"}\n" },
+    {
+      "card": "result",
+      "op": "{\"op\":\"add\",\"path\":\"/elements/root\",\"value\":{\"type\":\"Card\",\"props\":{\"title\":\"Result\"},\"children\":[\"x\"]}}\n"
+    },
+    {
+      "card": "task-board",
+      "op": "{\"op\":\"add\",\"path\":\"/elements/a\",\"value\":{\"type\":\"List\",\"props\":{\"items\":[{\"text\":\"R"
+    },
+    {
+      "card": "result",
+      "op": "{\"op\":\"add\",\"path\":\"/elements/x\",\"value\":{\"type\":\"Badge\",\"props\":{\"text\":\"shipped\",\"tone\":\"info\"},\"children\":[]}}\n"
+    },
+    { "card": "task-board", "op": "ead the code\",\"done\":true}]},\"children\":[]}}\n" },
+    { "card": "task-board", "op": "{\"op\":\"add\",\"path\":\n" },
+    {
+      "card": "task-board",
+      "op": "{\"op\":\"add\",\"path\":\"/elements/c\",\"value\":{\"type\":\"Badge\",\"props\":{\"text\":\"ok\",\"tone\":\"success\"},\"children\":[]}}"
+    }
+  ],
+  "expected": {
+    "task-board": {
+      "root": "root",
+      "elements": {
+        "root": {
+          "type": "Card",
+          "props": { "title": "Task board" },
+          "children": ["a"]
+        },
+        "a": {
+          "type": "List",
+          "props": {
+            "items": [{ "text": "Read the code", "done": true }]
+          },
+          "children": []
+        },
+        "c": {
+          "type": "Badge",
+          "props": { "text": "ok", "tone": "success" },
+          "children": []
+        }
+      }
+    },
+    "result": {
+      "root": "root",
+      "elements": {
+        "root": {
+          "type": "Card",
+          "props": { "title": "Result" },
+          "children": ["x"]
+        },
+        "x": {
+          "type": "Badge",
+          "props": { "text": "shipped", "tone": "info" },
+          "children": []
+        }
+      }
+    }
+  }
+}
