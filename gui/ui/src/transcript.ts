@@ -7,7 +7,8 @@
 //     (rendered dim and collapsible);
 //   - `tool_start` / `tool_result` pair into a card (running / ok / error),
 //     unpaired starts hang as running;
-//   - `usage` renders a token-usage line;
+//   - `usage` no longer paints a row (the numbers live in the top-bar
+//     Usage HUD, spec D6), so it reduces to nothing here;
 //   - `compacted` renders a collapsible notice;
 //   - a user `message` opens a user block; an assistant `message` closes the
 //     current assistant block.
@@ -21,7 +22,6 @@ import type { Chip } from "./chip";
 import type {
   AgentMessage,
   GuiWireEvent,
-  TokenUsage,
 } from "./types";
 
 export type ToolStatus = "running" | "ok" | "error";
@@ -52,7 +52,6 @@ export type Block =
   // activates a skill by reading its `SKILL.md` (the read result is a `<skill>`
   // block). The user-trigger path instead surfaces a skill chip in a user block.
   | { id: string; kind: "skill"; name: string }
-  | { id: string; kind: "usage"; usage: TokenUsage }
   | { id: string; kind: "compacted"; before: number; after: number | null }
   | { id: string; kind: "error"; text: string };
 
@@ -64,13 +63,6 @@ function nextId(): string {
 
 export function newBlockSeq(): void {
   blockSeq = 0;
-}
-
-/** A standalone token-usage block, appended on demand for the `/usage`
- *  command (mirrors the TUI's `show_usage`). Carries the session's cumulative
- *  usage, read from the current snapshot. */
-export function usageNotice(usage: TokenUsage): Block {
-  return { id: nextId(), kind: "usage", usage };
 }
 
 function reduceBlock(state: Block[], event: GuiWireEvent): Block[] {
@@ -170,10 +162,11 @@ function reduceBlock(state: Block[], event: GuiWireEvent): Block[] {
         }
       }
       break;
-    case "usage": {
-      blocks.push({ id: nextId(), kind: "usage", usage: event.usage });
+    case "usage":
+      // The `usage` event no longer paints a transcript row: the numbers live
+      // in the top-bar Usage HUD instead (spec D6). The branch stays so the
+      // switch remains exhaustive over every wire kind.
       break;
-    }
     case "compacted": {
       blocks.push({
         id: nextId(),

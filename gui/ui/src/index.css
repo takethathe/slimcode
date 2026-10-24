@@ -45,3 +45,27 @@
   border-color: var(--color-indigo-300);
   box-shadow: 0 0 0 2px var(--color-indigo-100);
 }
+
+/* The Usage HUD's `/usage` feedback: a one-shot indigo ring around the badge
+ * group (spec D7). The class is re-added on each pulse, so the animation
+ * replays from a clean state and leaves no residue once it settles. */
+@keyframes usage-hud-pulse {
+  from {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--color-indigo-500) 60%, transparent);
+  }
+  to {
+    box-shadow: 0 0 0 6px transparent;
+  }
+}
+.usage-hud-active {
+  animation: usage-hud-pulse 600ms ease-out;
+}
+
+/* Reduced motion: no pulse, just a static outline for the same window. */
+@media (prefers-reduced-motion: reduce) {
+  .usage-hud-active {
+    animation: none;
+    outline: 2px solid var(--color-indigo-400);
+    outline-offset: 1px;
+  }
+}

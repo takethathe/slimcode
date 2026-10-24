@@ -180,6 +180,28 @@ describe("model read activation (ticket 04)", () => {
   });
 });
 
+describe("usage events no longer render a transcript row (gui-usage-hud ticket 02)", () => {
+  const usageEvent: GuiWireEvent = {
+    kind: "usage",
+    usage: {
+      prompt_tokens: 3396,
+      completion_tokens: 101,
+      total_tokens: 3497,
+      prompt_tokens_details: { cached_tokens: 3334, cache_creation_input_tokens: 0 },
+    },
+  };
+
+  it("reduces a usage event to no block at all", () => {
+    expect(reduceTranscript([], [usageEvent])).toHaveLength(0);
+  });
+
+  it("leaves surrounding blocks untouched when a usage event arrives", () => {
+    const before = reduceTranscript([], [userEvent("hi")]);
+    const after = reduceTranscript(before, [usageEvent]);
+    expect(after).toEqual(before);
+  });
+});
+
 describe("intercepted local commands never chip (ticket 03 guard)", () => {
   it("the frontend intercepts the effect-mapped commands so they never reach the reducer", () => {
     for (const command of ["/new", "/compact", "/usage", "/help", "/exit"]) {

@@ -3,7 +3,6 @@ import type { Block } from "../transcript";
 import { ToolCard } from "./ToolCard";
 import { ReasoningBlock } from "./ReasoningBlock";
 import { CompactNotice } from "./CompactNotice";
-import { UsageLine } from "./UsageLine";
 import { ChipBadge } from "./Chip";
 import { Markdown } from "./Markdown";
 
@@ -115,12 +114,6 @@ function BlockView({ block }: { block: Block }) {
             argumentsRaw={block.arguments}
             result={block.result}
           />
-        </div>
-      );
-    case "usage":
-      return (
-        <div className="ml-9">
-          <UsageLine usage={block.usage} />
         </div>
       );
     case "compacted":

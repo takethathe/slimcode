@@ -5,15 +5,16 @@ import {
   blocksFromHistory,
   newBlockSeq,
   reduceTranscript,
-  usageNotice,
   type Block,
 } from "./transcript";
+import { addUsage, EMPTY_USAGE } from "./usage";
 import type {
   CompletionItem,
   ContextInfo,
   GuiSettings,
   GuiWireEvent,
   SessionInfo,
+  TokenUsage,
 } from "./types";
 import { Sidebar } from "./components/Sidebar";
 import { TopBar } from "./components/TopBar";
@@ -29,6 +30,16 @@ export default function App() {
   const [title, setTitle] = useState<string | null>(null);
   const [model, setModel] = useState("");
   const [context, setContext] = useState<ContextInfo | null>(null);
+  // The Usage HUD state (spec .scratch/gui-usage-hud): the session cumulative
+  // and the most recent request's usage. `usage` is fed by both live `usage`
+  // events and the host snapshot (which overwrites it to recalibrate); `CH`
+  // comes only from `latestUsage`, the last request seen, since the snapshot
+  // carries no per-request figure (spec D2/D5).
+  const [usage, setUsage] = useState<TokenUsage>(EMPTY_USAGE);
+  const [latestUsage, setLatestUsage] = useState<TokenUsage | null>(null);
+  // Bumping this counter asks the HUD to ring once (the `/usage` feedback, spec
+  // D7); the value itself is meaningless, only its changes drive the pulse.
+  const [usagePulse, setUsagePulse] = useState(0);
   const [warning, setWarning] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -43,6 +54,10 @@ export default function App() {
   // rAF so streaming stays smooth without re-rendering per fragment.
   const eventsRef = useRef<GuiWireEvent[]>([]);
   const flushScheduled = useRef(false);
+  // Monotonic fence for the cumulative HUD total: every local `usage` delta
+  // bumps it, and a snapshot requested before that bump is discarded when it
+  // lands — otherwise an older total would overwrite a newer one (spec D5).
+  const usageEpoch = useRef(0);
 
   const refreshSessions = useCallback(async () => {
     try {
@@ -53,12 +68,17 @@ export default function App() {
   }, []);
 
   const refreshSnapshot = useCallback(async () => {
+    const at = usageEpoch.current;
     try {
       const snapshot = await api.getSession();
       setCurrentId(snapshot.id);
       setTitle(snapshot.title);
       setModel(snapshot.model);
       setContext(snapshot.context);
+      // Recalibrate only when no `usage` event arrived while the request was
+      // in flight; the host already folded that request into its total, and a
+      // local delta may have landed on top of it meanwhile.
+      if (at === usageEpoch.current) setUsage(snapshot.usage);
       setWarning(snapshot.warning);
       return snapshot;
     } catch (e) {
@@ -73,6 +93,24 @@ export default function App() {
     if (pending.length === 0) return;
     eventsRef.current = [];
     setBlocks((prev) => reduceTranscript(prev, pending));
+    // Feed the HUD from `usage` events: fold each request into the running
+    // total so ↑/↓ tick up mid-turn, and remember the latest for `CH`. The
+    // snapshot refresh below overwrites the total to recalibrate (spec D5).
+    let hudDelta: TokenUsage | null = null;
+    let hudLatest: TokenUsage | null = null;
+    for (const e of pending) {
+      if (e.kind === "usage") {
+        hudDelta = hudDelta ? addUsage(hudDelta, e.usage) : e.usage;
+        hudLatest = e.usage;
+      }
+    }
+    if (hudDelta) {
+      // Bump the fence before the update: any snapshot already in flight was
+      // taken against the previous total and is now stale.
+      usageEpoch.current += 1;
+      setUsage((prev) => addUsage(prev, hudDelta));
+    }
+    if (hudLatest) setLatestUsage(hudLatest);
     // The authoritative end of a turn: `turn_finished` (completed/cancelled)
     // or `error` (failed). Either one releases the running state.
     if (
@@ -85,12 +123,28 @@ export default function App() {
     // `message` events drive the title/model/context refresh (ticket 06)
     // and the sidebar row (title / time / message count) refresh (spec:
     // message events drive both the sidebar and the top bar).
+    // `compacted` is the only event a manual compaction emits, and the host has
+    // already folded the summary request into the session usage by then, so it
+    // must recalibrate too — otherwise ↑/↓ and the context badge keep the
+    // pre-compaction values until the next turn ends.
     const last = pending[pending.length - 1];
-    if (last && (last.kind === "message" || last.kind === "turn_finished")) {
+    if (
+      pending.some((e) => e.kind === "compacted") ||
+      (last && (last.kind === "message" || last.kind === "turn_finished"))
+    ) {
       void refreshSnapshot();
       void refreshSessions();
     }
   }, [refreshSnapshot, refreshSessions]);
+
+  // A session swap replaces the whole counter: reset locally and fence off any
+  // snapshot taken against the previous session instead of relying on the
+  // next snapshot to zero it.
+  const resetUsage = useCallback(() => {
+    usageEpoch.current += 1;
+    setUsage(EMPTY_USAGE);
+    setLatestUsage(null);
+  }, []);
 
   const queueEvent = useCallback(
     (event: GuiWireEvent) => {
@@ -110,6 +164,7 @@ export default function App() {
       if (snapshot) {
         newBlockSeq();
         setBlocks(blocksFromHistory(snapshot.messages));
+        setLatestUsage(null);
       }
       await refreshSessions();
     })();
@@ -158,6 +213,7 @@ export default function App() {
     setBusy(true);
     try {
       await api.newSession();
+      resetUsage();
       const snapshot = await refreshSnapshot();
       if (snapshot) {
         newBlockSeq();
@@ -176,6 +232,7 @@ export default function App() {
     setBusy(true);
     try {
       await api.resumeSession(id);
+      resetUsage();
       const snapshot = await refreshSnapshot();
       if (snapshot) {
         newBlockSeq();
@@ -200,6 +257,7 @@ export default function App() {
       await refreshSessions();
       // If the deleted session was current, the host opened a fresh one.
       if (id === currentId) {
+        resetUsage();
         const snapshot = await refreshSnapshot();
         if (snapshot) {
           newBlockSeq();
@@ -235,13 +293,17 @@ export default function App() {
     }
   }
 
-  // `/usage` reports the current session's cumulative token usage as a usage
-  // line in the transcript (mirrors the TUI's `show_usage`), read fresh from
-  // the host snapshot rather than starting a model turn.
+  // `/usage` recalibrates the HUD from a fresh host snapshot and rings it once
+  // as feedback (spec D7): it no longer appends a transcript row, and it never
+  // starts a model turn.
   async function showUsage(): Promise<void> {
     try {
       const snapshot = await api.getSession();
-      setBlocks((prev) => [...prev, usageNotice(snapshot.usage)]);
+      // This reading is the freshest one available: fence off any snapshot
+      // that was requested earlier and could land after it.
+      usageEpoch.current += 1;
+      setUsage(snapshot.usage);
+      setUsagePulse((n) => n + 1);
     } catch (e) {
       setError(errorMessage(e));
     }
@@ -273,6 +335,9 @@ export default function App() {
           context={context}
           onCompact={() => void compact()}
           compacting={running}
+          usage={usage}
+          latest={latestUsage}
+          pulse={usagePulse}
         />
         {warning ? (
           <div className="border-b border-amber-200 bg-amber-50 px-4 py-1.5 text-xs text-amber-800">

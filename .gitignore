@@ -2,3 +2,5 @@ target/
 .codegraph
 .mcp.json
 .codex
+# devshot runtime screenshots (debug-only GUI capture harness output)
+.scratch/*/devshots/

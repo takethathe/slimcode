@@ -1,9 +1,16 @@
-import type { ContextInfo } from "../types";
+import { useEffect, useState } from "react";
+import type { ContextInfo, TokenUsage } from "../types";
 import { formatTokens } from "../format";
+import { cacheHitBadge, usageTooltip } from "../usage";
 
-// The top bar (spec user story 15, ticket 06): session title, model name,
-// and the context-window usage badge with threshold coloring (≤70% normal /
-// >70% warn / >90% critical — the CLI footer's thresholds, ADR-0020).
+// The top bar: session title, model name, the Compact action, and the
+// resident Usage HUD — `↑ ↓ CH ctx` (spec .scratch/gui-usage-hud). The
+// first three come from the usage module; the
+// fourth is the context-window badge with threshold coloring (≤70% normal /
+// >70% warn / >90% critical — the CLI footer's thresholds, ADR-0020). All four
+// stay resident (zero values included) so their position never jumps, and the
+// hover tooltip carries the cache read/write counts plus the full cumulative
+// summary.
 
 function formatPercent(percent: number): string {
   const tenths = Math.round(percent * 10);
@@ -24,20 +31,39 @@ const LEVEL_STYLES = {
   critical: "bg-red-50 text-red-700 ring-red-200",
 };
 
+const BADGE =
+  "inline-flex shrink-0 items-center rounded-full bg-slate-100 px-2 py-1 font-mono text-xs font-medium text-slate-600 ring-1 ring-inset ring-slate-200";
+
 export function TopBar({
   title,
   model,
   context,
   onCompact,
   compacting,
+  usage,
+  latest,
+  pulse,
 }: {
   title: string | null;
   model: string;
   context: ContextInfo | null;
   onCompact: () => void;
   compacting: boolean;
+  usage: TokenUsage;
+  latest: TokenUsage | null;
+  pulse: number;
 }) {
   const level = context ? contextLevel(context.percent) : "normal";
+  // A `/usage` bump rings the HUD once (~600ms) as feedback (spec D7). The CSS
+  // class drives a one-shot pulse; under `prefers-reduced-motion` it degrades
+  // to a static outline for the same window (see index.css).
+  const [ringing, setRinging] = useState(false);
+  useEffect(() => {
+    if (pulse <= 0) return;
+    setRinging(true);
+    const timer = setTimeout(() => setRinging(false), 600);
+    return () => clearTimeout(timer);
+  }, [pulse]);
   return (
     <header className="flex h-14 shrink-0 items-center gap-3 border-b border-slate-200 bg-white px-4">
       <div className="min-w-0 flex-1">
@@ -57,14 +83,22 @@ export function TopBar({
       >
         Compact
       </button>
-      {context ? (
-        <span
-          className={`inline-flex items-center rounded-full px-2.5 py-1 font-mono text-xs font-medium ring-1 ring-inset ${LEVEL_STYLES[level]}`}
-          title={`Estimated context usage of ${formatTokens(context.window)} token window`}
-        >
-          {formatPercent(context.percent)}/{formatTokens(context.window)}
-        </span>
-      ) : null}
+      <div
+        className={`flex shrink-0 items-center gap-1.5 rounded-full${ringing ? " usage-hud-active" : ""}`}
+        title={usageTooltip(usage, latest)}
+      >
+        <span className={BADGE}>↑{formatTokens(usage.prompt_tokens)}</span>
+        <span className={BADGE}>↓{formatTokens(usage.completion_tokens)}</span>
+        <span className={BADGE}>CH{cacheHitBadge(latest)}</span>
+        {context ? (
+          <span
+            className={`inline-flex shrink-0 items-center rounded-full px-2.5 py-1 font-mono text-xs font-medium ring-1 ring-inset ${LEVEL_STYLES[level]}`}
+            title={`Estimated context usage of ${formatTokens(context.window)} token window`}
+          >
+            {formatPercent(context.percent)}/{formatTokens(context.window)}
+          </span>
+        ) : null}
+      </div>
     </header>
   );
 }
