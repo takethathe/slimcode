@@ -10,6 +10,7 @@ slimcode：Rust 实现的 coding agent。
 2. **计划** — 读 `GLOSSARY.md` 与涉及的 `docs/adr/`，列出步骤与影响范围。
 3. **TDD** — red → green → refactor。
 4. **测试** — `cargo test` 全绿。
+   - **GUI 改动** — 运行时用 **devshot** 截图确认 webview 实际渲染（协议见 `docs/development.md` gui 一节）；devshot 只编进 debug 构建，取图须跑 `tauri dev`，release 的 `.app` 无 watcher。
 5. **文档** — 影响架构 / 接口 / 用法的改动，同步更新 `docs/` 里对应的文档（索引 `docs/index.md`）。
 6. **review** — 逐条对照本文件，确认每条纪律都已在 diff 中满足。
 7. **提交** — 按《提交规则》写 message，然后本地提交。
