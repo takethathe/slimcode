@@ -202,6 +202,13 @@ pub struct WireRequest<'a> {
     /// their byte shape; one-off requests (compaction summaries) set it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// Answer without a reasoning pass when this is `false` (Bailian
+    /// `enable_thinking`). `true` is what the provider does anyway, so it is
+    /// omitted and an ordinary request keeps its byte shape; only a one-off
+    /// request that must not spend thinking tokens — a Card spec stream — sends
+    /// the flag.
+    #[serde(skip_serializing_if = "is_true")]
+    pub enable_thinking: bool,
     pub stream: bool,
     pub stream_options: WireStreamOptions,
 }
@@ -209,6 +216,11 @@ pub struct WireRequest<'a> {
 /// `skip_serializing_if` predicate: omit a `false` flag from the request.
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// `skip_serializing_if` predicate: omit a `true` flag from the request.
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 #[derive(Serialize)]
@@ -1097,6 +1109,7 @@ mod tests {
             tools,
             parallel_tool_calls,
             max_tokens: None,
+            enable_thinking: true,
             stream: true,
             stream_options: WireStreamOptions {
                 include_usage: true,
@@ -1380,6 +1393,26 @@ mod tests {
         let mut req = wire_request(Vec::new(), None);
         req.max_tokens = Some(2048);
         assert_eq!(serde_json::to_value(&req).unwrap()["max_tokens"], 2048);
+    }
+
+    #[test]
+    fn request_omits_enable_thinking_when_on_and_serializes_it_when_off() {
+        // The default (on) keeps an ordinary request byte-identical; a one-off
+        // request that must not spend thinking tokens sends the flag.
+        let req = wire_request(Vec::new(), None);
+        assert!(
+            serde_json::to_value(&req)
+                .unwrap()
+                .get("enable_thinking")
+                .is_none()
+        );
+
+        let mut req = wire_request(Vec::new(), None);
+        req.enable_thinking = false;
+        assert_eq!(
+            serde_json::to_value(&req).unwrap()["enable_thinking"],
+            serde_json::json!(false)
+        );
     }
 
     #[test]

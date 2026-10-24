@@ -162,6 +162,9 @@ impl Provider for BailianProvider {
             // A response cap is a per-call setting (ADR-0016): `None` omits the
             // field, so ordinary turns keep their byte shape.
             max_tokens: config.max_tokens,
+            // Likewise the thinking flag: only a request that opts out sends
+            // `enable_thinking: false`.
+            enable_thinking: config.enable_thinking,
             stream: true,
             stream_options: wire::WireStreamOptions {
                 include_usage: true,

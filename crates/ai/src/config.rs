@@ -33,13 +33,21 @@ pub struct ProviderConfig {
     /// one-off requests (compaction summaries) set a conservative cap with
     /// [`ProviderConfig::with_max_tokens`].
     pub max_tokens: Option<u32>,
+    /// Whether the model may reason before answering (the wire
+    /// `enable_thinking`). On by default; `true` is the provider's own default
+    /// too, so the field stays off the wire and ordinary turns keep their byte
+    /// shape. A one-off request that only wants the answer body — a Card spec
+    /// stream — forces it off with [`ProviderConfig::with_thinking`]: thinking
+    /// tokens would be spent on reasoning nobody reads and would delay the
+    /// first patch.
+    pub enable_thinking: bool,
 }
 
 impl ProviderConfig {
     /// Construct explicitly (used by callers with their own config / tests).
-    /// Cache is on by default and no response cap is set — call
-    /// [`ProviderConfig::with_cache`] / [`ProviderConfig::with_max_tokens`] to
-    /// override.
+    /// Cache and thinking are on by default, no response cap is set — call
+    /// [`ProviderConfig::with_cache`] / [`ProviderConfig::with_max_tokens`] /
+    /// [`ProviderConfig::with_thinking`] to override.
     pub fn new(
         api_key: impl Into<String>,
         base_url: impl Into<String>,
@@ -51,6 +59,7 @@ impl ProviderConfig {
             model: model.into(),
             cache: true,
             max_tokens: None,
+            enable_thinking: true,
         }
     }
 
@@ -64,6 +73,12 @@ impl ProviderConfig {
     /// Builder-style setter for the response cap (the wire `max_tokens`).
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = Some(max_tokens);
+        self
+    }
+
+    /// Builder-style setter for the thinking flag (the wire `enable_thinking`).
+    pub fn with_thinking(mut self, thinking: bool) -> Self {
+        self.enable_thinking = thinking;
         self
     }
 
@@ -96,9 +111,10 @@ mod tests {
     }
 
     #[test]
-    fn new_defaults_cache_on() {
+    fn new_defaults_cache_on_and_thinking_on() {
         let cfg = ProviderConfig::new("k", "https://x.example.com/v1", "m");
         assert!(cfg.cache, "cache must default to on");
+        assert!(cfg.enable_thinking, "thinking must default to on");
     }
 
     #[test]
@@ -113,5 +129,13 @@ mod tests {
         let cfg = ProviderConfig::new("k", "https://x.example.com/v1", "m");
         assert_eq!(cfg.max_tokens, None);
         assert_eq!(cfg.with_max_tokens(2048).max_tokens, Some(2048));
+    }
+
+    #[test]
+    fn thinking_defaults_to_on_and_can_be_forced_off() {
+        let cfg = ProviderConfig::new("k", "https://x.example.com/v1", "m");
+        assert!(cfg.enable_thinking);
+        assert!(!cfg.clone().with_thinking(false).enable_thinking);
+        assert!(cfg.with_thinking(true).enable_thinking);
     }
 }
