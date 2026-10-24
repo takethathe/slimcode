@@ -1,13 +1,26 @@
 @import "tailwindcss";
 
 /* The GUI's light modern design language (ADR-0024 D2): slate gray-scale
- * background, indigo accent, system UI font with a monospace for code and
- * transcript text. Tailwind v4 CSS-first theme. */
+ * background, indigo accent, system UI font with a monospace for code. The
+ * markdown renderer keeps prose in the sans stack and only code in mono
+ * (ADR-0028 D3). Tailwind v4 CSS-first theme. */
 @theme {
   --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, "Helvetica Neue",
     sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas,
     monospace;
+}
+
+/* Inline code inside assistant prose. The block form is owned by the markdown
+ * renderer's <pre> wrapper, so this selector deliberately only reaches code
+ * that is not inside a <pre> (ticket 01/03, spec .scratch/gui-markdown). */
+.markdown :not(pre) > code {
+  border-radius: 0.25rem;
+  background: var(--color-slate-100);
+  padding: 0.1rem 0.3rem;
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  color: var(--color-slate-800);
 }
 
 /* Restore the native scrollbar look instead of Tailwind's preflight-reset

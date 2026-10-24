@@ -464,3 +464,7 @@ _Avoid_: backend, core process, GUI core
 **GUI wire 事件 (GUI wire event)**:
 The flat JSON event enum the GUI frontend consumes, produced by the Tauri 宿主 from each SdkEvent with an exhaustive match (mirroring the FFI 模块's wire enum, ADR-0023 D3 — `SdkEvent` / `DisplayItem` cannot derive `Serialize`), and delivered per `prompt` over a Tauri `Channel`. The frontend never sees an `SdkEvent`.
 _Avoid_: GUI event, wire payload, channel event
+
+**Heading marker**:
+The literal `#` characters (one per level) a GUI heading keeps in front of its text when rendering markdown, drawn dim and monospaced so the heading's own weight and size read separately from its level. The marker count is the first signal of hierarchy and typographic size only decorates it (two tiers), because size alone cannot tell a level-2 heading from a level-3 one. The TUI drops the marker and carries level through colour; the GUI's retention is a deliberate divergence (ADR-0028).
+_Avoid_: heading prefix, hash prefix, heading level indicator

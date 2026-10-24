@@ -5,6 +5,7 @@ import { ReasoningBlock } from "./ReasoningBlock";
 import { CompactNotice } from "./CompactNotice";
 import { UsageLine } from "./UsageLine";
 import { ChipBadge } from "./Chip";
+import { Markdown } from "./Markdown";
 
 // The transcript area: renders the block list with auto-follow scrolling —
 // it sticks to the bottom while the user is near it and pauses while the
@@ -96,12 +97,7 @@ function BlockView({ block }: { block: Block }) {
       return (
         <div className="min-w-0">
           <ReasoningBlock text={block.reasoning} />
-          {block.text ? (
-            <pre className="whitespace-pre-wrap break-words font-mono text-sm leading-relaxed text-slate-800">
-              {block.text}
-              {block.complete ? "" : "▌"}
-            </pre>
-          ) : null}
+          {block.text ? <Markdown text={block.text} /> : null}
         </div>
       );
     case "skill":

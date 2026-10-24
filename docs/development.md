@@ -808,11 +808,12 @@ gui/
 - **设置**：`gui.toml`（slimcode_home 下）存 `model` / `base_url` / `cache` / 可选 `api_key`，
   启动读出作为 SDK overrides 传入；**绝不写 `config.toml`**（那是 CLI/TUI/GUI 共享的第三层，
   GUI 写它会静默改变其它前端行为）；api_key v1 明文 + 0600，Keychain 为 v2 增强；
+- **渲染**：assistant 正文走 markdown（CommonMark + GFM，ADR-0028）：单一 `Markdown` 组件（`react-markdown` + `remark-gfm`、`skipHtml`）在渲染时解析，Block 模型仍只存原始文本，所以直播与 resume 回放同构；标题保留 `#`×N 作为 Heading marker，字号只做两档；围栏代码块带语言标签、正文 sans / 代码 mono；`http(s)` 链接经 `tauri-plugin-opener`（宿主已注册；capability 只授 `opener:allow-open-url` 且 scope 限 `http(s)`，不含文件管理器 reveal）开系统浏览器，其余 target 调用 `preventDefault` 后不跳转；图片不渲染（`img` → alt 文本占位，避免 CSP 为 null 时模型输出引发远程请求）；GFM 的任务列表勾选框降级为 `☐`/`☑` 文本、脚注引用降级为字面 `[^id]` 并丢弃其定义（否则会出现模型没写过的 “Footnotes” 标题，破坏 marker 计数）；流式不再拼 `▌` 光标；
 - **门禁**：`gui/` 不是 workspace member，workspace 的 `cargo test` / clippy / `architecture.rs`
   矩阵不受影响；GUI 自己的 Rust 测试在 `gui/src-tauri` 内跑（FakeProvider + `with_home(scratch)`
-  注入，沿用 `crates/sdk/tests/` 模式，离线无 key），前端 v1 手动验收；
+  注入，沿用 `crates/sdk/tests/` 模式，离线无 key）；
   - Rust 门禁：在 `gui/src-tauri` 里 `cargo fmt` / `cargo clippy --all-targets --all-features -- -D warnings` / `cargo test`；
-  - 前端门禁：在 `gui/ui` 里 `npx tsc --noEmit` / `npm run build`；reducer 单测（Vitest，ADR-0027 D3）在 `gui/ui` 里 `npm test`（或从 `gui/` 聚合 `npm test`），渲染层仍手动验收；
+  - 前端门禁：在 `gui/ui` 里 `npx tsc --noEmit` / `npm run build`；`npm test`（Vitest）同时跑 reducer 纯逻辑单测（ADR-0027 D3）与渲染层 DOM 单测（jsdom + Testing Library，文件级 `@vitest-environment jsdom`，ADR-0028 D6）；像素级视觉效果仍靠 devshot 截图人工确认；
   - 开发运行：`cd gui && npm install && npm run dev`（= `tauri dev`）；打包 `npm run build`（= `tauri build`，
     在 macOS 产出 `src-tauri/target/release/bundle/` 下的 .app 与 .dmg）。Tauri CLI 把**含 `package.json`
     的那层**（`gui/`，即 app root）当项目根，`beforeDevCommand` / `beforeBuildCommand` 的 CWD 也是它，

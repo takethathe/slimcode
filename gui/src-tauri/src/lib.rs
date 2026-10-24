@@ -40,7 +40,28 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let controller = AppController::new(home, cwd);
 
+    // Runtime backstop for the "the webview never navigates away" invariant
+    // (ADR-0028): the front end cancels link activation on every pointer path,
+    // but the webview's CSP is null, so the trusted bound is here. A navigation
+    // is allowed only for the app's own origin — any other-scheme or
+    // cross-origin target (an `http(s)` page, `file://`, a stray middle-click
+    // the DOM missed) is cancelled. Registered as a plugin because Tauri v2
+    // exposes `on_navigation` only through the webview/plugin builders, not the
+    // app builder, and windows are declared in `tauri.conf.json`.
+    let nav_guard = tauri::plugin::Builder::<tauri::Wry>::new("nav-guard")
+        .on_navigation(|webview, target| {
+            webview
+                .url()
+                .map(|current| current.origin() == target.origin())
+                .unwrap_or(false)
+        })
+        .build();
+
     tauri::Builder::default()
+        // Link clicks in the transcript open the system browser instead of
+        // navigating the webview away from the conversation (ADR-0028).
+        .plugin(tauri_plugin_opener::init())
+        .plugin(nav_guard)
         .manage(controller)
         .setup(|app| {
             // Start the debug screenshot watcher before the window is drawn;
