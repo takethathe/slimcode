@@ -7,7 +7,7 @@
 //! mode, the alternate screen and the exit code are all outside this module.
 
 use std::io::Stdout;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -16,7 +16,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::app::{App, Effect};
-use crate::handler::{ControlFlow, Prompt, UiHandler};
+use crate::handler::{ControlFlow, Emitter, Prompt, UiHandler};
 use crate::render::RenderItem;
 
 /// One UI-loop frame: ~80ms, matching pi's loader interval so the status
@@ -88,12 +88,16 @@ fn drive_turn<H: UiHandler>(
     let (tx, rx) = mpsc::channel::<RenderItem>();
     let worker = thread::scope(|scope| {
         let handle = scope.spawn(move || {
-            let mut emit = |item: RenderItem| {
+            // The turn's render sink: a `Send + Sync` closure feeding the
+            // channel this thread drains. The SDK reaches it from the
+            // session's dispatcher thread, so items stream live while the
+            // worker blocks in `submit`.
+            let emit: Emitter = Arc::new(move |item: RenderItem| {
                 // A closed channel means the loop is already gone; the turn
                 // still finishes so the session log stays consistent.
                 let _ = tx.send(item);
-            };
-            handler.submit(prompt, &mut emit)
+            });
+            handler.submit(prompt, &emit)
         });
 
         // A terminal/UI error is remembered but the loop still drains the

@@ -120,6 +120,51 @@ fn sdk_depends_on_app_only() {
     assert_deps("sdk", &["slimcode-app"]);
 }
 
+/// Whether one manifest names `token` in any dependency table, ignoring comment
+/// lines (prose may legitimately mention a forbidden name; the dependency
+/// tables may not).
+fn declares_in_dependency_tables(manifest: &Path, token: &str) -> bool {
+    let text =
+        fs::read_to_string(manifest).unwrap_or_else(|e| panic!("read {}: {e}", manifest.display()));
+    let mut in_dependency_table = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_dependency_table = line.ends_with("dependencies]");
+            continue;
+        }
+        if !in_dependency_table {
+            continue;
+        }
+        // Drop a trailing comment before matching.
+        let code = line.split('#').next().unwrap_or_default();
+        if code.contains(token) {
+            return true;
+        }
+    }
+    false
+}
+
+/// `engine_layers_declare_no_tokio`: the async facade (ADR-0031 D3, engine
+/// ticket 07) is runtime-agnostic, so slimcode's engine layers — `core`, `app`
+/// and `sdk` — never name tokio as a dependency (the `futures` family is the
+/// only async surface, and it carries no runtime). Checks dependency tables
+/// only, so explanatory comments mentioning tokio stay legal.
+#[test]
+fn engine_layers_declare_no_tokio() {
+    for crate_dir in ["core", "app", "sdk"] {
+        let manifest = workspace_root()
+            .join("crates")
+            .join(crate_dir)
+            .join("Cargo.toml");
+        assert!(
+            !declares_in_dependency_tables(&manifest, "tokio"),
+            "{} must not depend on tokio (the async facade is runtime-agnostic)",
+            manifest.display()
+        );
+    }
+}
+
 /// `ffi_depends_on_sdk_only`: the FFI module is a plain C ABI over the SDK and
 /// nothing more (ADR-0023 D1 / the ffi spec D1), so it never reaches into
 /// app/ai/core/commands/cli/tui — not even from a dev-dependency (this reader

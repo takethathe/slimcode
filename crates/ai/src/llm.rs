@@ -14,6 +14,7 @@ use serde_json::Value;
 
 use crate::config::ProviderConfig;
 use crate::message::Message;
+use crate::trace::SpanRecorder;
 use crate::wire::TokenUsage;
 
 /// A shared cancellation handle threaded through a run: one `Arc<AtomicBool>`
@@ -135,6 +136,31 @@ pub trait Provider {
         on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
     ) -> Result<Option<TokenUsage>, String>;
 
+    /// [`chat`](Provider::chat) widened with the current `provider.chat`
+    /// [`SpanRecorder`] (ADR-0031 D4). The kernel calls *this* around every
+    /// provider request so a provider can attach request-body attributes
+    /// (serialized payload, model, retry count) to the span the kernel opened —
+    /// attributes that must still land when the transport fails, so they are
+    /// recorded before the fallible call and flushed when the recorder drops.
+    ///
+    /// **The default forwards to [`chat`](Provider::chat) and discards the
+    /// recorder**, so every existing provider (the code-type `BailianProvider
+    /// included) keeps behaving byte-for-byte as before: the recorder seam is
+    /// strictly opt-in for hosts that want request-level spans. A bot provider
+    /// overrides this, calls `recorder.record(..)`, then delegates to its own
+    /// generation body.
+    fn chat_traced(
+        &mut self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        config: &ProviderConfig,
+        cancel: &CancelToken,
+        on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
+        _recorder: &mut SpanRecorder,
+    ) -> Result<Option<TokenUsage>, String> {
+        self.chat(messages, tools, config, cancel, on_delta)
+    }
+
     /// Cumulative usage across every request this provider has run.
     ///
     /// Kept as the provider's own running total (tests read it; the footer
@@ -158,6 +184,22 @@ impl<T: Provider + ?Sized> Provider for Box<T> {
         on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
     ) -> Result<Option<TokenUsage>, String> {
         (**self).chat(messages, tools, config, cancel, on_delta)
+    }
+
+    // Forward the traced variant to the inner provider so a bot override is
+    // honored through the `Box<dyn Provider>` the kernel holds; without this the
+    // blanket default here would call `Box::chat` and silently drop the
+    // recorder, bypassing the inner `chat_traced`.
+    fn chat_traced(
+        &mut self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        config: &ProviderConfig,
+        cancel: &CancelToken,
+        on_delta: &mut dyn FnMut(Delta) -> Result<(), String>,
+        recorder: &mut SpanRecorder,
+    ) -> Result<Option<TokenUsage>, String> {
+        (**self).chat_traced(messages, tools, config, cancel, on_delta, recorder)
     }
 
     fn total_usage(&self) -> TokenUsage {

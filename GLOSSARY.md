@@ -103,23 +103,85 @@ _Avoid_: parallel function call, 并行函数调用
 
 **AgentRunner**:
 The runtime loop of one run as a value: it holds that run's tools, config, cancel token, event
-subscription and optional Run hooks, and takes the provider, system prompt and message history per
+subscription and optional phase hooks, and takes the provider, system prompt and message history per
 call. It replaced the free loop functions, so a boundary (a hook, a subscriber) has one place to
 attach to.
 _Avoid_: executor, driver, agent loop (as a function)
 
-**Run hooks**:
-The optional callbacks an AgentRunner invokes at its boundaries: before a Tool batch's calls are
-dispatched, as each tool result is about to enter history, and once when the run stops. All of them
-default to unset, and a hook may rewrite the AgentMessage it is handed — so the model, the session
-log and the display all see the rewritten message.
-_Avoid_: middleware, interceptor, plugin
-
 **ToolDecision**:
-What a before-tool hook returns for one call: run it, or skip execution and supply the result the
+What a pre-tool hook returns for one call: run it, or skip execution and supply the result the
 model will see. A skip still yields a tool result, because every `tool_call` must be paired with
 one.
 _Avoid_: verdict, action, permission
+
+**Engine**:
+The portable agent loop underneath the SDK — a single reusable loop kernel plus its public seams — that
+drives both a coding agent and a bot agent. It is what a host embeds to borrow only the loop and own
+everything else; distinct from the SDK, which is a whole-product session embed on top of it.
+_Avoid_: runtime, executor, agent loop (the informal name)
+
+**Loop skeleton**:
+The one irreducible, non-replaceable part of the Engine: iterate — assemble context, call the
+provider, handle the response, dispatch tools, collect results — until the model stops calling tools,
+or the caller cancels, or the provider errors. Everything around it lives on a seam.
+_Avoid_: kernel (bare — collides with no-OS meaning), core loop
+
+**Operand**:
+Something the loop skeleton calls directly to make progress — the provider and the tool execution, plus
+the run's inputs (message history, cancellation, guardrails). Operands are handed to the Engine by the
+host and are deliberately not hooks; they are the skeleton's verbs, not cross-cutting behavior.
+_Avoid_: hook, component, service
+
+**Phase hook**:
+A cross-cutting seam at one of the loop's boundaries where a host registers behavior — it receives the
+run's mutable state and may rewrite the message list about to enter history, veto or skip a tool call,
+or abort the run. The boundaries are the seven turn phases (pre-turn, pre-chat, after-chat, pre-tool,
+after-tool, post-iteration, after-turn); multiple hooks attach to one phase and run in order. The
+loop's own turn maintenance — assembling context, calling the provider, appending and persisting
+results — belongs to the skeleton and its Operands, not to a phase hook; a host may nonetheless
+register a hook that rewrites that history, overriding the default. slimcode wires its defaults across
+the seam that fits each: cross-cutting veto/rewrite as phase hooks, the provider and tool execution as
+operands, compaction as a turn-end component, persistence as the message sink — no single seam holds
+them all.
+_Avoid_: middleware, interceptor, plugin
+
+**Preset**:
+The Engine configured with one bundle of defaults for an agent kind. A **code preset** is the
+Engine with the coding-agent bundle (context files, skills, JSONL persistence, turn-end compaction,
+the seven tools) and is behavior-identical to today's slimcode; a **bot preset** swaps in the
+bot bundle (memory and runtime-context injection, governance, rollback, consolidation, channel
+broadcast, trace). The two kinds are one Engine differing only in which defaults are wired into its
+seams.
+_Avoid_: profile, mode, config
+
+**Event bus**:
+The Engine's read-only event channel: streamed deltas, per-message history entries, turn finish,
+compaction, and span start/end are published to a bounded bus so a slow subscriber cannot stall the
+loop thread and bursts are absorbed. The turn's terminal events are delivered only after the run's
+taken state is put back, so a subscriber reading the session there sees the finished turn, never the
+pre-turn snapshot.
+_Avoid_: callback, notifier, signal
+
+**Async facade**:
+The Engine's asynchronous front — a non-blocking prompt future and a runtime-agnostic event stream —
+over a synchronous loop kernel running on its own thread. The kernel and its operands stay
+synchronous (a coding-agent host crosses no bridge); an async host adapts its own provider/tool to
+the synchronous operands at this boundary. slimcode stays free of any specific async runtime.
+_Avoid_: async engine, event loop, reactor
+
+**Guardrail**:
+An optional per-run loop cap — a maximum iteration count or a wall-clock timeout — that stops a run
+under control at a turn boundary and reports a distinguishable stop reason. Both default to unset, so
+a coding agent runs uncapped (the model decides when to end); a bot run sets them. A timeout is
+honored at boundaries like a cancel, never mid-request.
+_Avoid_: budget, quota, limit (bare — collides with the session storage quota)
+
+**Rollback cursor**:
+The message count a run started with (`initial_message_count`), the baseline a bot-type default
+after-turn hook truncates back to when a turn is interrupted (cancelled or aborted), so a half-applied
+turn leaves the session where it began. The kernel never rolls back on its own; registering the hook is
+what enables it, leaving the code preset's path unaffected.
+_Avoid_: undo, checkpoint (bare — collides with the compaction checkpoint)
 
 **Session store**:
 The project-scoped place sessions are persisted: one directory per project
@@ -410,7 +472,7 @@ The SDK's event payload a subscriber receives from `AgentSession::subscribe`: `D
 message as it enters history — the user prompt and tool results carry `usage: None`, assistant
 replies carry the request's usage), `TurnFinished { stop_reason }` (the authoritative end of one `prompt`, roughly
 pi's `agent_settled`), and `Compacted { before, after }` (an auto-compaction just replaced an old
-history span). Delivered synchronously on the turn's calling thread, in subscription order. The
+history span). Published through the bounded event bus and delivered in subscription order. The
 turn-end pair (`TurnFinished`, then an optional `Compacted`) is delivered after the turn's taken
 provider / tools / session state is put back, so a listener reading the session there
 (`messages()` / `usage()`) sees the finished turn, never the pre-turn snapshot.

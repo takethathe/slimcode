@@ -131,14 +131,15 @@ tool_call_id，已不含日志专用字段），`core` 拥有会话单元 `Agent
 
 循环是一个值：`AgentRunner`（借用式 per-run：tools / `RunConfig` / `&ProviderConfig` / `CancelToken` / 事件订阅，
 `run(provider, system, messages)` 驱动，返回更新后的 history 与 stop reason；ADR-0011 D1，
-provider config seam 见 ADR-0016，hook seam 见 ADR-0015）。折入自 ticket 04 原型，决策：
+provider config seam 见 ADR-0016，扩展 seam 见下文「可移植 Engine 与七阶段管线」（ADR-0031，已取代 ADR-0015 的三钩子））。折入自 ticket 04 原型，决策：
 
 - 循环：模型带 `tool_calls` 的响应 → 执行工具 → 追加 `role: tool` 结果 → 循环，直到模型不再调工具；
-- 停止：无 tool_calls → `Completed`（coding agent 无迭代上限，何时结束由模型决定）；
-  取消（ticket 07）→ `StopReason::Cancelled`——`CancelToken`（`Arc<AtomicBool>`，`new`/`cancel`/
+- 停止：无 tool_calls → `Completed`；取消（ticket 07）→ `StopReason::Cancelled`——`CancelToken`（`Arc<AtomicBool>`，`new`/`cancel`/
   `reset`/`is_cancelled`/`Clone`）由每个 run 入口携带，在每个 runner 边界检查：provider chat 之前、
   chat 返回 Err 时若 flag 置位视为静默 Cancelled 而非错误、已流出的 deltas 之后（半段文本不落 history）、
   每个工具派发前后（串行/并行）。已 push 的工具结果保留；
+- 默认**无迭代上限**（coding agent 何时结束由模型决定）；`RunConfig` 的两个**可选**护栏（ticket 08）
+  为 bot 型按需开启，未设即逐字节回到无上限旧行为——见下文「护栏与回滚游标」；
 - 工具执行默认**并行**（ADR-0010）：一个 Tool batch 内的调用各在 scoped thread 上真并发，
   事件按完成顺序流出、结果按模型返回顺序（`tool_calls` 的 index）进 history；取消在批次应用前
   检查，已 push 的结果保留、未应用的不追加。`RunConfig.parallel_tools` 默认 `true`，
@@ -158,6 +159,53 @@ provider config seam 见 ADR-0016，hook seam 见 ADR-0015）。折入自 ticket
 - 流式 delta（`Reasoning`/`Text`/`ToolCallStart`/`ToolCallArgs`/`Done`）镜像 ticket 05 实测 wire 形状，`assemble` 负责拼接；
   delta **不经过返回值**：provider 在收到时即时 push 进 `on_delta` sink（ADR-0019），runner 边转发
   `AgentEvent::Stream` 边累积同一份列表交给 `assemble`，因此只有一次投递、不会重复渲染。
+
+### 可移植 Engine 与七阶段管线（ADR-0031）
+
+把 slimcode 的同步循环内核升级为**可移植的通用 agent 引擎**：循环骨架是唯一不可换的内核，负责
+一回合的默认维护（装配 context、调用 provider、追加结果、持久化）。产品行为按各自贴合的接缝
+分布——跨切的否决/改写是**宿主可替换、可关闭的 phase hook**，provider 与工具执行是 operands，
+压缩是 turn-end component，持久化是 message sink，trace 是内核 RAII span——不再有单一「特权内部」
+把所有行为焊死在循环里；宿主可注册 hook 改写 `RunState::messages` 来覆盖默认维护。slimcode 自身
+只挂少数 hook（`pre_tool` skill 拦截、bot 侧 `after_turn` 回滚），其余走上述默认接缝。整条迁移以
+「逻辑等效」为铁律——code preset 的外部可观测面逐字节不变，由工单 01 的等效性集成基线（两条
+`equivalence_baseline` 快照，sdk 与 app 各一）钉死。
+
+- **七阶段管线**（core `agent::PhaseHooks`）：`pre_turn / pre_chat / after_chat / pre_tool /
+  after_tool / post_iteration / after_turn`，穿过一份不可变 `RunSpec`（tools / `RunConfig` /
+  `ProviderConfig` / cancel / system）与一份可变 `RunState`（`messages` / `turn` / `iterations` /
+  `initial_message_count` / 类型化 `Extensions`）。流程控制：非工具相位回 `HookAction`（Continue /
+  Abort{reason}），`pre_tool` 每调用回 `ToolHookAction`（Execute / Skip{result} / Abort{reason}），
+  `after_tool`、`after_turn` 回 `Result<()>`（只改写、不否决）。`after_turn` 无论 Completed /
+  Cancelled / Abort 恒运行（错误路径除外），承接回滚 / 收尾 / 终态事件。**每个相位只在自身列表非空时
+  才迭代调用**——空 bundle 即逐字节回到管线前的循环（等效 gate 的真实机制：各相位对空 `Vec` 天然短路，
+  无需额外开关）。
+- **公开构造面**（app `engine::Engine`）：一次 build 选一个 `Preset`（`Code{skills,cwd,history}` = 默认
+  code bundle，即 SDK 装配的那套；`Custom(PhaseHooks)` = 自带 bundle，如 bot preset），注入 operands、
+  `Tracer`、`RunConfig`（`with_tracer` / `with_run_config` / `with_preset`）。Engine 单回合一次性：借用
+  operands 跑一次 `run_turn`（宿主像 SDK 那样 take/put 自己的 provider）。SDK 的每个回合都经此公共面
+  装配 code preset，使产品行为与任意外部宿主接线方式一致。`Tracer: None` + 空 bundle 即裸循环。
+- **护栏与回滚游标**（ticket 08）：`RunConfig` 两个**可选**字段 `max_iterations: Option<usize>` 与
+  `timeout: Option<Duration>`，默认 `None`（code 型不设上限）。设了就在**回合边界受控停止**并给可区分的
+  `StopReason::MaxIterations` / `StopReason::Timeout`（超时像取消一样只在边界兑现、不打断在途请求）。
+  `RunState::initial_message_count` 是 run 入口的消息数基线游标；**回滚是 bot hook bundle 的可选件**
+  （app `preset::bot_phase_hooks` / `rollback_after_turn`）：一个默认 `after_turn` hook 在取消/中止时把
+  `messages` 截回该游标，使半截回合不留痕；内核自身从不回滚，故 code 默认路径（不挂此 hook）无感。
+  FFI / GUI / CLI 对新增 `StopReason` 变体的穷尽匹配走 catch-all——这些变体在 code preset 永不触发，
+  wire 词汇与返回码不变。
+- **trace 内建 seam**（ADR-0031 D4）：`ai::trace::{Tracer, SpanRecorder}`；`Provider::chat_traced`（默认方法
+  转发 `chat`）让 provider 往 `provider.chat` span 记属性。core 在 `iteration` / `provider.chat` /
+  `tool.{name}` 三处开 RAII span（recorder drop 即收尾，错误路径也 flush）。`tracer: None` 时全部是静默
+  no-op、`chat_traced` 逐字节等于 `chat`。测试证据见 `crates/app/tests/engine_trace.rs`（`TestTraceBackend`）。
+- **event bus 投递**（sdk）：回合内的事件不再在循环线程上同步回调订阅者，而是投进一条有界
+  `sync_channel(256)`，由每会话一个 dispatcher 线程取出再扇给订阅者；慢/阻塞订阅者不 stall 内核线程，
+   panic 订阅者被 `catch_unwind` 隔离。`prompt` / `compact_now` 末尾有一道 flush 屏障，保证**宿主视角仍同步**
+  （终态事件在会话状态回填后才送达，顺序契约不变）→ golden 与 FFI 逐字节不变。见 `crates/sdk/src/bus.rs`。
+- **runtime-agnostic async 门面**（ticket 07，sdk `facade`）：`AgentSession::prompt_async(Arc<Self>, text)` 在一条
+  专用 OS 线程（`thread::Builder`，非 tokio）跑同步 `prompt` 并返回 `PromptFuture`（`oneshot` 包装）；
+  `event_stream(&self)` 订阅 bus 并转发为 `EventStream`（实现 `futures_core::Stream`，drop 时 unsubscribe）。
+  operand 仍是同步 trait，异步宿主用宿主侧 `block_on` shim 在专用线程过桥。只依赖 `futures-*`，
+  **core/app/sdk 不引 tokio**（由 `architecture.rs::engine_layers_declare_no_tokio` 断言）。GUI/FFI 继续走同步面。
 
 ### crates/commands 命令注册表（`slimcode-commands`）
 

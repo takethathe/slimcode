@@ -10,7 +10,6 @@
 //! responsive and knows the app through two vocabularies: [`Effect`]s out,
 //! [`RenderItem`]s in.
 
-use std::cell::Cell;
 use std::io::{Write, stdout};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -36,7 +35,7 @@ use slimcode_sdk::{
 use slimcode_tui::app::{App, Effect};
 use slimcode_tui::git::{current_branch, terminal_title};
 use slimcode_tui::handler::{
-    CompletionItem, CompletionProvider, ControlFlow, Prompt, TurnReport, UiHandler,
+    CompletionItem, CompletionProvider, ControlFlow, Emitter, Prompt, TurnReport, UiHandler,
 };
 use slimcode_tui::render::{RenderItem, SessionRow};
 
@@ -192,66 +191,40 @@ impl CompletionProvider for CliCompletions {
     }
 }
 
-// The emit channel of whichever thread is driving a turn.
+// The current turn's render sink, held per session.
 //
-// The SDK delivers its events synchronously on the thread that called
-// `prompt` / `compact_now`, and the session's listener has no other way to
-// reach the library's `emit` callback (which is only valid for the duration
-// of that call). `submit` (the worker thread) and `/compact` (the frame
-// thread) therefore bind their own `emit` here for the call, and the listener
-// reads the slot on the same thread: a thread-local, so there is no locking
-// and no cross-thread access.
-thread_local! {
-    static EMIT_SLOT: Cell<Option<*mut ErasedEmit>> = const { Cell::new(None) };
-}
+// The SDK delivers its events over the session's bounded event bus, on the
+// session's dispatcher thread — not on the thread that called `prompt` /
+// `compact_now`. The session's listener has no other way to reach the sink a
+// turn handed in, so `submit` (the worker thread) and `/compact` (the frame
+// thread) bind the sink here for the duration of the call and the listener
+// reads it from the dispatcher thread. It lives per session (not a global)
+// because concurrent sessions must not clobber each other's sink, and it is
+// `Send + Sync` because the binding thread and the reading thread differ.
+type EmitSlot = Arc<Mutex<Option<Emitter>>>;
 
-/// `dyn FnMut(RenderItem)` with the (scoped) borrow's lifetime erased, so a
-/// thread-local can hold a pointer to the caller's closure. The erasure is
-/// only sound inside [`with_emit_slot`]'s scope; nothing else may build one.
-type ErasedEmit = dyn FnMut(RenderItem) + 'static;
-
-/// Bind `emit` as this thread's channel for the duration of `f`, clearing the
-/// slot afterwards even on unwind.
-fn with_emit_slot<R>(emit: &mut dyn FnMut(RenderItem), f: impl FnOnce() -> R) -> R {
+/// Bind `emit` as the session's render sink for the duration of `f`, clearing
+/// the slot afterwards even on unwind.
+fn with_slot<R>(slot: &EmitSlot, emit: Emitter, f: impl FnOnce() -> R) -> R {
     /// Clears the slot on every exit path.
-    struct Clear;
+    struct Clear(EmitSlot);
     impl Drop for Clear {
         fn drop(&mut self) {
-            EMIT_SLOT.with(|slot| slot.set(None));
+            *self.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
     }
-    let pointer: *mut (dyn FnMut(RenderItem) + '_) = emit;
-    // SAFETY: `pointer` is derived from `emit`, which stays borrowed for the
-    // whole call, and the slot is cleared by the guard below before that
-    // borrow ends — so the erased lifetime is never observed outside the
-    // scope the pointer is valid in.
-    let erased = unsafe {
-        std::mem::transmute_copy::<*mut (dyn FnMut(RenderItem) + '_), *mut ErasedEmit>(&pointer)
-    };
-    EMIT_SLOT.with(|slot| slot.set(Some(erased)));
-    let _clear = Clear;
+    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(emit);
+    let _clear = Clear(Arc::clone(slot));
     f()
 }
 
-/// Forward one render item to this thread's bound channel. An item arriving
-/// with no channel bound is dropped: events only arrive on a thread driving a
-/// turn, which always binds one.
-fn emit_render_item(item: RenderItem) {
-    let emit = EMIT_SLOT.with(|slot| slot.get());
-    if let Some(emit) = emit {
-        // SAFETY: the slot holds a pointer derived from the `&mut` that
-        // `with_emit_slot` still borrows for the whole call, and it is set and
-        // read on that thread only (the slot is thread-local) and cleared
-        // before the borrow ends, so the reference cannot outlive it or race
-        // another access.
-        let emit = unsafe { &mut *emit };
+/// Forward one render item to the sink currently bound in `slot`. An item
+/// arriving with nothing bound is dropped: events only arrive while a turn is
+/// driving a call, which always binds one.
+fn emit_into(slot: &EmitSlot, item: RenderItem) {
+    if let Some(emit) = slot.lock().unwrap_or_else(|e| e.into_inner()).clone() {
         emit(item);
     }
-}
-
-/// The closure form of [`emit_render_item`], for the `emit` parameters.
-fn slot_emitter() -> impl FnMut(RenderItem) {
-    emit_render_item
 }
 
 /// Rebuilds one session's provider and tools.
@@ -263,11 +236,13 @@ fn slot_emitter() -> impl FnMut(RenderItem) {
 type SessionDeps = Arc<dyn Fn() -> (Box<dyn Provider + Send>, Vec<Tool>) + Send + Sync>;
 
 /// The session the handler currently drives and the adapter its events render
-/// through. Both are `Arc`-shared: a turn runs on the worker thread with a
-/// clone of the session, and the session's listener holds the adapter.
+/// through. All three are `Arc`-shared: a turn runs on the worker thread with a
+/// clone of the session, the session's listener holds the adapter and the
+/// render slot, and the slot hands the listener the current turn's sink.
 struct Inner {
     session: Arc<AgentSession>,
     adapter: Arc<Mutex<TuiAdapter>>,
+    emitter: EmitSlot,
 }
 
 /// Open a session and the adapter its events render through.
@@ -309,16 +284,24 @@ fn open_session(
     // first usage render must report.
     adapter.reseed(session.messages(), session.usage());
     let adapter = Arc::new(Mutex::new(adapter));
+    // The slot a turn binds its sink into; the listener reads it on the
+    // session's dispatcher thread.
+    let emitter: EmitSlot = Arc::new(Mutex::new(None));
     // The returned unsubscribe handle is dropped on purpose: the listener
     // lives for the session's whole life, and `dispose` clears it.
     let _unsubscribe = session.subscribe({
         let adapter = Arc::clone(&adapter);
+        let emitter = Arc::clone(&emitter);
         // A weak handle, not a clone: the listener lives inside the session's
         // listener list, so holding the session strongly here would leak it.
         let session = Arc::downgrade(&session);
-        move |event| route_event(&adapter, session.upgrade().as_deref(), event)
+        move |event| route_event(&adapter, session.upgrade().as_deref(), &emitter, event)
     });
-    Ok(Inner { session, adapter })
+    Ok(Inner {
+        session,
+        adapter,
+        emitter,
+    })
 }
 
 /// Route one SDK event: display items render through the adapter, messages
@@ -330,8 +313,13 @@ fn open_session(
 ///
 /// `session` is `None` only when the session is already gone (the listener
 /// cannot outlive it for long).
-fn route_event(adapter: &Arc<Mutex<TuiAdapter>>, session: Option<&AgentSession>, event: SdkEvent) {
-    let mut emit = slot_emitter();
+fn route_event(
+    adapter: &Arc<Mutex<TuiAdapter>>,
+    session: Option<&AgentSession>,
+    emitter: &EmitSlot,
+    event: SdkEvent,
+) {
+    let mut emit = |item: RenderItem| emit_into(emitter, item);
     let adapter = adapter.lock().unwrap_or_else(|e| e.into_inner());
     match event {
         SdkEvent::Display(item) => adapter.render(&item, &mut emit),
@@ -411,11 +399,16 @@ impl<'a> TuiSession<'a> {
         Arc::clone(&self.inner.lock().unwrap_or_else(|e| e.into_inner()).session)
     }
 
-    /// The session and the adapter its events render through, cloned out the
-    /// same way.
-    fn current(&self) -> (Arc<AgentSession>, Arc<Mutex<TuiAdapter>>) {
+    /// The session, the adapter its events render through, and the render slot
+    /// a turn binds its sink into — all cloned out under a short lock, so
+    /// nothing is held across a turn and `cancel` never waits for one.
+    fn current(&self) -> (Arc<AgentSession>, Arc<Mutex<TuiAdapter>>, EmitSlot) {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        (Arc::clone(&inner.session), Arc::clone(&inner.adapter))
+        (
+            Arc::clone(&inner.session),
+            Arc::clone(&inner.adapter),
+            Arc::clone(&inner.emitter),
+        )
     }
 
     fn session_id(&self) -> String {
@@ -443,6 +436,7 @@ impl<'a> TuiSession<'a> {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let old = std::mem::replace(&mut inner.session, opened.session);
             inner.adapter = opened.adapter;
+            inner.emitter = opened.emitter;
             old
         };
         old.dispose();
@@ -766,16 +760,28 @@ impl<'a> TuiSession<'a> {
     /// `/compact`: summarize the live session's older history on demand,
     /// regardless of the threshold (spec `.scratch/compact`).
     ///
-    /// The frame thread drives the compaction, so it binds its own emit channel
-    /// for the call: the session's listener renders the result through it —
-    /// the footer's usage + context and the token change — exactly like the
-    /// automatic path, which reaches the same `Compacted` event. Only a failure
-    /// is reported here, from the return value (the automatic path stays silent
-    /// for failures).
+    /// The frame thread drives the compaction, so it hands the session's
+    /// render slot a buffering sink for the call: the SDK delivers the result
+    /// on the session's dispatcher thread while this thread blocks, and every
+    /// item is forwarded to the caller in order once the call — and its flush
+    /// barrier — returns. The rendered result — the footer's usage + context
+    /// and the token change — is exactly the automatic path's, because both
+    /// reach the same `Compacted` event. Only a failure is reported here, from
+    /// the return value (the automatic path stays silent for failures).
     fn compact_now(&self, emit: &mut dyn FnMut(RenderItem)) -> ControlFlow {
-        let session = self.session();
+        let (session, _, emitter) = self.current();
         emit(RenderItem::Notice("compressing context…".to_string()));
-        let result = with_emit_slot(emit, || session.compact_now());
+        let buffer: Arc<Mutex<Vec<RenderItem>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink: Emitter = {
+            let buffer = Arc::clone(&buffer);
+            Arc::new(move |item| {
+                buffer.lock().unwrap_or_else(|e| e.into_inner()).push(item);
+            })
+        };
+        let result = with_slot(&emitter, sink, || session.compact_now());
+        for item in buffer.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
+            emit(item);
+        }
         if let Err(e) = result {
             emit(RenderItem::Error(format!("compaction failed: {e}")));
         }
@@ -798,15 +804,12 @@ impl UiHandler for TuiSession<'_> {
         }
     }
 
-    fn submit(
-        &self,
-        prompt: Prompt,
-        emit: &mut dyn FnMut(RenderItem),
-    ) -> Result<TurnReport, String> {
-        // A short lock clones the session and its adapter out; the turn then
-        // runs without holding anything, so `cancel` (the frame thread) only
-        // ever touches the session's cancel token and never waits here.
-        let (session, adapter) = self.current();
+    fn submit(&self, prompt: Prompt, emit: &Emitter) -> Result<TurnReport, String> {
+        // A short lock clones the session, its adapter and the render slot out;
+        // the turn then runs without holding anything, so `cancel` (the frame
+        // thread) only ever touches the session's cancel token and never waits
+        // here.
+        let (session, adapter, emitter) = self.current();
         // The typed prompt is recorded before the turn, so a failed turn still
         // records what the user wrote (input history stays a CLI concern,
         // ADR-0013 D3).
@@ -823,10 +826,11 @@ impl UiHandler for TuiSession<'_> {
             .unwrap_or_else(|e| e.into_inner())
             .reseed(session.messages(), session.usage());
         let before = session.messages().len();
-        // The SDK delivers its events synchronously on this worker thread and
-        // only while `prompt` runs, so binding this thread's emit channel here
-        // is what keeps the turn streaming into the transcript.
-        let result = with_emit_slot(emit, || session.prompt(&prompt.text));
+        // Bind this turn's sink for the call: the SDK delivers the turn's
+        // events on the session's dispatcher thread, which reads them from the
+        // slot — this is what keeps the turn streaming into the transcript, and
+        // `prompt` returns only once every event has been delivered.
+        let result = with_slot(&emitter, Arc::clone(emit), || session.prompt(&prompt.text));
         result.map(|_| TurnReport {
             // `appended` counts what the turn itself produced: everything that
             // entered history except the prompt it was built from.
@@ -1280,6 +1284,24 @@ mod tests {
         }
     }
 
+    /// A render sink that drops every item — `submit` now takes a `&Emitter`.
+    fn discard() -> Emitter {
+        Arc::new(|_| {})
+    }
+
+    /// A `submit` sink plus the shared vector it records into, so a test can
+    /// read the items a turn streamed while the call ran on another thread.
+    fn collector() -> (Emitter, Arc<Mutex<Vec<RenderItem>>>) {
+        let items: Arc<Mutex<Vec<RenderItem>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let items = Arc::clone(&items);
+            Arc::new(move |item| {
+                items.lock().unwrap_or_else(|e| e.into_inner()).push(item);
+            })
+        };
+        (sink, items)
+    }
+
     /// The current session's messages.
     fn messages(handler: &TuiSession<'_>) -> Vec<AgentMessage> {
         handler.session().messages()
@@ -1618,7 +1640,7 @@ mod tests {
             Delta::Done(FinishReason::Stop),
         ]]);
         let mut handler = fx.handler(provider, no_tools());
-        handler.submit(user_message("one"), &mut |_| {}).unwrap();
+        handler.submit(user_message("one"), &discard()).unwrap();
         let id = handler.session_id();
         let before = messages(&handler);
 
@@ -1660,7 +1682,7 @@ mod tests {
         ]])
         .with_per_call(usage);
         let mut handler = fx.handler(provider, no_tools());
-        handler.submit(user_message("one"), &mut |_| {}).unwrap();
+        handler.submit(user_message("one"), &discard()).unwrap();
         // The session, not the provider, is the display's source (ADR-0018 D4).
         assert_eq!(handler.session().usage(), usage);
         assert_eq!(
@@ -1701,10 +1723,11 @@ mod tests {
         let mut handler = fx.handler(provider, probe_tools());
         let id = handler.session_id();
 
-        let mut items = Vec::new();
+        let (sink, items) = collector();
         handler
-            .submit(user_message("go"), &mut |item| items.push(item))
+            .submit(user_message("go"), &sink)
             .expect("turn succeeds");
+        let items = items.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
         // Two requests × (10 prompt + 5 completion), counted once each.
         assert_eq!(
@@ -1764,8 +1787,8 @@ mod tests {
             ..Default::default()
         });
         let handler = fx.handler(provider, no_tools());
-        handler.submit(user_message("one"), &mut |_| {}).unwrap();
-        handler.submit(user_message("two"), &mut |_| {}).unwrap();
+        handler.submit(user_message("one"), &discard()).unwrap();
+        handler.submit(user_message("two"), &discard()).unwrap();
 
         // Each turn adds its own request only; the total is not the running
         // counter read twice.
@@ -1794,10 +1817,11 @@ mod tests {
         })
         .cancels_on(1);
         let handler = fx.handler(provider, no_tools());
-        let mut items = Vec::new();
+        let (sink, items) = collector();
         handler
-            .submit(user_message("go"), &mut |item| items.push(item))
+            .submit(user_message("go"), &sink)
             .expect("a cancelled turn is not an error");
+        let items = items.lock().unwrap_or_else(|e| e.into_inner()).clone();
         assert_eq!(handler.session().usage(), TokenUsage::default());
         assert!(
             !items.iter().any(|i| matches!(i, RenderItem::Usage { .. })),
@@ -1819,7 +1843,7 @@ mod tests {
             ..Default::default()
         });
         let mut handler = fx.handler(provider, no_tools());
-        handler.submit(user_message("one"), &mut |_| {}).unwrap();
+        handler.submit(user_message("one"), &discard()).unwrap();
         assert_eq!(handler.session().usage().total_tokens, 15);
 
         command(&mut handler, "/new");
@@ -1906,7 +1930,7 @@ mod tests {
             ..Default::default()
         });
         let mut handler = fx.handler(provider, no_tools());
-        handler.submit(user_message("one"), &mut |_| {}).unwrap();
+        handler.submit(user_message("one"), &discard()).unwrap();
         assert_eq!(handler.session().usage().total_tokens, 15);
 
         // The previous session's numbers must not follow the load.
@@ -1962,10 +1986,11 @@ mod tests {
         let handler = fx.handler(provider, no_tools());
         let id = handler.session_id();
 
-        let mut items = Vec::new();
+        let (sink, items) = collector();
         let report = handler
-            .submit(user_message("hi"), &mut |item| items.push(item))
+            .submit(user_message("hi"), &sink)
             .expect("turn succeeds");
+        let items = items.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
         // The user prompt plus the assistant reply entered the log.
         // `appended` counts what the turn itself produced: the assistant
@@ -1998,7 +2023,7 @@ mod tests {
                     text: "replayed".to_string(),
                     record: false,
                 },
-                &mut |_| {},
+                &discard(),
             )
             .unwrap();
         assert!(fx.history.load().unwrap().is_empty());
@@ -2033,7 +2058,7 @@ mod tests {
         let id = handler.session_id();
 
         let err = handler
-            .submit(user_message("do it"), &mut |_| {})
+            .submit(user_message("do it"), &discard())
             .expect_err("the provider fails");
         assert_eq!(err, "boom");
 
@@ -2069,11 +2094,11 @@ mod tests {
         let handler = fx.handler(provider, no_tools());
         let id = handler.session_id();
         handler
-            .submit(user_message("one"), &mut |_| {})
+            .submit(user_message("one"), &discard())
             .expect("first turn succeeds");
 
         let err = handler
-            .submit(user_message("two"), &mut |_| {})
+            .submit(user_message("two"), &discard())
             .expect_err("second turn fails");
         assert_eq!(err, "boom");
 
@@ -2094,7 +2119,7 @@ mod tests {
         let handler = fx.handler(FakeProvider::failing_at_zero(), no_tools());
         let id = handler.session_id();
         handler
-            .submit(user_message("only"), &mut |_| {})
+            .submit(user_message("only"), &discard())
             .expect_err("the provider fails");
         // Nothing worth persisting: the log must not exist (ADR-0009 D5).
         let path = fx.store.session_path(&id).expect("path");
@@ -2124,7 +2149,7 @@ mod tests {
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 handler
-                    .submit(user_message("go"), &mut |_| {})
+                    .submit(user_message("go"), &discard())
                     .expect("a cancelled turn is not an error");
             });
             gate.wait_entered();
@@ -2133,7 +2158,7 @@ mod tests {
         });
 
         let report = handler
-            .submit(user_message("again"), &mut |_| {})
+            .submit(user_message("again"), &discard())
             .expect("turn succeeds");
         assert_eq!(report.appended, 1);
     }
@@ -2152,13 +2177,13 @@ mod tests {
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 handler
-                    .submit(user_message("go"), &mut |_| {})
+                    .submit(user_message("go"), &discard())
                     .expect("turn succeeds");
             });
             gate.wait_entered();
             // The SDK refuses a second turn while one is in flight.
             assert_eq!(
-                handler.submit(user_message("go"), &mut |_| {}).unwrap_err(),
+                handler.submit(user_message("go"), &discard()).unwrap_err(),
                 "a turn is already running"
             );
             gate.open();
@@ -2180,10 +2205,11 @@ mod tests {
         ]);
         let handler = fx.handler(provider, no_tools());
         let id = handler.session_id();
-        let mut items = Vec::new();
+        let (sink, items) = collector();
         handler
-            .submit(user_message("long task"), &mut |i| items.push(i))
+            .submit(user_message("long task"), &sink)
             .expect("turn succeeds");
+        let items = items.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
         let session_messages = messages(&handler);
         assert_eq!(session_messages.len(), 1, "{session_messages:?}");
@@ -2248,10 +2274,11 @@ mod tests {
         ])
         .with_per_call(per_call);
         let handler = fx.handler(provider, no_tools());
-        let mut items = Vec::new();
+        let (sink, items) = collector();
         handler
-            .submit(user_message("long task"), &mut |i| items.push(i))
+            .submit(user_message("long task"), &sink)
             .expect("turn succeeds");
+        let items = items.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
         // `note_compacted` emits the footer refresh immediately before the
         // notice, so the refresh that belongs to the compaction is the last
@@ -2291,10 +2318,11 @@ mod tests {
             Delta::Done(FinishReason::Stop),
         ]]);
         let handler = fx.handler(provider, no_tools());
-        let mut items = Vec::new();
+        let (sink, items) = collector();
         handler
-            .submit(user_message("small task"), &mut |i| items.push(i))
+            .submit(user_message("small task"), &sink)
             .expect("turn succeeds");
+        let items = items.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let session_messages = messages(&handler);
         assert_eq!(session_messages.len(), 2);
         assert!(session_messages.iter().all(|m| !m.is_compact_summary()));

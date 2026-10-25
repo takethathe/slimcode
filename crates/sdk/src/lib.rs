@@ -3,12 +3,15 @@
 //!
 //! One call [`create_agent_session`] builds a persistent [`AgentSession`];
 //! [`AgentSession::prompt`] runs a whole agent turn on the calling thread,
-//! reusing the app layer's shared turn loop
-//! ([`slimcode_app::runner::run_turn_with_hooks`]) — no second turn loop.
-//! Events are delivered synchronously to listeners in subscription order on
-//! the turn's thread via [`AgentSession::subscribe`] (`SdkEvent`:
-//! streamed `Display` items, per-message `Message` events, and a final
-//! `TurnFinished`). The session persists as the existing JSONL session log
+//! driving the code preset through the app layer's public Engine seam
+//! ([`slimcode_app::engine::Engine`]) — no second turn loop.
+//! Events are delivered to listeners in subscription order over the session's
+//! internal bounded message-bus ([`AgentSession::subscribe`]: streamed
+//! `Display` items, per-message `Message` events, and a final `TurnFinished`),
+//! drained on a dispatcher thread so a slow subscriber never stalls the turn;
+//! `prompt` / `compact_now` flush the bus before returning, so a host sees its
+//! whole ordered event stream by the time the call returns. The session
+//! persists as the existing JSONL session log
 //! (project-partitioned, `/session`-picker compatible), replayable through
 //! [`slimcode_app::session::SessionStore`].
 //!
@@ -24,20 +27,23 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex};
 
-use slimcode_app::compaction;
+mod bus;
+mod facade;
+
 use slimcode_app::config::{self, Overrides};
-use slimcode_app::context::{ContextBuilder, Environment, skill_loaded_in};
+use slimcode_app::context::{ContextBuilder, Environment};
 use slimcode_app::context_files::{load_context_files, resolve_project_home};
+use slimcode_app::engine;
+use slimcode_app::preset;
 use slimcode_app::render::Renderer;
-use slimcode_app::runner;
 use slimcode_app::session::{SessionStore, infer_title, new_session_id, now_rfc3339, project_key};
-use slimcode_app::skills::{SkillStore, skill_for_read_args, skill_prompt};
+use slimcode_app::skills::SkillStore;
 use slimcode_app::tools;
 use slimcode_app::{
-    BailianProvider, CancelToken, MessageStopReason, ProviderConfig, Role, RunConfig, RunHooks,
-    Session, ToolDecision,
+    BailianProvider, CancelToken, MessageStopReason, ProviderConfig, Role, RunConfig, Session,
 };
 
 /// Re-exports of the `slimcode-app` types this crate's public API names
@@ -47,6 +53,12 @@ use slimcode_app::{
 pub use slimcode_app::render::DisplayItem;
 pub use slimcode_app::skills::Skill;
 pub use slimcode_app::{AgentMessage, Provider, StopReason, TokenUsage, Tool};
+
+/// The runtime-agnostic async facade over the synchronous kernel (ADR-0031 D3,
+/// engine ticket 07): a [`PromptFuture`] for a turn driven on a dedicated OS
+/// thread and an [`EventStream`] of the session's read-only events, reached
+/// through [`AgentSession::prompt_async`] / [`AgentSession::event_stream`].
+pub use facade::{EventStream, PromptFuture};
 
 /// One event delivered to a subscriber during a turn, in subscription order.
 ///
@@ -129,6 +141,12 @@ pub struct AgentSessionOptions {
     /// The skills advertised to the model; `None` discovers from the user
     /// and project scopes.
     pub skills: Option<Vec<Skill>>,
+    /// The turn-end component run once after a completed turn (auto-compaction)
+    /// and by `compact_now`. `None` uses the code preset's default
+    /// compaction (`slimcode_app::preset::compaction_turn_end`); a host swaps in
+    /// its own consolidation, or disables the step with
+    /// `slimcode_app::preset::noop_turn_end`.
+    pub turn_end: Option<Arc<preset::TurnEndComponent>>,
 }
 
 impl AgentSessionOptions {
@@ -147,6 +165,7 @@ impl AgentSessionOptions {
             provider: None,
             tools: None,
             skills: None,
+            turn_end: None,
         }
     }
 
@@ -215,6 +234,16 @@ impl AgentSessionOptions {
         self.skills = Some(skills);
         self
     }
+
+    /// Replace or disable the turn-end component. Passing
+    /// `slimcode_app::preset::noop_turn_end` (as an `Arc<dyn
+    /// preset::TurnEndComponent>`) turns off auto-compaction and `compact_now`
+    /// alike; a custom component runs in their place. `None` (the default) keeps
+    /// the code preset's compaction.
+    pub fn with_turn_end(mut self, turn_end: Arc<preset::TurnEndComponent>) -> Self {
+        self.turn_end = Some(turn_end);
+        self
+    }
 }
 
 /// The per-session state behind the mutex, mirroring the TUI's take/put
@@ -251,6 +280,12 @@ pub struct AgentSession {
     /// the runner / provider.
     cancel: CancelToken,
     listeners: Arc<Mutex<Vec<Listener>>>,
+    /// Publisher handle onto the session's bounded event bus (ticket 06): every
+    /// [`Self::emit`] sends here and a dedicated dispatcher thread delivers to
+    /// [`Self::listeners`]. A `SyncSender` blocks on a full buffer, which is the
+    /// backpressure a sustained-slow subscriber applies; a burst is absorbed by
+    /// the capacity. `Send + Sync`, so the session stays both.
+    bus_tx: SyncSender<bus::BusMsg>,
     next_listener_id: AtomicUsize,
     // Immutable per-session resources (never change; SessionStore methods
     // take &self), kept outside the mutex.
@@ -260,6 +295,10 @@ pub struct AgentSession {
     skills: Vec<Skill>,
     store: Option<SessionStore>,
     cwd: PathBuf,
+    /// The turn-end component (auto-compaction / `compact_now`), shared so it
+    /// stays `Send + Sync`; the code preset's default compaction unless
+    /// [`AgentSessionOptions::with_turn_end`] swapped it out.
+    turn_end: Arc<preset::TurnEndComponent>,
 }
 
 /// Create an [`AgentSession`], assembling the services exactly like the CLI
@@ -279,9 +318,10 @@ pub struct AgentSession {
 /// running bash child. AGENTS.md
 /// context files are discovered from `cwd` (and the slimcode home for the
 /// global file) and skills from the user + project scopes — both exactly like
-/// the CLI — with explicit `options.skills` bypassing discovery. The skill
-/// `before_tool` read-intercept hook is wired: a model `read` of a skill's own
-/// `SKILL.md` is served as the skill activation block.
+/// the CLI — with explicit `options.skills` bypassing discovery. The default
+/// code-preset phase-hook bundle is registered on the run: its `pre_tool`
+/// interception serves a model `read` of a skill's own `SKILL.md` as the skill
+/// activation block (ADR-0031 D5).
 pub fn create_agent_session(options: AgentSessionOptions) -> Result<AgentSession, String> {
     let cwd = options
         .cwd
@@ -383,6 +423,18 @@ pub fn create_agent_session(options: AgentSessionOptions) -> Result<AgentSession
             usage: TokenUsage::default(),
         },
     };
+    // The bounded event bus (ticket 06): a `SyncSender`/`Receiver` pair over
+    // `BusMsg` plus a dispatcher thread that drains it and delivers to the
+    // shared subscriber list. Publishing never runs a subscriber on the turn's
+    // own thread, so a slow one is absorbed by the buffer (backpressure only on
+    // sustained overflow); `prompt` / `compact_now` flush before returning so
+    // the host still observes a fully-delivered, ordered stream.
+    let listeners: Arc<Mutex<Vec<Listener>>> = Arc::new(Mutex::new(Vec::new()));
+    let (bus_tx, bus_rx) = mpsc::sync_channel(bus::EVENT_BUS_CAPACITY);
+    std::thread::spawn({
+        let listeners = Arc::clone(&listeners);
+        move || bus::run(bus_rx, listeners)
+    });
     Ok(AgentSession {
         id: session.id.clone(),
         inner: Arc::new(Mutex::new(Inner {
@@ -392,7 +444,8 @@ pub fn create_agent_session(options: AgentSessionOptions) -> Result<AgentSession
             disposed: false,
         })),
         cancel: session_cancel,
-        listeners: Arc::new(Mutex::new(Vec::new())),
+        listeners,
+        bus_tx,
         next_listener_id: AtomicUsize::new(0),
         config: app.provider,
         environment,
@@ -400,6 +453,9 @@ pub fn create_agent_session(options: AgentSessionOptions) -> Result<AgentSession
         skills,
         store,
         cwd,
+        turn_end: options
+            .turn_end
+            .unwrap_or_else(|| Arc::new(preset::compaction_turn_end)),
     })
 }
 
@@ -420,8 +476,9 @@ struct TurnOutcome {
 impl AgentSession {
     /// Run one whole agent turn for `text`, returning the stop reason.
     ///
-    /// Synchronous and single-flight: runs on the calling thread, reuses the
-    /// shared turn loop ([`slimcode_app::runner::run_turn_with_hooks`]) and
+    /// Synchronous and single-flight: runs on the calling thread, drives the
+    /// code preset through the public turn seam
+    /// ([`slimcode_app::engine::Engine`]) and
     /// mirrors the CLI's turn orchestration (prompt recording, title
     /// inference, best-effort persistence, closing messages on failure /
     /// cancellation). `text` is plain user input — `/` commands are a
@@ -480,6 +537,12 @@ impl AgentSession {
                 self.emit(SdkEvent::Compacted { before, after });
             }
         }
+        // Turn-end barrier: deliver this turn's whole stream (every event above
+        // and the ones published during the loop) before returning, so a
+        // subscriber reads a fully-drained, ordered sequence and — inside the
+        // terminal events — the put-back session state, exactly as the old
+        // synchronous `emit` gave on the calling thread.
+        self.flush_events();
         outcome.result
     }
 
@@ -561,58 +624,50 @@ impl AgentSession {
             .unwrap_or(false);
         // Skill dedup history: the messages in play when the turn starts,
         // including this turn's prompt (the CLI's `history_for_skill_dedup`).
+        // A frozen snapshot, handed to the default `pre_tool` interception so a
+        // second activation of the same skill in one turn still reads as
+        // already-loaded exactly as before the pipeline migration.
         let history_for_skill_dedup = session.messages.clone();
-        let result = runner::run_turn_with_hooks(
-            &mut provider,
-            &tools,
-            context,
-            &cfg,
-            &self.config,
-            &cancel,
-            &mut SdkRenderer { session: self },
-            &mut |msg: &AgentMessage, usage: Option<&TokenUsage>| {
-                // The message entered history: mirror it into the session and
-                // append it to the log. Persistence is best-effort — a
-                // storage hiccup must not abort the turn.
-                session.messages.push(msg.clone());
-                appended += 1;
-                // The request's usage (None on tool results) accumulates into
-                // the session (ADR-0018 D4).
-                if let Some(u) = usage {
-                    session.usage = session.usage.saturating_add(u);
-                }
-                self.emit(SdkEvent::Message {
-                    message: msg.clone(),
-                    usage: usage.copied(),
-                });
-                self.append_best_effort(&session, msg);
-                Ok(())
-            },
-            RunHooks {
-                // The skill read-intercept hook (ticket 05 wires discovery):
-                // a `read` of a skill's own SKILL.md is served as the skill
-                // activation block. Inert with an empty skill list.
-                before_tool: Some(Box::new(&mut |msg: &mut AgentMessage, index: usize| {
-                    let Some(call) = msg.tool_calls().get(index) else {
-                        return Ok(ToolDecision::Run);
-                    };
-                    if call.name != "read" {
-                        return Ok(ToolDecision::Run);
+        // The code preset rides the public Engine seam (ADR-0031 D1/D5): the SDK
+        // builds its turn the same way any external host would — through
+        // [`slimcode_app::engine::Engine`], injecting the code default hook
+        // bundle rather than a privileged internal path. The Engine borrows the
+        // provider for the turn, so it lives in its own scope and hands the
+        // provider back before the outcome is assembled.
+        let result = {
+            let mut engine = engine::Engine::code(
+                &mut provider,
+                &tools,
+                &self.config,
+                &self.skills,
+                &self.cwd,
+                history_for_skill_dedup,
+            )
+            .with_run_config(cfg);
+            engine.run_turn(
+                context,
+                &cancel,
+                &mut SdkRenderer { session: self },
+                &mut |msg: &AgentMessage, usage: Option<&TokenUsage>| {
+                    // The message entered history: mirror it into the session and
+                    // append it to the log. Persistence is best-effort — a
+                    // storage hiccup must not abort the turn.
+                    session.messages.push(msg.clone());
+                    appended += 1;
+                    // The request's usage (None on tool results) accumulates into
+                    // the session (ADR-0018 D4).
+                    if let Some(u) = usage {
+                        session.usage = session.usage.saturating_add(u);
                     }
-                    let Some(skill) = skill_for_read_args(&self.skills, &self.cwd, &call.arguments)
-                    else {
-                        return Ok(ToolDecision::Run);
-                    };
-                    let already_loaded = skill_loaded_in(&history_for_skill_dedup, skill);
-                    Ok(ToolDecision::Skip(Ok(skill_prompt(
-                        skill,
-                        None,
-                        already_loaded,
-                    ))))
-                })),
-                ..Default::default()
-            },
-        );
+                    self.emit(SdkEvent::Message {
+                        message: msg.clone(),
+                        usage: usage.copied(),
+                    });
+                    self.append_best_effort(&session, msg);
+                    Ok(())
+                },
+            )
+        };
         let stop_reason = match result {
             Ok((_, reason)) => reason,
             Err(e) => {
@@ -644,10 +699,15 @@ impl AgentSession {
                 // crossed the threshold replaces the old span with a summary
                 // checkpoint; a failure keeps the full history silently.
                 compacted = self
-                    .run_compaction(&mut provider, &mut session, &cancel, false)
+                    .apply_turn_end(&mut provider, &mut session, &cancel, false)
                     .unwrap_or_default();
             }
-            StopReason::Cancelled => {
+            // An interrupted turn adopts its partial history and closes the log
+            // on an assistant boundary (never compacts). The guardrail stops
+            // (ticket 08) join this arm for completeness: the code preset leaves
+            // `max_iterations` / `timeout` unset, so only `Cancelled` arises on
+            // this path (the equivalence gate).
+            StopReason::Cancelled | StopReason::MaxIterations | StopReason::Timeout => {
                 // Esc: the partial turn is adopted; the log is closed on an
                 // assistant boundary so it never ends on a dangling tool batch
                 // (ADR-0009 D3). A first turn that produced nothing has no log
@@ -666,48 +726,37 @@ impl AgentSession {
         }
     }
 
-    /// Compact the history when it crossed the threshold (auto path) or when
-    /// the caller forced it (`compact_now`, `/compact` semantics): summarize
-    /// the old span, replace it in the session, persist the checkpoint
-    /// best-effort, fold the summary request's own cost into `session.usage`
-    /// (ADR-0018 D4), and report the token change so the caller can emit
-    /// [`SdkEvent::Compacted`].
+    /// Run the session's turn-end component over the finished history. This is
+    /// the seam ADR-0031 lifts auto-compaction and `compact_now` onto: the
+    /// component (default `slimcode_app::preset::compaction_turn_end`,
+    /// replaceable or disable-able via [`AgentSessionOptions::with_turn_end`])
+    /// does the work, and this method only assembles its
+    /// `slimcode_app::preset::TurnEndCtx` — binding
+    /// `persist` to the session's own best-effort log append.
     ///
-    /// `Ok(Some((before, after)))` reports a completed compaction; `Ok(None)`
-    /// means no compaction ran (auto path below the threshold — never with
-    /// `force`). A failure returns the provider error detail (or the
-    /// "nothing to compact" error of [`compaction::compact_messages`]) with
-    /// the history and this turn's result untouched; the auto path swallows it
-    /// silently, `compact_now` propagates it.
-    fn run_compaction(
+    /// `force` is `false` on the auto path (threshold-gated) and `true` for
+    /// `compact_now`. Returns the component's token change (`Ok(Some(..))`),
+    /// `Ok(None)` when it ran but changed nothing, or `Err` on failure (auto
+    /// swallows it, `compact_now` propagates it).
+    fn apply_turn_end(
         &self,
         provider: &mut Box<dyn Provider + Send>,
         session: &mut Session,
         cancel: &CancelToken,
         force: bool,
     ) -> Result<Option<(usize, usize)>, String> {
-        if !force && !compaction::should_compact(&session.messages) {
-            return Ok(None);
-        }
-        let before = compaction::estimate_total_tokens(&session.messages);
-        // The summary request spends tokens too (ADR-0018 D4): snapshot the
-        // provider total so the compaction's own cost lands in `session.usage`.
-        let usage_before = provider.total_usage();
-        let compacted =
-            compaction::compact_messages(provider, &self.config, cancel, &session.messages)?;
-        session.messages = compacted;
-        // Persist the checkpoint as the boundary it is: the log is append-only
-        // and keeps the records it replaced, but the load path drops everything
-        // before the newest checkpoint, so a reload feeds the model the same
-        // compacted view (ADR-0020 D2). Best-effort, like every other append.
-        if let Some(checkpoint) = session.messages.first() {
-            self.append_best_effort(session, checkpoint);
-        }
-        session.usage = session
-            .usage
-            .saturating_add(&provider.total_usage().saturating_sub(&usage_before));
-        let after = compaction::estimate_total_tokens(&session.messages);
-        Ok(Some((before, after)))
+        let mut persist = |session: &Session, message: &AgentMessage| {
+            self.append_best_effort(session, message);
+        };
+        let mut ctx = preset::TurnEndCtx {
+            provider,
+            config: &self.config,
+            cancel,
+            session,
+            force,
+            persist: &mut persist,
+        };
+        (self.turn_end)(&mut ctx)
     }
 
     /// Force an on-demand compaction of the session's history, ignoring the
@@ -745,7 +794,7 @@ impl AgentSession {
         let cancel = self.cancel.clone();
         drop(inner);
 
-        let outcome = self.run_compaction(&mut provider, &mut session, &cancel, true);
+        let outcome = self.apply_turn_end(&mut provider, &mut session, &cancel, true);
 
         // Put everything back, whatever the outcome (a failure leaves the
         // history and this turn's result untouched).
@@ -760,11 +809,17 @@ impl AgentSession {
         match outcome {
             Ok(Some((before, after))) => {
                 self.emit(SdkEvent::Compacted { before, after });
+                // Same turn-end barrier as `prompt`: the `Compacted` event has
+                // reached every subscriber (the FFI queue holds it) by the time
+                // this returns.
+                self.flush_events();
                 Ok((before, after))
             }
-            // `force` makes `run_compaction` skip the threshold guard, so this
-            // arm is unreachable; it stays for exhaustiveness.
-            Ok(None) => unreachable!("compact_now forces compaction past the threshold"),
+            // The default compaction component always changes something on a
+            // forced call (or errors), so this only happens when a host swapped
+            // in a component that no-ops (e.g. `preset::noop_turn_end`): report
+            // the absence of change rather than emitting a hollow `Compacted`.
+            Ok(None) => Err("turn-end component made no change".to_string()),
             Err(e) => Err(e),
         }
     }
@@ -801,6 +856,13 @@ impl AgentSession {
             .unwrap_or_else(|e| e.into_inner())
             .disposed = true;
         self.cancel.cancel();
+        // Stop the dispatcher. Clearing the subscribers above already silences
+        // every later delivery; this additionally retires the thread so a
+        // disposed-but-not-yet-dropped session (the FFI keeps its handle) does
+        // not park forever on an empty bus. A turn still in flight finds the bus
+        // gone: its later publishes fail (dropped) and its flush is a no-op, so
+        // it unwinds cleanly rather than blocking.
+        let _ = self.bus_tx.send(bus::BusMsg::Shutdown);
     }
 
     /// Persist one message, swallowing failures (best-effort, ADR-0009 D6).
@@ -832,34 +894,39 @@ impl AgentSession {
         }
     }
 
-    /// Deliver one event to every subscriber, synchronously, in subscription
-    /// order (spec D4). The `Arc` handles are snapshotted under the lock and
-    /// invoked outside it, so a listener that calls its own [`Unsubscribe`]
-    /// from inside a callback — or a concurrent `dispose` that clears the
-    /// list — cannot deadlock on the same mutex. A panicking listener is
-    /// isolated by `catch_unwind`: it is skipped, the other listeners and the
-    /// turn continue, and the session stays usable.
+    /// Publish one event onto the session's bounded bus (ticket 06). Delivery
+    /// itself happens on the dispatcher thread, in subscription order, with each
+    /// listener isolated by `catch_unwind` (see [`bus::run`]) — this call only
+    /// hands the event over. A `SyncSender::send` blocks while the buffer is
+    /// full, which is the backpressure a sustained-slow subscriber applies (a
+    /// burst stays absorbed by the capacity); a send failure means the bus is
+    /// gone (disposed / dropped), i.e. the silenced-subscriber case, never an
+    /// error to surface to the turn.
     fn emit(&self, event: SdkEvent) {
-        let listeners: Vec<Arc<dyn Fn(SdkEvent) + Send + Sync>> = self
-            .listeners
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .map(|(_, listener)| Arc::clone(listener))
-            .collect();
-        for listener in listeners {
-            let _ =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| listener(event.clone())));
+        let _ = self.bus_tx.send(bus::BusMsg::Event(event));
+    }
+
+    /// Block until the dispatcher has delivered every event published so far on
+    /// this thread. The turn-end barrier that keeps `prompt` / `compact_now`
+    /// synchronous from the host's point of view even though delivery runs on
+    /// the dispatcher thread: when the call returns, its whole ordered event
+    /// stream has gone out (the FFI queue is populated, the equivalence baseline
+    /// is complete). A dead bus (disposed / dropped) returns immediately.
+    fn flush_events(&self) {
+        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+        if self.bus_tx.send(bus::BusMsg::Flush(ack_tx)).is_ok() {
+            let _ = ack_rx.recv();
         }
     }
 
-    /// Subscribe to this session's events. The listener is called
-    /// synchronously on the turn's thread, in subscription order, for every
-    /// event of each subsequent `prompt`. The returned [`Unsubscribe`]
+    /// Subscribe to this session's events. The listener is called on the bus's
+    /// dispatcher thread, in subscription order, for every event of each
+    /// subsequent `prompt` (delivered before the call returns, thanks to its
+    /// turn-end flush). The returned [`Unsubscribe`]
     /// removes it when called (a listener may call it from inside its own
     /// callback: the current event has already been delivered, later ones
     /// stop). `+ Sync` is required so the listener can be shared across the
-    /// `Arc`-backed snapshot `emit` uses.
+    /// `Arc`-backed snapshot the dispatcher delivers each event through.
     pub fn subscribe(&self, listener: impl Fn(SdkEvent) + Send + Sync + 'static) -> Unsubscribe {
         let id = self.next_listener_id.fetch_add(1, Ordering::SeqCst);
         let listener: Arc<dyn Fn(SdkEvent) + Send + Sync + 'static> = Arc::new(listener);
@@ -907,6 +974,16 @@ impl AgentSession {
             .unwrap_or_else(|e| e.into_inner())
             .session
             .usage
+    }
+}
+
+impl Drop for AgentSession {
+    /// Retire the dispatcher thread when the session goes away: a best-effort
+    /// [`bus::BusMsg::Shutdown`] so it does not block forever on an empty bus.
+    /// Pending events need not drain — the owner is dropping the session; and a
+    /// not-yet-started `Shutdown` behind live subscribers is harmless.
+    fn drop(&mut self) {
+        let _ = self.bus_tx.send(bus::BusMsg::Shutdown);
     }
 }
 

@@ -9,10 +9,12 @@ pub mod config;
 pub mod llm;
 pub mod message;
 pub mod provider;
+pub mod trace;
 pub mod wire;
 
 pub use config::{DEFAULT_BASE_URL, DEFAULT_MODEL, ProviderConfig};
 pub use llm::{CancelToken, Delta, FinishReason, Provider, ToolSpec};
 pub use message::{Message, Part, Role, ToolCall};
 pub use provider::BailianProvider;
+pub use trace::{SpanRecorder, Tracer};
 pub use wire::TokenUsage;

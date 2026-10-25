@@ -16,9 +16,11 @@
 //! display item, never touching disk — so a session layer can persist each
 //! message at the moment it exists.
 
+use std::sync::Arc;
+
 use slimcode_core::agent::{
-    AgentEvent, AgentMessage, AgentRunner, CancelToken, Provider, ProviderConfig, RunConfig,
-    RunHooks, StopReason, TokenUsage, Tool,
+    AgentEvent, AgentMessage, AgentRunner, CancelToken, PhaseHooks, Provider, ProviderConfig,
+    RunConfig, StopReason, TokenUsage, Tool, Tracer,
 };
 
 use crate::context::Context;
@@ -59,7 +61,7 @@ pub fn run_turn<P: Provider>(
     renderer: &mut dyn Renderer,
     on_message: MessageSink<'_>,
 ) -> Result<(Vec<AgentMessage>, StopReason), String> {
-    run_turn_with_hooks(
+    run_turn_with_pipeline(
         provider,
         tools,
         context,
@@ -68,16 +70,20 @@ pub fn run_turn<P: Provider>(
         cancel,
         renderer,
         on_message,
-        RunHooks::default(),
+        PhaseHooks::default(),
+        None,
     )
 }
 
-/// [`run_turn`] with the ADR-0015 hook seam wired in: the caller supplies the
-/// hooks (e.g. a skill-aware `read` interception), the runner owns them for
-/// the run. [`run_turn`] is a thin wrapper passing no hooks, so existing
-/// callers and tests keep working unchanged.
+/// [`run_turn`] widened with the ADR-0031 seven-phase pipeline: the caller also
+/// supplies a [`PhaseHooks`] bundle, which the runner threads through the loop,
+/// and an optional [`Tracer`] the kernel opens operand-call spans on. This is
+/// the seam the code preset (and a future bot host) registers its default phase
+/// hooks on — the skill-read interception, for instance, is a `pre_tool` phase
+/// hook. An empty [`PhaseHooks`] and `None` tracer leave the loop byte-identical
+/// to [`run_turn`] (the equivalence gate).
 #[allow(clippy::too_many_arguments)] // the turn's full run context crosses this seam
-pub fn run_turn_with_hooks<P: Provider>(
+pub fn run_turn_with_pipeline<P: Provider>(
     provider: &mut P,
     tools: &[Tool],
     context: Context,
@@ -86,7 +92,8 @@ pub fn run_turn_with_hooks<P: Provider>(
     cancel: &CancelToken,
     renderer: &mut dyn Renderer,
     on_message: MessageSink<'_>,
-    hooks: RunHooks<'_>,
+    phases: PhaseHooks<'_>,
+    tracer: Option<Arc<dyn Tracer>>,
 ) -> Result<(Vec<AgentMessage>, StopReason), String> {
     let Context { system, messages } = context;
     let mut sink = |e: AgentEvent| {
@@ -109,7 +116,8 @@ pub fn run_turn_with_hooks<P: Provider>(
         Ok(())
     };
     let mut runner = AgentRunner::new(tools, cfg.clone(), provider_config, cancel, &mut sink);
-    runner.hooks = hooks;
+    runner.phases = phases;
+    runner.tracer = tracer;
     runner.run(provider, &system, messages)
 }
 
@@ -118,7 +126,9 @@ mod tests {
     use super::*;
     use crate::render::DisplayItem;
     use serde_json::Value;
-    use slimcode_core::agent::{Delta, FinishReason, StopReason, ToolDecision, ToolSpec};
+    use slimcode_core::agent::{
+        Delta, FinishReason, PreTool, StopReason, ToolHookAction, ToolSpec,
+    };
     use slimcode_core::session::{AgentMessage, Message, Role};
 
     /// A fixed provider config for the turn-runner tests: these tests exercise
@@ -579,10 +589,9 @@ mod tests {
     }
 
     #[test]
-    fn before_tool_hook_can_skip_a_call_and_supply_its_result() {
-        // A `before_tool` hook may return `Skip`, replacing what the model
-        // sees (and what enters history) without running the tool. The hook
-        // signature is the run_turn_with_hooks seam; run_turn passes none.
+    fn pre_tool_phase_can_skip_a_call_and_supply_its_result() {
+        // A `pre_tool` phase hook may return `Skip`, replacing what the model
+        // sees (and what enters history) without running the tool.
         let script = vec![vec![
             tc_start(0, "call_1", "get_weather"),
             tc_args(0, "{}"),
@@ -592,16 +601,19 @@ mod tests {
         let mut renderer = RecordingRenderer::new();
         let messages = vec![user("weather?")];
         let cancel = CancelToken::new();
-        let mut hook = |msg: &mut AgentMessage, index: usize| {
-            let call_name = msg.tool_calls()[index].name.clone();
-            assert_eq!(call_name, "get_weather");
-            Ok(ToolDecision::Skip(Ok("SKIPPED_WEATHER".to_string())))
-        };
-        let hooks = RunHooks {
-            before_tool: Some(Box::new(&mut hook)),
-            ..Default::default()
-        };
-        let (updated, stop) = run_turn_with_hooks(
+        let mut phases = PhaseHooks::default();
+        phases
+            .pre_tool
+            .push(PreTool(Box::new(|_spec, state, index| {
+                let call_name = state.messages.last().unwrap().tool_calls()[index]
+                    .name
+                    .clone();
+                assert_eq!(call_name, "get_weather");
+                Ok(ToolHookAction::Skip {
+                    result: Ok("SKIPPED_WEATHER".to_string()),
+                })
+            })));
+        let (updated, stop) = run_turn_with_pipeline(
             &mut provider,
             &[weather_tool()],
             context(messages),
@@ -610,7 +622,8 @@ mod tests {
             &cancel,
             &mut renderer,
             &mut noop_sink(),
-            hooks,
+            phases,
+            None,
         )
         .unwrap();
         assert_eq!(stop, StopReason::Completed);

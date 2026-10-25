@@ -15,14 +15,17 @@
 mod common;
 use common::*;
 
+use std::path::Path;
 use std::sync::{Arc, Mutex};
+
+use slimcode_app::preset;
 
 use slimcode_app::{
     AgentMessage, CancelToken, Delta, FinishReason, Message, Provider, ProviderConfig, StopReason,
-    TokenUsage, ToolSpec,
+    TokenUsage, Tool, ToolSpec,
 };
 
-use slimcode_sdk::SdkEvent;
+use slimcode_sdk::{AgentSession, AgentSessionOptions, SdkEvent, create_agent_session};
 
 /// The compaction trigger in tokens: `should_compact` fires once the estimate
 /// reaches `200_000 - 16_000` (the estimator is chars/4 per message, so the
@@ -36,7 +39,7 @@ const COMPACT_TRIGGER_TOKENS: usize = 200_000 - 16_000;
 /// summary call streams `summary_reply` (or errors when `fails_summary`), and
 /// a turn call can be made to error with `fails_on_turn` (1-based).
 /// `total_usage()` accumulates `per_call` across every call, mirroring the
-/// CLI's `run_compaction` usage-delta trick (research notes §4).
+/// default turn-end component's (`preset::compaction_turn_end`) usage-delta trick.
 struct FakeProvider {
     script: Vec<Vec<Delta>>,
     turn_calls: usize,
@@ -615,4 +618,101 @@ fn compact_now_after_dispose_errors() {
 
     let err = session.compact_now().unwrap_err();
     assert!(err.contains("session is disposed"), "err: {err}");
+}
+
+// --- the turn-end component seam is replaceable and disable-able
+// (ADR-0031 D5, engine ticket 04) ------------------------------------------
+
+/// [`make_session`] plus [`AgentSessionOptions::with_turn_end`], so a test can
+/// wire a non-default turn-end component (a custom consolidation, or a disabled
+/// one) instead of the code preset's compaction.
+fn make_session_with_turn_end(
+    cwd: &Path,
+    provider: Box<dyn Provider + Send>,
+    tools: Vec<Tool>,
+    component: Arc<preset::TurnEndComponent>,
+) -> AgentSession {
+    create_agent_session(
+        AgentSessionOptions::new(Some(cwd.to_path_buf()))
+            .with_api_key("sk-test")
+            .with_base_url("https://example.invalid/v1")
+            .with_model("test-model")
+            .with_provider(provider)
+            .with_tools(tools)
+            .with_turn_end(component),
+    )
+    .expect("create_agent_session")
+}
+
+#[test]
+fn a_disabled_turn_end_component_skips_auto_compaction() {
+    let (_guard, _home, cwd) = test_env("compact-disabled");
+    // Turn 1 alone crosses the threshold (the default component would compact
+    // at its end); the disabled one must leave the history and events alone.
+    let provider = FakeProvider::new(vec![big_reply(740_000)]).with_summary("unused");
+    let session = make_session_with_turn_end(
+        &cwd,
+        Box::new(provider),
+        vec![probe_tool()],
+        Arc::new(preset::noop_turn_end),
+    );
+    let recorder = Recorder::new();
+    let _unsubscribe = session.subscribe(recorder.listener());
+
+    let stop = session.prompt("first").expect("turn");
+    assert_eq!(stop, StopReason::Completed);
+
+    let events = recorder.events();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, SdkEvent::Compacted { .. })),
+        "{events:?}"
+    );
+    // No checkpoint head: the history is exactly what the turn produced.
+    assert!(!session.messages().first().unwrap().is_compact_summary());
+}
+
+#[test]
+fn compact_now_with_a_disabled_component_reports_no_change() {
+    let (_guard, _home, cwd) = test_env("compact-now-disabled");
+    let provider = FakeProvider::new(vec![big_reply(100_000)]).with_summary("unused");
+    let session = make_session_with_turn_end(
+        &cwd,
+        Box::new(provider),
+        vec![probe_tool()],
+        Arc::new(preset::noop_turn_end),
+    );
+    session.prompt("first").expect("turn");
+
+    let err = session.compact_now().unwrap_err();
+    assert!(err.contains("made no change"), "err: {err}");
+}
+
+#[test]
+fn a_replacement_turn_end_component_runs_in_place_of_compaction() {
+    // A host consolidation that ignores the provider summary and just reports a
+    // fixed token change: proves the seam is swappable and the component's
+    // `Ok(Some(..))` still surfaces as the turn's `Compacted` event.
+    let (_guard, _home, cwd) = test_env("compact-replaced");
+    let consolidator: Arc<preset::TurnEndComponent> = Arc::new(|_ctx| Ok(Some((1234, 567))));
+    let provider = FakeProvider::new(vec![big_reply(100_000)]).with_summary("unused");
+    let session =
+        make_session_with_turn_end(&cwd, Box::new(provider), vec![probe_tool()], consolidator);
+    let recorder = Recorder::new();
+    let _unsubscribe = session.subscribe(recorder.listener());
+
+    session.prompt("first").expect("turn");
+
+    let events = recorder.events();
+    let compacted = events
+        .iter()
+        .find_map(|e| match e {
+            SdkEvent::Compacted { before, after } => Some((*before, *after)),
+            _ => None,
+        })
+        .expect("the replacement component's Compacted event");
+    assert_eq!(compacted, (1234, 567));
+    // The replacement never summarized, so no checkpoint entered history.
+    assert!(!session.messages().first().unwrap().is_compact_summary());
 }

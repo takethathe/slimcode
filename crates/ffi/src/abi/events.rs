@@ -52,6 +52,10 @@ pub unsafe extern "C" fn slimcode_session_prompt(session: *mut c_void, text: *co
         match handle.session().prompt(text) {
             Ok(StopReason::Completed) => 0,
             Ok(StopReason::Cancelled) => 1,
+            // Guardrail stops (ticket 08) are a bot-only concern: the code
+            // preset this ABI serves leaves `max_iterations` / `timeout` unset,
+            // so they never arise here. Map any such stop to the clean code.
+            Ok(_) => 0,
             Err(message) => {
                 error::set(message);
                 -1

@@ -1,0 +1,214 @@
+### tool_turn
+Observable {
+    events: [
+        "message(user::weather please;usage=-)",
+        "disp:turn(1)",
+        "disp:text(checking )",
+        "message(assistant::checking ;usage=15)",
+        "disp:usage(15)",
+        "disp:toolstart(call_1,probe,{})",
+        "disp:toolresult(call_1,probe,ok=true,probed)",
+        "message(tool::probed;usage=-)",
+        "disp:turn(2)",
+        "disp:text(done)",
+        "message(assistant::done;usage=15)",
+        "disp:usage(15)",
+        "disp:stop(Completed)",
+        "turn_finished(Completed)",
+    ],
+    stop: Some(
+        "Completed",
+    ),
+    error: None,
+    title: Some(
+        "weather please",
+    ),
+    usage_total: 30,
+    history: [
+        "user::weather please",
+        "assistant::checking  [call_1:probe]",
+        "tool::probed (for call_1)",
+        "assistant::done",
+    ],
+    log: [
+        "<HEADER>",
+        "{\"type\":\"title\",\"title\":\"weather please\"}",
+        "{\"type\":\"message\",\"message\":{\"kind\":\"llm\",\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"text\":\"weather please\"}]}}",
+        "{\"type\":\"message\",\"message\":{\"kind\":\"llm\",\"role\":\"assistant\",\"parts\":[{\"type\":\"text\",\"text\":\"checking \"}],\"tool_calls\":[{\"id\":\"call_1\",\"name\":\"probe\",\"arguments\":\"{}\"}]}}",
+        "{\"type\":\"message\",\"message\":{\"kind\":\"llm\",\"role\":\"tool\",\"parts\":[{\"type\":\"text\",\"text\":\"probed\"}],\"tool_call_id\":\"call_1\"}}",
+        "{\"type\":\"message\",\"message\":{\"kind\":\"llm\",\"role\":\"assistant\",\"parts\":[{\"type\":\"text\",\"text\":\"done\"}]}}",
+    ],
+}
+
+### error
+Observable {
+    events: [
+        "message(user::hello;usage=-)",
+        "disp:turn(1)",
+        "disp:text(first)",
+        "message(assistant::first;usage=0)",
+        "disp:usage(0)",
+        "disp:stop(Completed)",
+        "turn_finished(Completed)",
+        "message(user::boom;usage=-)",
+        "disp:turn(1)",
+    ],
+    stop: Some(
+        "Completed",
+    ),
+    error: Some(
+        "provider exploded",
+    ),
+    title: Some(
+        "hello",
+    ),
+    usage_total: 0,
+    history: [
+        "user::hello",
+        "assistant::first",
+        "user::boom",
+        "assistant::The turn ended with an error: provider exploded",
+    ],
+    log: [
+        "<HEADER>",
+        "{\"type\":\"title\",\"title\":\"hello\"}",
+        "{\"type\":\"message\",\"message\":{\"kind\":\"llm\",\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"text\":\"hello\"}]}}",
+        "{\"type\":\"message\",\"message\":{\"kind\":\"llm\",\"role\":\"assistant\",\"parts\":[{\"type\":\"text\",\"text\":\"first\"}]}}",
+        "{\"type\":\"message\",\"message\":{\"kind\":\"llm\",\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"text\":\"boom\"}]}}",
+        "{\"type\":\"message\",\"message\":{\"kind\":\"llm\",\"role\":\"assistant\",\"parts\":[{\"type\":\"text\",\"text\":\"The turn ended with an error: provider exploded\"}]},\"stop_reason\":\"error\",\"error\":\"provider exploded\"}",
+    ],
+}
+
+### cancel
+Observable {
+    events: [
+        "message(user::go;usage=-)",
+        "disp:turn(1)",
+        "message(assistant::;usage=0)",
+        "disp:usage(0)",
+        "disp:toolstart(call_1,probe,{})",
+        "disp:toolresult(call_1,probe,ok=true,probed)",
+        "message(tool::probed;usage=-)",
+        "disp:turn(2)",
+        "disp:text(final)",
+        "disp:stop(Cancelled)",
+        "turn_finished(Cancelled)",
+    ],
+    stop: Some(
+        "Cancelled",
+    ),
+    error: None,
+    title: Some(
+        "go",
+    ),
+    usage_total: 0,
+    history: [
+        "user::go",
+        "assistant:: [call_1:probe]",
+        "tool::probed (for call_1)",
+        "assistant::The turn was cancelled.",
+    ],
+    log: [
+        "<HEADER>",
+        "{\"type\":\"title\",\"title\":\"go\"}",
+        "{\"type\":\"message\",\"message\":{\"kind\":\"llm\",\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"text\":\"go\"}]}}",
+        "{\"type\":\"message\",\"message\":{\"kind\":\"llm\",\"role\":\"assistant\",\"parts\":[{\"type\":\"text\",\"text\":\"\"}],\"tool_calls\":[{\"id\":\"call_1\",\"name\":\"probe\",\"arguments\":\"{}\"}]}}",
+        "{\"type\":\"message\",\"message\":{\"kind\":\"llm\",\"role\":\"tool\",\"parts\":[{\"type\":\"text\",\"text\":\"probed\"}],\"tool_call_id\":\"call_1\"}}",
+        "{\"type\":\"message\",\"message\":{\"kind\":\"llm\",\"role\":\"assistant\",\"parts\":[{\"type\":\"text\",\"text\":\"The turn was cancelled.\"}]},\"stop_reason\":\"aborted\"}",
+    ],
+}
+
+### compaction
+Observable {
+    events: [
+        "message(user::<x x 800000>;usage=-)",
+        "disp:turn(1)",
+        "disp:text(SUMMARY BODY)",
+        "message(assistant::SUMMARY BODY;usage=7)",
+        "disp:usage(7)",
+        "disp:stop(Completed)",
+        "turn_finished(Completed)",
+        "compacted(200003,6)",
+    ],
+    stop: Some(
+        "Completed",
+    ),
+    error: None,
+    title: Some(
+        "<x x 48>…",
+    ),
+    usage_total: 14,
+    history: [
+        "user::SUMMARY BODY",
+        "assistant::SUMMARY BODY",
+    ],
+    log: [
+        "<HEADER>",
+        "{\"type\":\"title\",\"title\":\"<x x 48>…\"}",
+        "{\"type\":\"message\",\"message\":{\"kind\":\"llm\",\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"text\":\"<x x 800000>\"}]}}",
+        "{\"type\":\"message\",\"message\":{\"kind\":\"llm\",\"role\":\"assistant\",\"parts\":[{\"type\":\"text\",\"text\":\"SUMMARY BODY\"}]}}",
+        "{\"type\":\"message\",\"message\":{\"kind\":\"compact_summary\",\"summary\":\"SUMMARY BODY\",\"tokens_before\":200003,\"kept_count\":1}}",
+    ],
+}
+
+### compaction_failure
+Observable {
+    events: [
+        "message(user::<y x 800000>;usage=-)",
+        "disp:turn(1)",
+    ],
+    stop: None,
+    error: Some(
+        "summary exploded",
+    ),
+    title: Some(
+        "<y x 48>…",
+    ),
+    usage_total: 0,
+    history: [
+        "user::<y x 800000>",
+    ],
+    log: [],
+}
+
+### skill_intercept
+Observable {
+    events: [
+        "message(user::use the probe skill;usage=-)",
+        "disp:turn(1)",
+        "message(assistant::;usage=0)",
+        "disp:usage(0)",
+        "disp:toolstart(call_1,read,{\"path\": \"<HOME>/skills/probe/SKILL.md\"})",
+        "disp:toolresult(call_1,read,ok=true,<skill name=\"probe\" location=\"<HOME>/skills/probe/SKILL.md\">\nReferences are relative to <HOME>/skills/probe.\n\nPROBE BODY\n</skill>)",
+        "message(tool::<skill name=\"probe\" location=\"<HOME>/skills/probe/SKILL.md\">\nReferences are relative to <HOME>/skills/probe.\n\nPROBE BODY\n</skill>;usage=-)",
+        "disp:turn(2)",
+        "disp:text(loaded)",
+        "message(assistant::loaded;usage=0)",
+        "disp:usage(0)",
+        "disp:stop(Completed)",
+        "turn_finished(Completed)",
+    ],
+    stop: Some(
+        "Completed",
+    ),
+    error: None,
+    title: Some(
+        "use the probe skill",
+    ),
+    usage_total: 0,
+    history: [
+        "user::use the probe skill",
+        "assistant:: [call_1:read]",
+        "tool::<skill name=\"probe\" location=\"<HOME>/skills/probe/SKILL.md\">\nReferences are relative to <HOME>/skills/probe.\n\nPROBE BODY\n</skill> (for call_1)",
+        "assistant::loaded",
+    ],
+    log: [
+        "<HEADER>",
+        "{\"type\":\"title\",\"title\":\"use the probe skill\"}",
+        "{\"type\":\"message\",\"message\":{\"kind\":\"llm\",\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"text\":\"use the probe skill\"}]}}",
+        "{\"type\":\"message\",\"message\":{\"kind\":\"llm\",\"role\":\"assistant\",\"parts\":[{\"type\":\"text\",\"text\":\"\"}],\"tool_calls\":[{\"id\":\"call_1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\": \\\"<HOME>/skills/probe/SKILL.md\\\"}\"}]}}",
+        "{\"type\":\"message\",\"message\":{\"kind\":\"llm\",\"role\":\"tool\",\"parts\":[{\"type\":\"text\",\"text\":\"<skill name=\\\"probe\\\" location=\\\"<HOME>/skills/probe/SKILL.md\\\">\\nReferences are relative to <HOME>/skills/probe.\\n\\nPROBE BODY\\n</skill>\"}],\"tool_call_id\":\"call_1\"}}",
+        "{\"type\":\"message\",\"message\":{\"kind\":\"llm\",\"role\":\"assistant\",\"parts\":[{\"type\":\"text\",\"text\":\"loaded\"}]}}",
+    ],
+}
+

@@ -548,6 +548,11 @@ fn render_structural(item: &DisplayItem) -> String {
         DisplayItem::Stop(StopReason::Cancelled) => {
             unreachable!("the one-shot CLI never cancels a turn")
         }
+        // Guardrail stops (ticket 08) are a bot-only concern; the one-shot CLI
+        // runs the code preset with no `max_iterations` / `timeout` set.
+        DisplayItem::Stop(StopReason::MaxIterations | StopReason::Timeout) => {
+            unreachable!("the one-shot CLI never sets a guardrail")
+        }
         DisplayItem::Text(_) | DisplayItem::Reasoning(_) | DisplayItem::Usage(_) => {
             unreachable!("Text, Reasoning and Usage are handled by TextRenderer::render")
         }

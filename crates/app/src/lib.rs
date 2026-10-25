@@ -23,12 +23,16 @@
 //!   `map_event`, and the `Renderer` trait (ADR-0004).
 //! - [`runner`]: the shared turn loop that streams every `AgentEvent` to a
 //!   `Renderer` live (ADR-0004).
+//! - [`preset`]: the code-type preset's built-in default phase hooks
+//!   (ADR-0031 D5) — today the `pre_tool` skill-read interception.
 
 pub mod compaction;
 pub mod config;
 pub mod context;
 pub mod context_files;
+pub mod engine;
 pub mod history;
+pub mod preset;
 pub mod render;
 pub mod runner;
 pub mod session;
@@ -43,10 +47,14 @@ pub mod tools;
 pub use slimcode_ai::BailianProvider;
 pub use slimcode_core::agent::ToolSpec;
 pub use slimcode_core::agent::{
-    CancelToken, Delta, FinishReason, Provider, ProviderConfig, RunConfig, RunHooks, StopReason,
-    TokenUsage, Tool, ToolDecision,
+    AbortReason, AfterChat, AfterChatHook, AfterTool, AfterToolHook, AfterTurn, AfterTurnHook,
+    CancelToken, Delta, Extensions, FinishReason, GateHook, HookAction, PhaseHooks, PostIteration,
+    PreChat, PreTool, PreToolHook, PreTurn, Provider, ProviderConfig, RunConfig, RunSpec, RunState,
+    SpanRecorder, StopReason, TokenUsage, Tool, ToolDecision, ToolHookAction, Tracer,
 };
 pub use slimcode_core::session::{AgentMessage, Message, MessageStopReason, Role, Session};
+
+pub use engine::{Engine, Preset};
 
 #[doc(hidden)]
 pub mod testutil;

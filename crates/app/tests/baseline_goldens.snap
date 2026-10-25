@@ -1,0 +1,39 @@
+### tool_turn
+Foot {
+    displays: [
+        "turn(1)",
+        "text(checking )",
+        "toolstart(call_1,probe,{})",
+        "toolresult(call_1,probe,ok=true,probed)",
+        "turn(2)",
+        "text(done)",
+        "stop(Completed)",
+    ],
+    history: [
+        "user::weather?",
+        "assistant::checking ",
+        "tool::probed",
+        "assistant::done",
+    ],
+    stop: "Completed",
+}
+
+### skip_hook
+Foot {
+    displays: [
+        "turn(1)",
+        "toolstart(call_1,probe,{})",
+        "toolresult(call_1,probe,ok=true,SKIPPED)",
+        "turn(2)",
+        "text(done)",
+        "stop(Completed)",
+    ],
+    history: [
+        "user::go",
+        "assistant::",
+        "tool::SKIPPED",
+        "assistant::done",
+    ],
+    stop: "Completed",
+}
+

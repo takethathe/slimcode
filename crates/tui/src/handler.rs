@@ -11,8 +11,18 @@
 //! vocabularies: [`Effect`](crate::app::Effect) for intent coming out of the
 //! reducer, [`RenderItem`] for display state going in.
 
+use std::sync::Arc;
+
 use crate::app::Effect;
 use crate::render::RenderItem;
+
+/// A sink for [`RenderItem`]s a turn streams out, callable from any thread.
+///
+/// The SDK delivers a turn's events over its bounded event bus, on the
+/// session's dispatcher thread — not on the worker thread `submit` runs on.
+/// So the sink that carries those items to the frame loop must be `Send +
+/// Sync`: in production it feeds the channel the frame loop drains live.
+pub type Emitter = Arc<dyn Fn(RenderItem) + Send + Sync>;
 
 /// One completion candidate: the `/`-prefixed spelling to commit and a short
 /// description.
@@ -89,13 +99,11 @@ pub trait UiHandler: Sync {
     fn on_effect(&mut self, effect: Effect, emit: &mut dyn FnMut(RenderItem)) -> ControlFlow;
 
     /// Run one turn to completion, streaming its display items through `emit`.
-    /// Called on the library's worker thread; `Err` is a failure the library
-    /// shows as an error line (the CLI has already closed the session log).
-    fn submit(
-        &self,
-        prompt: Prompt,
-        emit: &mut dyn FnMut(RenderItem),
-    ) -> Result<TurnReport, String>;
+    /// Called on the library's worker thread; `emit` is `Send + Sync` because
+    /// the SDK delivers the turn's events on the session's dispatcher thread,
+    /// which reaches this same sink. `Err` is a failure the library shows as an
+    /// error line (the CLI has already closed the session log).
+    fn submit(&self, prompt: Prompt, emit: &Emitter) -> Result<TurnReport, String>;
 
     /// Cancel the running turn at the next runner boundary (the user pressed
     /// Esc). Called from the frame loop while `submit` is blocked.

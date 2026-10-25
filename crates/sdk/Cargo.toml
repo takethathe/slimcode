@@ -8,6 +8,15 @@ description = "Programmatic, session-centric access to slimcode's agent loop"
 
 [dependencies]
 slimcode-app.workspace = true
+# Runtime-agnostic async facade (ADR-0031 D3, engine ticket 07): `Stream` /
+# `Future` traits and the cross-thread `oneshot` / `mpsc` they park on. The
+# `futures` family carries no runtime (never tokio), so slimcode stays
+# runtime-agnostic and a host drives the facade on its own executor.
+futures-channel = "0.3"
+futures-core = "0.3"
 
 [dev-dependencies]
 serde_json = "1"
+# Tests drive the facade with `futures::executor::block_on` and pull the event
+# `Stream` with `StreamExt::next` — still no tokio (spec engine ticket 07).
+futures = "0.3"
