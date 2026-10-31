@@ -89,8 +89,12 @@ D3's `MIN_CONTEXT_REMAINING`) boundary, refusing to
 start the tail on a `tool` result (a kept result must keep the assistant tool call it answers),
 serializes the span with pi's `[User]` / `[Assistant]` / `[Assistant tool calls]` / `[Tool result]`
 text, and sends pi's structured prompt (`SUMMARIZATION_SYSTEM_PROMPT` + the initial or update
-instruction) through the ordinary `Provider::chat` seam with no tools, no cache writes and
-`max_tokens = 2048`. The result is `[CompactSummary, ...kept]`. A provider error, a cancel or an
+instruction) through the ordinary `Provider::chat` seam with no tools, no cache writes,
+`max_tokens = 2048` and thinking forced off (`with_thinking(false)`). A reasoning pass or a cache
+write would cost tokens without improving what the request produces — the summary is the only thing
+written back into history — and thinking tokens in particular would compete with it for the
+response cap and delay the checkpoint.
+The result is `[CompactSummary, ...kept]`. A provider error, a cancel or an
 empty summary returns `Err` and leaves the caller's history untouched; the frontend reports it and
 the next turn tries again with the full history.
 

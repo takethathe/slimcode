@@ -37,9 +37,9 @@ pub struct ProviderConfig {
     /// `enable_thinking`). On by default; `true` is the provider's own default
     /// too, so the field stays off the wire and ordinary turns keep their byte
     /// shape. A one-off request that only wants the answer body — a Card spec
-    /// stream — forces it off with [`ProviderConfig::with_thinking`]: thinking
-    /// tokens would be spent on reasoning nobody reads and would delay the
-    /// first patch.
+    /// stream or a compaction summary — forces it off with
+    /// [`ProviderConfig::with_thinking`]: thinking tokens would be spent on
+    /// reasoning nobody reads and would compete with the response cap.
     pub enable_thinking: bool,
 }
 

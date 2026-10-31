@@ -202,11 +202,14 @@ fn generate_summary<P: Provider>(
         Message::text(Role::System, SUMMARIZATION_SYSTEM_PROMPT),
         Message::text(Role::User, prompt),
     ];
-    // One-off call (spec §5): no tools, no cache writes, bounded response.
+    // One-off call (spec §5): no tools, no cache writes, bounded response, and
+    // no reasoning pass — the summary is the only thing written back into
+    // history, and thinking tokens would eat the cap that bounds it.
     let config = config
         .clone()
         .with_cache(false)
-        .with_max_tokens(SUMMARY_MAX_TOKENS);
+        .with_max_tokens(SUMMARY_MAX_TOKENS)
+        .with_thinking(false);
     let mut text = String::new();
     provider.chat(&request, &[], &config, cancel, &mut |delta| {
         if let Delta::Text(fragment) = delta {
@@ -649,7 +652,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_messages_uses_a_bounded_uncached_request() {
+    fn compact_messages_uses_a_bounded_uncached_and_thinking_free_request() {
         let mut provider = ScriptedProvider::replying("summary");
         compact_messages(
             &mut provider,
@@ -661,6 +664,10 @@ mod tests {
         let config = provider.seen_config.expect("config seen");
         assert_eq!(config.max_tokens, Some(SUMMARY_MAX_TOKENS));
         assert!(!config.cache, "a one-off summary does not warm the cache");
+        assert!(
+            !config.enable_thinking,
+            "a one-off summary does not spend thinking tokens"
+        );
     }
 
     #[test]

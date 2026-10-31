@@ -358,7 +358,8 @@ provider config seam 见 ADR-0016，扩展 seam 见下文「可移植 Engine 与
     把边界之前的 span（去掉旧 `CompactSummary`）序列化成 `[User]: …` / `[Assistant]: …` /
     `[Assistant tool calls]: read(path="a.rs")` / `[Tool result]: …`（result 截断到 2000 字符），
     用 pi 的 `SUMMARIZATION_SYSTEM_PROMPT` + `SUMMARIZATION_PROMPT`/`UPDATE_SUMMARIZATION_PROMPT`
-    请求一次摘要（`with_cache(false)` + `max_tokens=2048`，有旧摘要时合并而非重写），
+    请求一次摘要（`with_cache(false)` + `max_tokens=2048` + `with_thinking(false)`——一次性摘要不回写缓存、
+    思考也不会进入摘要正文，只会和摘要争抢这个上限；有旧摘要时合并而非重写），
     返回 `[CompactSummary, ...kept]`；失败/取消/空摘要返回 `Err`，调用方保留原历史；
   - 保留边界：checkpoint 记录它保留了多少条紧邻其前的近期消息（Kept tail，`kept_count`），
     `compact_messages` 产出 checkpoint 与保留尾部时一并写入；旧日志的 checkpoint 无此字段，
