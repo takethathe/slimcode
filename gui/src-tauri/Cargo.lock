@@ -3557,6 +3557,8 @@ dependencies = [
 name = "slimcode-sdk"
 version = "0.1.0"
 dependencies = [
+ "futures-channel",
+ "futures-core",
  "slimcode-app",
 ]
 
